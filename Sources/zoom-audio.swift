@@ -4,6 +4,7 @@ import ApplicationServices
 import CoreGraphics
 import CoreMedia
 import Foundation
+import OSLog
 import ScreenCaptureKit
 import UniformTypeIdentifiers
 
@@ -305,7 +306,7 @@ private final class ZoomMuteWatcher {
     func observedState() -> ZoomMuteState { currentState() }
 }
 
-func zoomMicrophoneDiagnostics(observations: Int = 1) -> [String: Any] {
+func zoomMicrophoneDiagnostics(observations: Int = 1) async -> [String: Any] {
     guard AXIsProcessTrusted() else { return ["accessAllowed": false] }
     guard let zoom = NSRunningApplication.runningApplications(withBundleIdentifier: "us.zoom.xos").first else {
         return ["accessAllowed": true, "zoomRunning": false]
@@ -314,13 +315,23 @@ func zoomMicrophoneDiagnostics(observations: Int = 1) -> [String: Any] {
     var result = watcher.diagnosticSnapshot()
     result["accessAllowed"] = true
     result["zoomRunning"] = true
+    result["zoomPID"] = zoom.processIdentifier
+    if CGPreflightScreenCaptureAccess(),
+       let content = try? await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false) {
+        if let target = ZoomAudio.captureApplication(in: content, pid: zoom.processIdentifier) {
+            result["captureApplication"] = target.bundleIdentifier
+            result["capturePID"] = target.processID
+        } else {
+            result["captureApplication"] = "unavailable"
+        }
+    }
     if observations > 1 {
         let start = Date()
         var readings = [[String: Any]]()
         for _ in 0..<min(observations, 150) {
             readings.append(["seconds": Date().timeIntervalSince(start),
                 "state": String(describing: watcher.observedState())])
-            Thread.sleep(forTimeInterval: 0.2)
+            try? await Task.sleep(nanoseconds: 200_000_000)
         }
         result["observations"] = readings
     }
@@ -440,6 +451,12 @@ struct RecordingResult {
 }
 
 struct ZoomAudio {
+    private static let logger = Logger(subsystem: "local.zoom-audio-recorder", category: "capture")
+
+    static func captureApplication(in content: SCShareableContent, pid: pid_t) -> SCRunningApplication? {
+        // The recorder's own name also contains "Zoom". Never select by display name.
+        content.applications.first { $0.bundleIdentifier == "us.zoom.xos" && $0.processID == pid }
+    }
 
     static func record(stop: StopRequest, output: URL,
                        onStarted: @escaping () -> Void,
@@ -460,9 +477,8 @@ struct ZoomAudio {
         } catch {
             throw RecorderError.message("\(screenAccessHint) Системная ошибка: \(error.localizedDescription)")
         }
-        guard let zoom = content.applications.first(where: {
-            $0.bundleIdentifier == "us.zoom.xos" || $0.applicationName.localizedCaseInsensitiveContains("zoom")
-        }) else {
+        guard let runningZoom = NSRunningApplication.runningApplications(withBundleIdentifier: "us.zoom.xos").first,
+              let zoom = captureApplication(in: content, pid: runningZoom.processIdentifier) else {
             throw RecorderError.message("Откройте Zoom и войдите в созвон перед запуском")
         }
         guard AXIsProcessTrustedWithOptions(["AXTrustedCheckOptionPrompt": true] as CFDictionary) else {
@@ -471,11 +487,12 @@ struct ZoomAudio {
         guard await AVCaptureDevice.requestAccess(for: .audio) else {
             throw RecorderError.message("Разрешите микрофон для Zoom Audio Recorder в Системных настройках")
         }
-        guard let runningZoom = NSRunningApplication.runningApplications(withBundleIdentifier: zoom.bundleIdentifier).first else {
-            throw RecorderError.message("Не удалось найти процесс Zoom")
-        }
+        logger.notice("Recording target: \(zoom.bundleIdentifier, privacy: .public), pid \(zoom.processID)")
         let watcher = ZoomMuteWatcher(pid: runningZoom.processIdentifier,
-                                      bundleURL: runningZoom.bundleURL, onChange: onMicrophone)
+                                      bundleURL: runningZoom.bundleURL, onChange: { state in
+            logger.notice("Zoom microphone: \(String(describing: state), privacy: .public)")
+            onMicrophone(state)
+        })
         capture.muteWatcher = watcher
         defer { watcher.stop() }
         watcher.start()

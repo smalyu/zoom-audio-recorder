@@ -169,7 +169,7 @@ final class RecorderDelegate: NSObject, NSApplicationDelegate {
         let path = arguments[flag + 1]
         let observations = arguments.contains("--observe") ? 150 : 1
         Task.detached {
-            let result = zoomMicrophoneDiagnostics(observations: observations)
+            let result = await zoomMicrophoneDiagnostics(observations: observations)
             if let data = try? JSONSerialization.data(withJSONObject: result, options: [.prettyPrinted, .sortedKeys]) {
                 try? data.write(to: URL(fileURLWithPath: path), options: .atomic)
             }
