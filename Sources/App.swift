@@ -167,8 +167,9 @@ final class RecorderDelegate: NSObject, NSApplicationDelegate {
         let arguments = CommandLine.arguments
         guard let flag = arguments.firstIndex(of: "--diagnose-zoom"), arguments.count > flag + 1 else { return }
         let path = arguments[flag + 1]
+        let observations = arguments.contains("--observe") ? 150 : 1
         Task.detached {
-            let result = zoomMicrophoneDiagnostics()
+            let result = zoomMicrophoneDiagnostics(observations: observations)
             if let data = try? JSONSerialization.data(withJSONObject: result, options: [.prettyPrinted, .sortedKeys]) {
                 try? data.write(to: URL(fileURLWithPath: path), options: .atomic)
             }

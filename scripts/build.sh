@@ -32,5 +32,5 @@ if ! xcrun actool --compile "$app/Contents/Resources" --platform macosx \
   cat "$cache_dir/actool.log"
   exit 1
 fi
-codesign --force --sign - --options runtime --entitlements Resources/Entitlements.plist "$app"
+zsh scripts/sign.sh "$app"
 echo "Готово: $app"

@@ -5,3 +5,4 @@ build/
 *.m4a
 .idea/
 build.noindex/
+__pycache__/

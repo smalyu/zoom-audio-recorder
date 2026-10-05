@@ -122,11 +122,23 @@ struct ZoomMuteLabels {
     var shortMute = ["mute"]
     var shortUnmute = ["unmute"]
     var ambiguous = ["mute/unmute my audio"]
+    var ownActionMute = ["mute audio"]
+    var ownActionUnmute = ["unmute audio"]
 
     func state(labels: [String], role: String, enabled: Bool,
-               inToolbar: Bool = false) -> ZoomMuteState? {
+               inToolbar: Bool = false, identifier: String = "") -> ZoomMuteState? {
         guard enabled, ["AXButton", "AXCheckBox", "AXMenuItem"].contains(role) else { return nil }
         let texts = labels.map { $0.lowercased().trimmingCharacters(in: .whitespacesAndNewlines) }
+        let ownAudioCommand = identifier == "onMuteAudio:"
+        // Menu command selectors identify the user's microphone across localizations.
+        // Exclude participant commands and recent-file entries with similar titles.
+        if role == "AXMenuItem", !identifier.isEmpty, !ownAudioCommand { return nil }
+        if ownAudioCommand {
+            for text in texts where !ambiguous.contains(where: text.contains) {
+                if ownActionUnmute.contains(where: text.contains) { return .muted }
+                if ownActionMute.contains(where: text.contains) { return .unmuted }
+            }
+        }
         // Prefer the current action title over a generic shortcut/help description.
         for text in texts where !ambiguous.contains(where: text.contains) {
             if unmute.contains(where: text.contains) { return .muted }
@@ -170,6 +182,8 @@ private final class ZoomMuteWatcher {
                 if let value = strings["Mute"] { labels.shortMute.append(value.lowercased()) }
                 if let value = strings["Unmute"] { labels.shortUnmute.append(value.lowercased()) }
                 if let value = strings["LN_Hotkey_Mute_Audio_123974"] { labels.ambiguous.append(value.lowercased()) }
+                if let value = strings["Mute Audio"] { labels.ownActionMute.append(value.lowercased()) }
+                if let value = strings["Unmute Audio"] { labels.ownActionUnmute.append(value.lowercased()) }
             }
         }
     }
@@ -228,7 +242,8 @@ private final class ZoomMuteWatcher {
         guard enabled != false, role != "AXMenuItem" || enabled == true else { return nil }
         let text = [kAXTitleAttribute, kAXDescriptionAttribute, kAXHelpAttribute]
             .compactMap { attribute($0 as CFString, of: element) as? String }
-        return labels.state(labels: text, role: role, enabled: true, inToolbar: inToolbar)
+        let identifier = attribute(kAXIdentifierAttribute as CFString, of: element) as? String ?? ""
+        return labels.state(labels: text, role: role, enabled: true, inToolbar: inToolbar, identifier: identifier)
     }
 
     private func findMuteAction(in element: AXUIElement, depth: Int, inToolbar: Bool,
@@ -287,9 +302,10 @@ private final class ZoomMuteWatcher {
         }
         return ["state": String(describing: currentState()), "controls": controls]
     }
+    func observedState() -> ZoomMuteState { currentState() }
 }
 
-func zoomMicrophoneDiagnostics() -> [String: Any] {
+func zoomMicrophoneDiagnostics(observations: Int = 1) -> [String: Any] {
     guard AXIsProcessTrusted() else { return ["accessAllowed": false] }
     guard let zoom = NSRunningApplication.runningApplications(withBundleIdentifier: "us.zoom.xos").first else {
         return ["accessAllowed": true, "zoomRunning": false]
@@ -298,6 +314,16 @@ func zoomMicrophoneDiagnostics() -> [String: Any] {
     var result = watcher.diagnosticSnapshot()
     result["accessAllowed"] = true
     result["zoomRunning"] = true
+    if observations > 1 {
+        let start = Date()
+        var readings = [[String: Any]]()
+        for _ in 0..<min(observations, 150) {
+            readings.append(["seconds": Date().timeIntervalSince(start),
+                "state": String(describing: watcher.observedState())])
+            Thread.sleep(forTimeInterval: 0.2)
+        }
+        result["observations"] = readings
+    }
     return result
 }
 

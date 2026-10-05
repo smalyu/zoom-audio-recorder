@@ -15,5 +15,11 @@ func checkMuteDetection() throws {
     try check(matcher.state(labels: ["Audio"], role: "AXButton", enabled: true, inToolbar: true) == nil, "unknown audio state guessed")
     try check(matcher.state(labels: ["Mute my audio", "Mute/unmute my audio"], role: "AXMenuItem", enabled: true) == .unmuted, "generic help overrode current menu action")
     try check(matcher.state(labels: ["Mute/unmute my audio"], role: "AXMenuItem", enabled: true) == nil, "toggle description guessed a state")
+    try check(matcher.state(labels: ["Unmute audio"], role: "AXMenuItem", enabled: true, identifier: "onMuteAudio:") == .muted, "actual Zoom 7 command not recognized")
+    try check(matcher.state(labels: ["Mute audio"], role: "AXMenuItem", enabled: true, identifier: "onMuteAudio:") == .unmuted, "actual Zoom 7 unmuted command not recognized")
+    try check(matcher.state(labels: ["Mute audio"], role: "AXMenuItem", enabled: true, identifier: "onMuteAll:") == nil, "another command enabled own audio")
+    try check(matcher.state(labels: ["Mute my audio.txt"], role: "AXMenuItem", enabled: true, identifier: "_recentItemRequested:") == nil, "recent file interpreted as a microphone command")
+    matcher.ownActionUnmute.append("включить звук")
+    try check(matcher.state(labels: ["Включить звук"], role: "AXMenuItem", enabled: true, identifier: "onMuteAudio:") == .muted, "localized own audio action not recognized")
     print("PASS: own menu, disabled menu, localized checkbox, toolbar, participant isolation, unknown state")
 }
