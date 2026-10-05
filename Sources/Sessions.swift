@@ -8,10 +8,35 @@ func verifyRecording(_ url: URL) async throws -> Double {
     let audio = try await asset.loadTracks(withMediaType: .audio)
     let video = try await asset.loadTracks(withMediaType: .video)
     let duration = try await asset.load(.duration).seconds
-    guard audio.count == 1, video.isEmpty, duration > 0 else {
+    guard audio.count == 1, video.isEmpty, duration.isFinite, duration > 0 else {
         throw RecorderError.message("Сохранённый файл не прошёл проверку")
     }
     return duration
+}
+
+enum RecordingStorage {
+    /// A missing drive is unavailable; an ordinary missing subfolder can be created.
+    static func reachable(_ folder: URL) -> Bool {
+        var existing = folder.standardizedFileURL
+        var directory: ObjCBool = false
+        while !FileManager.default.fileExists(atPath: existing.path, isDirectory: &directory),
+              existing.pathComponents.count > 1 {
+            existing.deleteLastPathComponent()
+        }
+        return directory.boolValue && existing.path != "/Volumes"
+            && FileManager.default.isWritableFile(atPath: existing.path)
+    }
+
+    static func probe(_ folder: URL) -> Bool {
+        guard reachable(folder) else { return false }
+        let test = folder.appendingPathComponent(".zoom-recorder-probe-\(UUID().uuidString)")
+        do {
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            try Data().write(to: test, options: .withoutOverwriting)
+            defer { try? FileManager.default.removeItem(at: test) }
+            return true
+        } catch { return false }
+    }
 }
 
 struct ExportResult {
@@ -39,7 +64,7 @@ func exportRecording(zoom: [TrackPart], mic: [TrackPart], to output: URL,
         for part in parts {
             let asset = AVURLAsset(url: part.url)
             guard let source = try? await asset.loadTracks(withMediaType: .audio).first,
-                  let duration = try? await asset.load(.duration), duration.seconds > 0 else {
+                  let duration = try? await asset.load(.duration), duration.seconds.isFinite, duration.seconds > 0 else {
                 recorderLog.error("Unreadable part \(part.url.lastPathComponent, privacy: .public)")
                 unreadable.append(part.url)
                 continue
@@ -103,6 +128,7 @@ final class RecordingSession {
         let duration: Double
         /// Some parts could not be read; they were kept aside rather than deleted.
         let incomplete: Bool
+        let unreadableFolder: URL?
         /// The whole microphone, saved next to the recording when mute detection may have failed.
         let microphone: URL?
     }
@@ -132,7 +158,8 @@ final class RecordingSession {
         // a session that is not locked yet.
         let hidden = root.appendingPathComponent("." + folderName, isDirectory: true)
         let folder = root.appendingPathComponent(folderName, isDirectory: true)
-        try FileManager.default.createDirectory(at: hidden, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: hidden, withIntermediateDirectories: true,
+                                                attributes: [.posixPermissions: 0o700])
         guard let lock = acquireLock(hidden) else {
             throw RecorderError.message("Не удалось подготовить папку записи")
         }
@@ -215,13 +242,15 @@ final class RecordingSession {
 
     var hasAudio: Bool {
         !AudioTrack.parts(named: "zoom", in: folder).isEmpty || hasVoice || needsSafetyCopy(recovering: true)
+            || Self.size(folder.appendingPathComponent("final.m4a")) > 0
     }
 
     private var parts: [TrackPart] {
         AudioTrack.parts(named: "zoom", in: folder) + AudioTrack.parts(named: "mic", in: folder)
+            + AudioTrack.parts(named: "raw", in: folder)
     }
 
-    /// Bytes of recorded parts: tells a crash in the first second from real damage.
+    /// Bytes of all source tracks, including the safety microphone.
     var recordedBytes: Int { parts.reduce(0) { $0 + Self.size($1.url) } }
 
     private static func size(_ url: URL) -> Int {
@@ -240,18 +269,19 @@ final class RecordingSession {
         let main = try await exported("final", zoom: zoomParts, mic: micParts.isEmpty && zoomParts.isEmpty ? rawParts : micParts,
                                       progress: progress)
         // A failed safety copy keeps the session for a retry rather than losing the microphone.
-        let safety = rawParts.isEmpty || (zoomParts.isEmpty && micParts.isEmpty) ? nil
+        let cachedSafety = Self.size(folder.appendingPathComponent("microphone.m4a")) > 0
+        let safety = !cachedSafety && (rawParts.isEmpty || (zoomParts.isEmpty && micParts.isEmpty)) ? nil
             : try await exported("microphone", zoom: [], mic: rawParts)
         let preferred = URL(fileURLWithPath: manifest.destination, isDirectory: true)
         var failure: Error?
-        let incomplete = await keepUnreadableParts()
-        let base = (manifest.name as NSString).deletingPathExtension
+        let incomplete = try await keepUnreadableParts()
         for directory in [preferred, fallback] where directory != preferred || failure == nil {
             do {
                 let url = try await place(main.file, named: manifest.name, duration: main.duration, in: directory)
                 var microphone: URL?
                 if let safety {
                     do {
+                        let base = url.deletingPathExtension().lastPathComponent
                         microphone = try await place(safety.file, named: "\(base) (микрофон).m4a",
                                                      duration: safety.duration, in: directory)
                     } catch {
@@ -262,7 +292,8 @@ final class RecordingSession {
                 }
                 retire()
                 return Delivery(url: url, usedFallback: directory != preferred, duration: main.duration,
-                                incomplete: incomplete, microphone: microphone)
+                                incomplete: incomplete, unreadableFolder: incomplete ? unreadableFolder : nil,
+                                microphone: microphone)
             } catch {
                 recorderLog.error("Save to \(directory.path, privacy: .public) failed: \(error.localizedDescription, privacy: .public)")
                 failure = error
@@ -289,22 +320,12 @@ final class RecordingSession {
     private func place(_ file: URL, named name: String, duration: Double, in directory: URL) async throws -> URL {
         let manager = FileManager.default
         // An unmounted drive's path must not be recreated on the startup disk.
-        var existing = directory
-        while !manager.fileExists(atPath: existing.path), existing.pathComponents.count > 1 {
-            existing.deleteLastPathComponent()
-        }
-        guard existing.path != "/Volumes" else {
+        guard RecordingStorage.reachable(directory) else {
             throw RecorderError.message("Папка «\(directory.lastPathComponent)» недоступна")
         }
         try manager.createDirectory(at: directory, withIntermediateDirectories: true)
         let base = (name as NSString).deletingPathExtension
-        var target = directory.appendingPathComponent(name)
-        var index = 2
-        while manager.fileExists(atPath: target.path) {
-            target = directory.appendingPathComponent("\(base) \(index).m4a")
-            index += 1
-        }
-        let temporary = directory.appendingPathComponent(".\(base) \(UUID().uuidString.prefix(8)).partial.m4a")
+        let temporary = directory.appendingPathComponent(".zoom-recording-\(UUID().uuidString).partial.m4a")
         defer { try? manager.removeItem(at: temporary) }
         try manager.copyItem(at: file, to: temporary)
         syncToStorage(temporary)
@@ -312,26 +333,46 @@ final class RecordingSession {
               abs(try await verifyRecording(temporary) - duration) < 0.1 else {
             throw RecorderError.message("Файл скопирован не полностью")
         }
-        try manager.moveItem(at: temporary, to: target)
-        syncToStorage(directory)
-        return target
+        var target = directory.appendingPathComponent(name)
+        var index = 2
+        while true {
+            if !manager.fileExists(atPath: target.path) {
+                // FileManager's existence check and move can race with another save.
+                // RENAME_EXCL makes refusing an existing filename part of the rename itself.
+                if renamex_np(temporary.path, target.path, UInt32(RENAME_EXCL)) == 0 {
+                    syncToStorage(directory)
+                    return target
+                }
+                let code = errno
+                guard code == EEXIST else {
+                    throw NSError(domain: NSPOSIXErrorDomain, code: Int(code),
+                                  userInfo: [NSFilePathErrorKey: target.path])
+                }
+            }
+            target = directory.appendingPathComponent("\(base) \(index).m4a")
+            index += 1
+        }
     }
 
-    /// Parts that cannot be opened are moved aside instead of being deleted with the
-    /// session. Tiny ones hold nothing playable (a crash in the first second).
-    private func keepUnreadableParts() async -> Bool {
-        var kept = false
-        for part in parts where Self.size(part.url) > 65_536 {
-            let asset = AVURLAsset(url: part.url)
-            guard (try? await asset.loadTracks(withMediaType: .audio).first) == nil else { continue }
-            let aside = folder.deletingLastPathComponent().deletingLastPathComponent()
-                .appendingPathComponent("Unreadable/\(folder.lastPathComponent)", isDirectory: true)
-            try? FileManager.default.createDirectory(at: aside, withIntermediateDirectories: true)
-            if (try? FileManager.default.moveItem(at: part.url, to: aside.appendingPathComponent(part.url.lastPathComponent))) != nil {
-                kept = true
-            }
+    /// Parts that cannot be opened are moved aside instead of being deleted with the session.
+    private func keepUnreadableParts() async throws -> Bool {
+        let aside = unreadableFolder
+        // A previous delivery may have moved parts aside before its destination failed.
+        var kept = FileManager.default.fileExists(atPath: aside.path)
+        for part in parts where Self.size(part.url) > 0 {
+            guard (try? await verifyRecording(part.url)) == nil else { continue }
+            // If preservation fails, retain the entire session for a retry.
+            try FileManager.default.createDirectory(at: aside, withIntermediateDirectories: true,
+                                                    attributes: [.posixPermissions: 0o700])
+            try FileManager.default.moveItem(at: part.url, to: aside.appendingPathComponent(part.url.lastPathComponent))
+            kept = true
         }
         return kept
+    }
+
+    private var unreadableFolder: URL {
+        folder.deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("Unreadable/\(folder.lastPathComponent)", isDirectory: true)
     }
 
     /// After delivery: one rename marks the session done, so a crash while deleting

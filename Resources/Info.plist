@@ -9,9 +9,9 @@
     <key>CFBundleDisplayName</key>
     <string>Zoom Audio Recorder</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.2</string>
+    <string>1.3</string>
     <key>CFBundleVersion</key>
-    <string>8</string>
+    <string>9</string>
     <key>CFBundleExecutable</key>
     <string>zoom-audio</string>
     <key>CFBundlePackageType</key>

@@ -547,6 +547,72 @@ func checkSessions(_ folder: URL) async throws {
     let both = try await guarded.deliver(fallback: fallback)
     try check(both.microphone?.lastPathComponent == "Guarded (микрофон).m4a", "safety copy not delivered")
     try check(tone(try decode(both.microphone!), at: 1.0, frequency: 880) > 0.09, "safety copy lost the microphone")
+    // The safety file follows the final main filename when a meeting name collides.
+    let paired = try await makeSession(root: root, destination: destination, name: "Guarded.m4a")
+    try FileManager.default.copyItem(at: both.microphone!, to: paired.folder.appendingPathComponent("raw-1-0.m4a"))
+    paired.markSafetyCopy()
+    let pair = try await paired.deliver(fallback: fallback)
+    try check(pair.url.lastPathComponent == "Guarded 2.m4a"
+              && pair.microphone?.lastPathComponent == "Guarded 2 (микрофон).m4a", "main and safety filenames do not match")
+
+    // A preservation failure must never discard damaged source audio or retire the session.
+    let damaged = try await makeSession(root: root, destination: destination, name: "Damaged.m4a")
+    let badPart = damaged.folder.appendingPathComponent("zoom-2-96000.m4a")
+    try Data(repeating: 0x42, count: 70_000).write(to: badPart)
+    let unreadable = root.deletingLastPathComponent().appendingPathComponent("Unreadable")
+    try Data("blocked".utf8).write(to: unreadable)
+    do {
+        _ = try await damaged.deliver(fallback: fallback)
+        throw TestError.failed("delivery deleted an unpreserved source")
+    } catch is TestError { throw TestError.failed("delivery deleted an unpreserved source") }
+    catch {}
+    try check(FileManager.default.fileExists(atPath: badPart.path), "unpreserved source deleted")
+    try check(try await verifyRecording(damaged.folder.appendingPathComponent("final.m4a")) > 1.9, "verified mix lost after preservation failure")
+    try FileManager.default.removeItem(at: unreadable)
+    // If copying fails after damaged parts were moved, the warning must survive a retry.
+    let blockedOutput = folder.appendingPathComponent("blocked-output")
+    try Data("blocked".utf8).write(to: blockedOutput)
+    let retryDamage = try await makeSession(root: root, destination: blockedOutput, name: "Retry damage.m4a")
+    try Data(repeating: 0x43, count: 1024).write(to: retryDamage.folder.appendingPathComponent("raw-2-96000.m4a"))
+    do {
+        _ = try await retryDamage.deliver(fallback: blockedOutput)
+        throw TestError.failed("blocked destination succeeded")
+    } catch is TestError { throw TestError.failed("blocked destination succeeded") }
+    catch {}
+    for part in AudioTrack.parts(named: "zoom", in: retryDamage.folder) {
+        try FileManager.default.removeItem(at: part.url)
+    }
+    try check(retryDamage.hasAudio, "cached mix no longer recognised as audio")
+    let repaired = try await retryDamage.deliver(fallback: fallback)
+    try check(repaired.incomplete && repaired.unreadableFolder != nil, "damage warning lost on retry")
+    let savedDamage = try await damaged.deliver(fallback: fallback)
+    try check(savedDamage.incomplete, "partial recording reported as complete")
+    try check(FileManager.default.fileExists(atPath: savedDamage.unreadableFolder!.appendingPathComponent(badPart.lastPathComponent).path),
+              "damaged source not preserved")
+    // Both verified exports remain deliverable when source parts are no longer present.
+    let cached = try await makeSession(root: root, destination: blockedOutput, name: "Cached.m4a")
+    try FileManager.default.copyItem(at: both.microphone!, to: cached.folder.appendingPathComponent("raw-1-0.m4a"))
+    cached.markSafetyCopy()
+    do {
+        _ = try await cached.deliver(fallback: blockedOutput)
+        throw TestError.failed("blocked destination succeeded")
+    } catch is TestError { throw TestError.failed("blocked destination succeeded") }
+    catch {}
+    for name in ["zoom", "raw"] {
+        for part in AudioTrack.parts(named: name, in: cached.folder) { try FileManager.default.removeItem(at: part.url) }
+    }
+    let cachedDelivery = try await cached.deliver(fallback: fallback)
+    try check(cachedDelivery.microphone != nil, "cached safety export lost on retry")
+    // Two independent sessions can finish at the same time in the same folder.
+    let concurrentA = try await makeSession(root: root, destination: destination, name: "Concurrent.m4a")
+    let concurrentB = try await makeSession(root: root, destination: destination, name: "Concurrent.m4a")
+    async let saveA = concurrentA.deliver(fallback: fallback)
+    async let saveB = concurrentB.deliver(fallback: fallback)
+    let (deliveryA, deliveryB) = try await (saveA, saveB)
+    try check(deliveryA.url != deliveryB.url && !deliveryA.usedFallback && !deliveryB.usedFallback,
+              "concurrent saves collided or fell back")
+    try check(try await verifyRecording(deliveryA.url) > 1.9, "first concurrent save incomplete")
+    try check(try await verifyRecording(deliveryB.url) > 1.9, "second concurrent save incomplete")
     // A session abandoned before it was renamed is cleaned up.
     try FileManager.default.createDirectory(at: root.appendingPathComponent(".abandoned"), withIntermediateDirectories: true)
     try check(RecordingSession.interrupted(root: root, fallback: fallback).isEmpty, "abandoned folder offered for recovery")
@@ -557,6 +623,22 @@ func checkSessions(_ folder: URL) async throws {
     empty.remove()
     try check(try FileManager.default.contentsOfDirectory(atPath: root.path).isEmpty, "sessions left behind")
     print("PASS: session locks, unique names, no overwrite, offline drive fallback, kept on failure and retried")
+    print("PASS: paired safety filenames, damaged sources retained on failure, damage warning survives retries")
+}
+
+func checkStorage(_ folder: URL) throws {
+    let directory = folder.appendingPathComponent("nested/meetings")
+    try check(RecordingStorage.probe(directory), "ordinary missing folder unavailable")
+    let sentinel = directory.appendingPathComponent(".zoom-audio-recorder-test")
+    try Data("keep".utf8).write(to: sentinel)
+    try check(RecordingStorage.probe(directory), "existing folder unavailable")
+    try check(try String(contentsOf: sentinel, encoding: .utf8) == "keep", "probe overwrote an existing file")
+    try check(!RecordingStorage.reachable(sentinel), "a file accepted as a directory")
+    try check(!RecordingStorage.probe(sentinel.appendingPathComponent("child")), "a file accepted as a parent folder")
+    try check(!RecordingStorage.reachable(URL(fileURLWithPath: "/Volumes/Zoom Recorder Test Missing Drive/Meetings")), "missing drive reachable")
+    let contents = try FileManager.default.contentsOfDirectory(atPath: directory.path)
+    try check(contents == [sentinel.lastPathComponent], "probe left temporary files")
+    print("PASS: directory probing creates folders, rejects files and missing drives, preserves existing files")
 }
 
 func checkStopRequest() async throws {
@@ -570,7 +652,55 @@ func checkStopRequest() async throws {
     request.stop()
     await request.wait()
     try check(request.isRequested, "stop not recorded")
+    let raced = StopRequest()
+    let signal = Task {
+        try await Task.sleep(for: .milliseconds(30))
+        raced.signal()
+    }
+    await raced.wait(timeout: 0.2)
+    try await signal.value
+    let nextStart = Date()
+    await raced.wait(timeout: 0.3)
+    try check(Date().timeIntervalSince(nextStart) >= 0.25, "previous deadline woke a later wait")
+    // A signal consumed immediately must not schedule a timeout for the next wait.
+    raced.signal()
+    await raced.wait(timeout: 0.05)
+    let immediateStart = Date()
+    await raced.wait(timeout: 0.2)
+    try check(Date().timeIntervalSince(immediateStart) >= 0.15, "consumed signal left a stray deadline")
     print("PASS: stop request, signal, timeout")
+}
+
+func checkBoundedOperations() async throws {
+    let stop = StopRequest()
+    let cleaned = StopRequest()
+    let operation = Task {
+        try await bounded(stop, onLateResult: { _ in cleaned.stop() }) {
+            try await Task.sleep(for: .milliseconds(350))
+            return 42
+        }
+    }
+    stop.stop()
+    do {
+        _ = try await operation.value
+        throw TestError.failed("stopped operation returned successfully")
+    } catch is CancellationError {}
+    await cleaned.wait(timeout: 1)
+    try check(cleaned.isRequested, "late successful operation was not cleaned up")
+    let immediateCleanup = StopRequest()
+    let value = try await bounded(StopRequest(), onLateResult: { _ in immediateCleanup.stop() }) { 7 }
+    try check(value == 7 && !immediateCleanup.isRequested, "timely operation was discarded")
+    let timedOut = StopRequest()
+    do {
+        _ = try await bounded(StopRequest(), timeout: 0.05, onLateResult: { _ in timedOut.stop() }) {
+            try await Task.sleep(for: .milliseconds(350))
+            return 9
+        }
+        throw TestError.failed("operation exceeded its timeout")
+    } catch is RecorderError {}
+    await timedOut.wait(timeout: 1)
+    try check(timedOut.isRequested, "timed-out operation's late result was not cleaned up")
+    print("PASS: bounded operations cancel promptly and clean up late starts")
 }
 
 @main struct AudioTests {
@@ -584,9 +714,11 @@ func checkStopRequest() async throws {
         try checkMuteIndicators()
         try checkTimeline()
         let folder = URL(fileURLWithPath: arguments[1], isDirectory: true)
+        try checkStorage(folder.appendingPathComponent("storage"))
         try checkNormalizer()
         try checkDevices()
         try await checkStopRequest()
+        try await checkBoundedOperations()
         try await checkCapture(folder.appendingPathComponent("capture"))
         try await checkUnconfirmedVoice(folder.appendingPathComponent("unconfirmed"))
         try await checkSafetyCopy(folder.appendingPathComponent("safety"))

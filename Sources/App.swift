@@ -20,6 +20,8 @@ final class RecorderModel: ObservableObject {
         var title: String
         var detail: String?
         var file: URL?
+        var microphone: URL? = nil
+        var unreadableFolder: URL? = nil
     }
 
     @Published var phase: Phase = .idle
@@ -60,7 +62,7 @@ final class RecorderModel: ObservableObject {
         switch microphone {
         case .unmuted: return "Ваш голос записывается"
         case .muted: return "Микрофон выключен в Zoom"
-        case .unavailable: return "Голос не записывается"
+        case .unavailable: return "Не вижу микрофон Zoom"
         }
     }
     var micIcon: String {
@@ -146,25 +148,12 @@ final class RecorderModel: ObservableObject {
     /// Creates the folder and writes a test file, so a privacy prompt for a protected
     /// folder appears now, while the user is here, rather than at save time.
     nonisolated static func probe(_ folder: URL) -> Bool {
-        guard reachable(folder) else { return false }
-        let test = folder.appendingPathComponent(".zoom-audio-recorder-test")
-        do {
-            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-            try Data().write(to: test)
-            try FileManager.default.removeItem(at: test)
-            return true
-        } catch {
-            return false
-        }
+        RecordingStorage.probe(folder)
     }
 
     /// False for a folder on a drive that is not connected.
     nonisolated static func reachable(_ folder: URL) -> Bool {
-        var existing = folder
-        while !FileManager.default.fileExists(atPath: existing.path), existing.pathComponents.count > 1 {
-            existing.deleteLastPathComponent()
-        }
-        return existing.path != "/Volumes" && FileManager.default.isWritableFile(atPath: existing.path)
+        RecordingStorage.reachable(folder)
     }
 
     func allowed(_ access: Access) -> Bool {
@@ -201,7 +190,7 @@ final class RecorderModel: ObservableObject {
 
     func start() {
         refresh()
-        guard ready, !busy, zoomRunning, !quitting else { return }
+        guard ready, !busy, !recovering, zoomRunning, !quitting else { return }
         // A recording still waiting to be saved stays visible as a banner.
         if unsaved, unrecovered == nil { unrecovered = outcome?.file }
         outcome = nil
@@ -237,7 +226,10 @@ final class RecorderModel: ObservableObject {
                                                           name: RecordingSession.fileName(for: Date()))
                 session = created
                 let summary = try await ZoomAudio.record(into: created.folder, stop: request, events: { event in
-                    Task { @MainActor in self.handle(event) }
+                    Task { @MainActor in
+                        guard self.stop === request else { return }
+                        self.handle(event)
+                    }
                 }, onVoice: { created.markVoice() }, onUncertainVoice: { created.markSafetyCopy() },
                    onControlSeen: { created.markControlSeen() })
                 if summary.needsSafetyCopy { created.markSafetyCopy() }
@@ -249,7 +241,10 @@ final class RecorderModel: ObservableObject {
                 } else {
                     phase = .saving
                     let delivery = try await created.deliver(fallback: Self.defaultFolder) { value in
-                        Task { @MainActor in self.progress = value }
+                        Task { @MainActor in
+                            guard self.stop === request, self.phase == .saving else { return }
+                            self.progress = min(1, max(self.progress ?? 0, value))
+                        }
                     }
                     outcome = Self.outcome(for: delivery, summary: summary, preferred: destination)
                 }
@@ -260,7 +255,7 @@ final class RecorderModel: ObservableObject {
                 if let session, session.hasAudio {
                     // Captured audio stays on disk; the next launch saves it again.
                     outcome = Outcome(kind: .attention, title: "Запись не потеряна",
-                                      detail: "Файл не сохранён: \(Self.sentence(error)) Повторю при следующем запуске.",
+                                      detail: "Файл не сохранён: \(Self.sentence(error)) Можно повторить сохранение.",
                                       file: session.folder)
                 } else {
                     session?.remove()
@@ -286,24 +281,29 @@ final class RecorderModel: ObservableObject {
         return text.hasSuffix(".") ? text : text + "."
     }
 
-    private static func outcome(for delivery: RecordingSession.Delivery, summary: RecordingSummary,
+    private static func outcome(for delivery: RecordingSession.Delivery, summary: RecordingSummary? = nil,
                                 preferred: URL) -> Outcome {
         let size = (try? FileManager.default.attributesOfItem(atPath: delivery.url.path)[.size] as? Int) ?? 0
         var details = [clock(Int(delivery.duration.rounded())) + " · "
                        + ByteCountFormatter.string(fromByteCount: Int64(size), countStyle: .file)]
-        if !summary.hasZoom { details.append("Звук собеседников не получен") }
-        if summary.zoomQuit { details.append("Zoom закрылся — запись остановлена") }
-        if summary.interruptions > 0 { details.append("Связь с Zoom прерывалась: \(summary.interruptions)") }
-        if !summary.hasVoice { details.append("Ваш голос не записан") }
+        if let summary {
+            if !summary.hasZoom { details.append("Звук собеседников не получен") }
+            if summary.zoomQuit { details.append("Zoom закрылся — запись остановлена") }
+            if summary.interruptions > 0 { details.append("Связь с Zoom прерывалась: \(summary.interruptions)") }
+            if !summary.hasVoice && delivery.microphone == nil && summary.hasZoom { details.append("Микрофон оставался выключен или не определялся") }
+        }
         if delivery.microphone != nil { details.append("Кнопка mute не определялась — микрофон сохранён отдельно") }
-        if delivery.incomplete { details.append("Часть звука не прочитана") }
+        if delivery.incomplete { details.append("Часть записи повреждена — исходные файлы сохранены") }
         if delivery.usedFallback {
             details.insert("Папка «\(preferred.lastPathComponent)» недоступна", at: 0)
             return Outcome(kind: .attention, title: "Сохранено в «\(delivery.url.deletingLastPathComponent().lastPathComponent)»",
-                           detail: details.joined(separator: "\n"), file: delivery.url)
+                           detail: details.joined(separator: "\n"), file: delivery.url,
+                           microphone: delivery.microphone, unreadableFolder: delivery.unreadableFolder)
         }
-        return Outcome(kind: delivery.incomplete || delivery.microphone != nil ? .attention : .saved, title: "Сохранено",
-                       detail: details.joined(separator: "\n"), file: delivery.url)
+        return Outcome(kind: delivery.incomplete || delivery.microphone != nil || summary?.hasZoom == false
+                       || (summary?.interruptions ?? 0) > 0 ? .attention : .saved, title: "Сохранено",
+                       detail: details.joined(separator: "\n"), file: delivery.url,
+                       microphone: delivery.microphone, unreadableFolder: delivery.unreadableFolder)
     }
 
     private func handle(_ event: RecorderEvent) {
@@ -331,6 +331,7 @@ final class RecorderModel: ObservableObject {
 
     func finish() {
         guard phase == .recording || phase == .preparing else { return }
+        if let started { elapsed = Int(ProcessInfo.processInfo.systemUptime - started) }
         if phase == .preparing { cancelled = true }
         if phase == .recording { phase = .saving }
         stop?.stop()
@@ -338,7 +339,7 @@ final class RecorderModel: ObservableObject {
 
     /// Saves recordings left by a crash, a forced quit or a failed save.
     func recover() {
-        guard !recovering else { return }
+        guard !recovering, !busy, !quitting else { return }
         recovering = true
         Task {
             let activity = ProcessInfo.processInfo.beginActivity(
@@ -355,7 +356,14 @@ final class RecorderModel: ObservableObject {
                     recovered.append(delivery.url)
                     if outcome?.file == session.folder { outcome = nil }
                     if unrecovered == session.folder { unrecovered = nil }
-                } catch RecorderError.noAudio where session.recordedBytes < 1_000_000 {
+                    if delivery.incomplete || delivery.microphone != nil || delivery.usedFallback {
+                        if outcome == nil {
+                            outcome = Self.outcome(for: delivery,
+                                preferred: URL(fileURLWithPath: session.manifest.destination, isDirectory: true))
+                        }
+                        attention = true
+                    }
+                } catch RecorderError.noAudio where session.recordedBytes == 0 {
                     session.remove()
                 } catch {
                     recorderLog.error("Recovery failed: \(error.localizedDescription, privacy: .public)")
@@ -367,12 +375,6 @@ final class RecorderModel: ObservableObject {
             recovering = false
             if quitting && !busy { NSApplication.shared.reply(toApplicationShouldTerminate: true) }
         }
-    }
-
-    func dismissRecovery() {
-        recovered = []
-        unrecovered = nil
-        attention = false
     }
 
     /// The recovered files were shown; a recording still waiting to be saved stays visible.
@@ -394,10 +396,17 @@ final class RecorderModel: ObservableObject {
         Task {
             let ready = await Task.detached(priority: .userInitiated) { () -> Bool in
                 guard Self.reachable(folder) else { return false }
-                try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-                return true
+                return (try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)) != nil
             }.value
             if ready { NSWorkspace.shared.open(folder) }
+            else {
+                folderAvailable = false
+                let alert = NSAlert()
+                alert.messageText = "Не удалось открыть папку записей"
+                alert.informativeText = "\(folder.path)\n\nПодключите диск или выберите другую папку в приложении."
+                alert.addButton(withTitle: "Понятно")
+                alert.runModal()
+            }
         }
     }
 
@@ -490,6 +499,7 @@ final class RecorderDelegate: NSObject, NSApplicationDelegate {
     #if PREVIEW
     @MainActor func applicationDidFinishLaunching(_ notification: Notification) {
         // Renders one state to a PNG: zoom-audio <output.png> <state>.
+        NSApplication.shared.appearance = NSAppearance(named: CommandLine.arguments.contains("--light") ? .aqua : .darkAqua)
         let model = RecorderModel.shared
         let state = CommandLine.arguments.count > 2 ? CommandLine.arguments[2] : "idle"
         model.screenAllowed = true
@@ -511,12 +521,24 @@ final class RecorderDelegate: NSObject, NSApplicationDelegate {
                                   detail: "Папка «Meetings» недоступна\n47:12 · 38,2 МБ", file: file)
         case "kept":
             model.outcome = .init(kind: .attention, title: "Запись не потеряна",
-                                  detail: "Файл не сохранён: на диске нет места. Повторю при следующем запуске.",
+                                  detail: "Файл не сохранён: на диске нет места. Можно повторить сохранение.",
                                   file: RecordingSession.root.appendingPathComponent("2026-10-05 14-30-00 1A2B3C4D"))
         case "failed":
             model.outcome = .init(kind: .failed, title: "Не удалось записать", detail: "Откройте Zoom и войдите в созвон")
         case "recovered": model.recovered = [file]
         case "recovering": model.recovering = true
+        case "longfolder":
+            model.folder = URL(fileURLWithPath: "/tmp/Очень длинное название папки с записями созвонов команды")
+        case "safety":
+            model.outcome = .init(kind: .attention, title: "Сохранено",
+                detail: "47:12 · 38,2 МБ\nКнопка mute не определялась — микрофон сохранён отдельно",
+                file: file, microphone: file.deletingLastPathComponent().appendingPathComponent("Zoom 2026-10-05 14-30 (микрофон).m4a"))
+        case "unrecovered":
+            model.unrecovered = RecordingSession.root.appendingPathComponent("2026-10-05 14-30-00 1A2B3C4D")
+        case "damaged":
+            model.outcome = .init(kind: .attention, title: "Сохранено",
+                detail: "47:12 · 38,2 МБ\nЧасть записи повреждена — исходные файлы сохранены",
+                file: file, unreadableFolder: RecordingSession.root.deletingLastPathComponent().appendingPathComponent("Unreadable"))
         default: break
         }
         let host = NSHostingView(rootView: RecorderView(model: model)
@@ -580,12 +602,14 @@ struct RecorderCommands: Commands {
         CommandMenu("Запись") {
             Button("Начать запись") { model.start() }
                 .keyboardShortcut("r")
-                .disabled(model.busy || !model.ready || !model.zoomRunning || model.quitting)
+                .disabled(model.busy || model.recovering || !model.ready || !model.zoomRunning || model.quitting)
             Button("Остановить запись") { model.finish() }
                 .keyboardShortcut(".")
                 .disabled(model.phase != .recording && model.phase != .preparing)
             Divider()
             Button("Открыть папку записей") { model.openFolder() }
+            Button("Повторить сохранение") { model.recover() }
+                .disabled(model.busy || model.recovering || !model.unsaved || model.quitting)
             Button("Изменить папку…") { model.chooseFolder() }
                 .disabled(model.busy)
         }
@@ -637,10 +661,17 @@ struct RecorderMenu: View {
             Button("Остановить запись") { model.finish() }
         } else {
             Button("Начать запись") { model.start() }
-                .disabled(model.busy || !model.ready || !model.zoomRunning || model.quitting)
+                .disabled(model.busy || model.recovering || !model.ready || !model.zoomRunning || model.quitting)
         }
         if let file = model.lastFile, !model.busy {
             Button("Показать последнюю запись") { model.reveal([file]) }
+        }
+        if model.unsaved {
+            Button(model.recovering ? "Сохраняю…" : "Повторить сохранение") { model.recover() }
+                .disabled(model.busy || model.recovering || model.quitting)
+        }
+        if let microphone = model.outcome?.microphone {
+            Button("Показать запись микрофона") { model.reveal([microphone]) }
         }
         Button("Открыть папку записей") { model.openFolder() }
         Divider()
@@ -671,6 +702,7 @@ struct RecorderView: View {
                 RecoveryBanner(model: model)
             }
             if !model.ready && !model.busy {
+                if let outcome = model.outcome { OutcomeView(model: model, outcome: outcome) }
                 PermissionsView(model: model)
             } else {
                 switch model.phase {
@@ -718,7 +750,7 @@ struct IdleView: View {
             .buttonStyle(.borderedProminent)
             .controlSize(.large)
             .keyboardShortcut(.defaultAction)
-            .disabled(!model.zoomRunning || model.quitting)
+            .disabled(!model.zoomRunning || model.recovering || model.quitting)
             VStack(spacing: 4) {
                 FolderMenu(model: model)
                 if !model.folderAvailable {
@@ -747,7 +779,8 @@ struct OutcomeView: View {
                 Button { model.reveal([file]) } label: {
                     HStack(spacing: 6) {
                         Image(systemName: file.pathExtension == "m4a" ? "waveform" : "folder")
-                        Text(file.lastPathComponent).lineLimit(1).truncationMode(.middle)
+                        Text(file.pathExtension == "m4a" ? file.lastPathComponent : "Показать исходную запись")
+                            .lineLimit(1).truncationMode(.middle)
                     }
                     .padding(.horizontal, 10)
                     .padding(.vertical, 5)
@@ -764,6 +797,20 @@ struct OutcomeView: View {
                     .multilineTextAlignment(.center)
                     .textSelection(.enabled)
                     .fixedSize(horizontal: false, vertical: true)
+            }
+            if let microphone = outcome.microphone {
+                Button("Показать запись микрофона") { model.reveal([microphone]) }
+                    .buttonStyle(.link)
+                    .font(.callout)
+            }
+            if let folder = outcome.unreadableFolder {
+                Button("Показать исходные файлы") { model.reveal([folder]) }
+                    .buttonStyle(.link)
+                    .font(.callout)
+            }
+            if outcome.file?.pathExtension != "m4a", outcome.kind == .attention {
+                Button(model.recovering ? "Сохраняю…" : "Повторить сохранение") { model.recover() }
+                    .disabled(model.busy || model.recovering || model.quitting)
             }
         }
     }
@@ -892,22 +939,31 @@ struct RecoveryBanner: View {
         HStack(spacing: 8) {
             Image(systemName: model.unrecovered == nil ? "arrow.uturn.backward.circle.fill" : "exclamationmark.triangle.fill")
                 .foregroundStyle(model.unrecovered == nil ? Color.accentColor : .orange)
-            Text(text).font(.callout).lineLimit(2).fixedSize(horizontal: false, vertical: true)
+            Text(text).font(.callout).fixedSize(horizontal: false, vertical: true)
             Spacer(minLength: 4)
-            Button("Показать") {
-                model.reveal(model.unrecovered.map { [$0] } ?? model.recovered)
+            VStack(spacing: 6) {
+                if model.unrecovered != nil {
+                    Button(model.recovering ? "Сохраняю…" : "Повторить") { model.recover() }
+                        .disabled(model.busy || model.recovering || model.quitting)
+                }
+                Button("Показать") {
+                    model.reveal(model.unrecovered.map { [$0] } ?? model.recovered)
+                }
             }
             .controlSize(.small)
-            Button { model.dismissRecovery() } label: { Image(systemName: "xmark") }
-                .buttonStyle(.borderless)
-                .controlSize(.small)
-                .help("Скрыть")
+            if model.unrecovered == nil {
+                Button { model.dismissRecovered() } label: { Image(systemName: "xmark") }
+                    .buttonStyle(.borderless)
+                    .controlSize(.small)
+                    .help("Скрыть")
+                    .accessibilityLabel("Скрыть сообщение о восстановлении")
+            }
         }
         .padding(10)
         .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 10))
     }
     private var text: String {
-        if model.unrecovered != nil { return "Запись ещё не сохранена — повторю при следующем запуске" }
+        if model.unrecovered != nil { return "Запись ещё не сохранена. Можно повторить." }
         return model.recovered.count == 1 ? "Восстановлена прерванная запись"
             : "Восстановлено записей: \(model.recovered.count)"
     }
@@ -925,15 +981,33 @@ struct FolderMenu: View {
                 }
             }
         } label: {
-            Label(model.folder.lastPathComponent, systemImage: "folder")
+            Label {
+                Text(folderName)
+            } icon: { Image(systemName: "folder") }
         } primaryAction: {
             model.openFolder()
         }
         .menuStyle(.borderlessButton)
-        .fixedSize()
+        .frame(maxWidth: wideButton)
         .font(.callout)
         .foregroundStyle(.secondary)
         .help(model.folder.path)
+        .accessibilityLabel("Папка записей: \(model.folder.lastPathComponent)")
+    }
+
+    /// Native macOS menus ignore Text's lineLimit, so fit the title before handing it over.
+    private var folderName: String {
+        let name = model.folder.lastPathComponent
+        let attributes: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 13)]
+        let available = wideButton - 48
+        guard (name as NSString).size(withAttributes: attributes).width > available else { return name }
+        var kept = name.count - 1
+        while kept > 0 {
+            let text = String(name.prefix((kept + 1) / 2)) + "…" + String(name.suffix(kept / 2))
+            if (text as NSString).size(withAttributes: attributes).width <= available { return text }
+            kept -= 1
+        }
+        return "…"
     }
 }
 
@@ -959,6 +1033,7 @@ struct HelpView: View {
             Text("Войдите в созвон Zoom → «Начать запись» → «Остановить». Файл появится в папке записей.")
             Text("Ваш голос записывается, только когда микрофон включён в Zoom. В Zoom и macOS должен быть выбран один микрофон.")
             Text("Прерванная запись восстанавливается при следующем запуске.")
+            Text("Если сохранение не удалось, нажмите «Повторить сохранение». Если кнопка mute не определялась, проверьте отдельную запись микрофона рядом с основным файлом.")
             Text("Предупредите участников о записи.").foregroundStyle(.secondary)
         }
         .font(.callout)

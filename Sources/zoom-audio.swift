@@ -29,9 +29,11 @@ private final class Once: @unchecked Sendable {
     private let lock = NSLock()
     private var done = false
     var isDone: Bool { lock.withLock { done } }
-    func run(_ body: () -> Void) {
+    @discardableResult
+    func run(_ body: () -> Void) -> Bool {
         let first = lock.withLock { defer { done = true }; return !done }
         if first { body() }
+        return first
     }
 }
 
@@ -51,13 +53,14 @@ func waitAtMost(_ seconds: Double, _ operation: @escaping () async -> Void) asyn
 /// Runs `operation`, but gives up when Stop is pressed or after `timeout`, so a hung
 /// ScreenCaptureKit call can never block stopping and saving.
 func bounded<T>(_ stop: StopRequest, timeout: TimeInterval? = nil,
+                onLateResult: @escaping (T) async -> Void = { _ in },
                 _ operation: @escaping () async throws -> T) async throws -> T {
     let once = Once()
     return try await withCheckedThrowingContinuation { (result: CheckedContinuation<T, Error>) in
         Task {
             do {
                 let value = try await operation()
-                once.run { result.resume(returning: value) }
+                if !once.run({ result.resume(returning: value) }) { await onLateResult(value) }
             } catch {
                 once.run { result.resume(throwing: error) }
             }
@@ -472,15 +475,15 @@ final class StopRequest: @unchecked Sendable {
     private var continuation: CheckedContinuation<Void, Never>?
     private var requested = false
     private var signaled = false
+    private var generation: UInt64 = 0
 
     var isRequested: Bool { lock.withLock { requested } }
 
     func wait(timeout: TimeInterval? = nil) async {
-        if let timeout {
-            DispatchQueue.global().asyncAfter(deadline: .now() + timeout) { [weak self] in self?.signal() }
-        }
         await withCheckedContinuation { next in
             lock.lock()
+            generation &+= 1
+            let waiting = generation
             if requested || signaled {
                 signaled = false
                 lock.unlock()
@@ -488,8 +491,25 @@ final class StopRequest: @unchecked Sendable {
             } else {
                 continuation = next
                 lock.unlock()
+                if let timeout {
+                    DispatchQueue.global().asyncAfter(deadline: .now() + timeout) { [weak self] in
+                        self?.timeout(waiting)
+                    }
+                }
             }
         }
+    }
+
+    /// An old deadline must never wake a later wait after a stream error woke this one.
+    private func timeout(_ waiting: UInt64) {
+        lock.lock()
+        guard generation == waiting, let next = continuation else {
+            lock.unlock()
+            return
+        }
+        continuation = nil
+        lock.unlock()
+        next.resume()
     }
 
     func stop() {
@@ -1433,7 +1453,10 @@ struct ZoomAudio {
         }
         watcher.start()
         do {
-            try await bounded(stop, timeout: timeout) { try await stream.startCapture() }
+            try await bounded(stop, timeout: timeout, onLateResult: { _ in
+                // startCapture can finish after cancellation and after the first stop attempt.
+                try? await stream.stopCapture()
+            }) { try await stream.startCapture() }
         } catch {
             watcher.stop()
             capture.queue.sync { capture.attach(nil) }
