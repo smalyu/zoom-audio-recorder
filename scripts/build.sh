@@ -3,7 +3,7 @@ set -euo pipefail
 cd "${0:A:h}/.."
 cache_dir="$(mktemp -d)"
 trap 'rm -rf "$cache_dir"' EXIT
-app="$PWD/build/Zoom Audio Recorder.app"
+app="$PWD/build.noindex/Zoom Audio Recorder.app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp Resources/Info.plist "$app/Contents/Info.plist"
 for arch in arm64 x86_64; do

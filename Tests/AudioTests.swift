@@ -64,6 +64,7 @@ func tone(_ buffer: AVAudioPCMBuffer, at seconds: Double, frequency: Double) -> 
 }
 @main struct AudioTests {
     static func main() async throws {
+        try checkMuteDetection()
         let folder = URL(fileURLWithPath: CommandLine.arguments[1], isDirectory: true)
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         let original = try sample(frequency: 880, index: 0)
@@ -109,6 +110,9 @@ func tone(_ buffer: AVAudioPCMBuffer, at seconds: Double, frequency: Double) -> 
         let remoteOnly = folder.appendingPathComponent("remote-only.m4a")
         try await saveAudio(zoom: zoom.url, mic: nil, output: remoteOnly, delayMilliseconds: 0)
         try check(Data(contentsOf: remoteOnly) == Data(contentsOf: zoom.url), "remote-only data changed")
+        let voiceOnly = folder.appendingPathComponent("voice-only.m4a")
+        try await saveAudio(zoom: nil, mic: mic.url, output: voiceOnly, delayMilliseconds: 0)
+        try check(Data(contentsOf: voiceOnly) == Data(contentsOf: mic.url), "own voice lost without remote audio")
         print("PASS: PCM silence, source preservation, timestamps, mute gaps, delayed mix, one audio track, zero video, remote-only export")
     }
 }

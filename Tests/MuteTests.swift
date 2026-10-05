@@ -1,0 +1,19 @@
+import Foundation
+
+func checkMuteDetection() throws {
+    var matcher = ZoomMuteLabels()
+    matcher.mute.append("выключить мой звук")
+    matcher.unmute.append("включить мой звук")
+    try check(matcher.state(labels: ["Mute my audio (⇧⌘A)"], role: "AXMenuItem", enabled: true) == .unmuted, "own menu action not recognized")
+    try check(matcher.state(labels: ["Unmute my audio"], role: "AXMenuItem", enabled: true) == .muted, "unmute confused with mute")
+    try check(matcher.state(labels: ["Mute my audio"], role: "AXMenuItem", enabled: false) == nil, "disabled menu implies a meeting")
+    try check(matcher.state(labels: ["Включить мой звук"], role: "AXCheckBox", enabled: true) == .muted, "localized checkbox not recognized")
+    try check(matcher.state(labels: ["Mute (⇧⌘A)"], role: "AXButton", enabled: true, inToolbar: true) == .unmuted, "toolbar mute not recognized")
+    try check(matcher.state(labels: ["Unmute"], role: "AXButton", enabled: true, inToolbar: true) == .muted, "toolbar unmute not recognized")
+    try check(matcher.state(labels: ["Mute"], role: "AXButton", enabled: true) == nil, "participant mute enabled own microphone")
+    try check(matcher.state(labels: ["Mute all"], role: "AXButton", enabled: true, inToolbar: true) == nil, "mute all enabled own microphone")
+    try check(matcher.state(labels: ["Audio"], role: "AXButton", enabled: true, inToolbar: true) == nil, "unknown audio state guessed")
+    try check(matcher.state(labels: ["Mute my audio", "Mute/unmute my audio"], role: "AXMenuItem", enabled: true) == .unmuted, "generic help overrode current menu action")
+    try check(matcher.state(labels: ["Mute/unmute my audio"], role: "AXMenuItem", enabled: true) == nil, "toggle description guessed a state")
+    print("PASS: own menu, disabled menu, localized checkbox, toolbar, participant isolation, unknown state")
+}

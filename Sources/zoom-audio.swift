@@ -116,6 +116,33 @@ final class StopRequest {
 // of its own mute button through macOS Accessibility. Unknown means muted.
 enum ZoomMuteState { case muted, unmuted, unavailable }
 
+struct ZoomMuteLabels {
+    var mute = ["mute my audio", "выключить мой звук"]
+    var unmute = ["unmute my audio", "включить мой звук"]
+    var shortMute = ["mute"]
+    var shortUnmute = ["unmute"]
+    var ambiguous = ["mute/unmute my audio"]
+
+    func state(labels: [String], role: String, enabled: Bool,
+               inToolbar: Bool = false) -> ZoomMuteState? {
+        guard enabled, ["AXButton", "AXCheckBox", "AXMenuItem"].contains(role) else { return nil }
+        let texts = labels.map { $0.lowercased().trimmingCharacters(in: .whitespacesAndNewlines) }
+        // Prefer the current action title over a generic shortcut/help description.
+        for text in texts where !ambiguous.contains(where: text.contains) {
+            if unmute.contains(where: text.contains) { return .muted }
+            if mute.contains(where: text.contains) { return .unmuted }
+        }
+        // A generic participant button must never enable our own microphone.
+        guard inToolbar, role != "AXMenuItem" else { return nil }
+        func matches(_ text: String, _ names: [String]) -> Bool {
+            names.contains { text == $0 || text.hasPrefix($0 + " (") || text.hasPrefix($0 + " [") }
+        }
+        if texts.contains(where: { matches($0, shortUnmute) }) { return .muted }
+        if texts.contains(where: { matches($0, shortMute) }) { return .unmuted }
+        return nil
+    }
+}
+
 private final class ZoomMuteWatcher {
     private let application: AXUIElement
     private let lock = NSLock()
@@ -124,8 +151,9 @@ private final class ZoomMuteWatcher {
     private var hasReported = false
     private var timer: DispatchSourceTimer?
     private let onChange: (ZoomMuteState) -> Void
-    private var muteLabels = ["mute my audio", "выключить мой звук"]
-    private var unmuteLabels = ["unmute my audio", "включить мой звук"]
+    private var labels = ZoomMuteLabels()
+    private var cachedElement: AXUIElement?
+    private var cachedInToolbar = false
 
     init(pid: pid_t, bundleURL: URL?, onChange: @escaping (ZoomMuteState) -> Void) {
         application = AXUIElementCreateApplication(pid)
@@ -137,8 +165,11 @@ private final class ZoomMuteWatcher {
                                               inDirectory: nil, forLocalization: language),
                       let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
                       let strings = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: String] else { continue }
-                if let value = strings["Mute My Audio"] { muteLabels.append(value.lowercased()) }
-                if let value = strings["Unmute My Audio"] { unmuteLabels.append(value.lowercased()) }
+                if let value = strings["Mute My Audio"] { labels.mute.append(value.lowercased()) }
+                if let value = strings["Unmute My Audio"] { labels.unmute.append(value.lowercased()) }
+                if let value = strings["Mute"] { labels.shortMute.append(value.lowercased()) }
+                if let value = strings["Unmute"] { labels.shortUnmute.append(value.lowercased()) }
+                if let value = strings["LN_Hotkey_Mute_Audio_123974"] { labels.ambiguous.append(value.lowercased()) }
             }
         }
     }
@@ -163,8 +194,7 @@ private final class ZoomMuteWatcher {
     }
 
     private func refresh() {
-        var budget = 1500
-        let next = findMuteAction(in: application, depth: 0, remaining: &budget) ?? .unavailable
+        let next = currentState()
         lock.lock()
         unmuted = (next == .unmuted)
         let changed = !hasReported || next != lastReported
@@ -174,27 +204,49 @@ private final class ZoomMuteWatcher {
         if changed { onChange(next) }
     }
 
-    private func findMuteAction(in element: AXUIElement, depth: Int, remaining: inout Int) -> ZoomMuteState? {
-        guard depth < 12, remaining > 0 else { return nil }
+    private func currentState() -> ZoomMuteState {
+        if let cachedElement, let state = state(of: cachedElement, inToolbar: cachedInToolbar) { return state }
+        cachedElement = nil
+        var budget = 2000
+        // The own-audio menu command is available even when meeting controls are hidden.
+        if let menu = attribute(kAXMenuBarAttribute as CFString, of: application),
+           CFGetTypeID(menu) == AXUIElementGetTypeID(),
+           let state = findMuteAction(in: unsafeBitCast(menu, to: AXUIElement.self),
+                                     depth: 0, inToolbar: false, remaining: &budget) { return state }
+        let windows = attribute(kAXWindowsAttribute as CFString, of: application) as? [AXUIElement] ?? []
+        for window in windows {
+            if let state = findMuteAction(in: window, depth: 0, inToolbar: false, remaining: &budget) { return state }
+        }
+        return .unavailable
+    }
+
+    private func state(of element: AXUIElement, inToolbar: Bool) -> ZoomMuteState? {
+        let role = attribute(kAXRoleAttribute as CFString, of: element) as? String ?? ""
+        guard ["AXButton", "AXCheckBox", "AXMenuItem"].contains(role) else { return nil }
+        // Disabled menu items exist before joining a meeting and must be ignored.
+        let enabled = attribute(kAXEnabledAttribute as CFString, of: element) as? Bool
+        guard enabled != false, role != "AXMenuItem" || enabled == true else { return nil }
+        let text = [kAXTitleAttribute, kAXDescriptionAttribute, kAXHelpAttribute]
+            .compactMap { attribute($0 as CFString, of: element) as? String }
+        return labels.state(labels: text, role: role, enabled: true, inToolbar: inToolbar)
+    }
+
+    private func findMuteAction(in element: AXUIElement, depth: Int, inToolbar: Bool,
+                              remaining: inout Int) -> ZoomMuteState? {
+        guard depth < 24, remaining > 0 else { return nil }
         remaining -= 1
         let role = attribute(kAXRoleAttribute as CFString, of: element) as? String ?? ""
-        if role == (kAXButtonRole as String) {
-            let labels = [kAXTitleAttribute, kAXDescriptionAttribute, kAXHelpAttribute]
-                .compactMap { attribute($0 as CFString, of: element) as? String }
-                .joined(separator: " ").lowercased()
-            // The button names the action that a click would perform.
-            if unmuteLabels.contains(where: labels.contains) {
-                return .muted
-            }
-            if muteLabels.contains(where: labels.contains) {
-                return .unmuted
-            }
+        let toolbar = inToolbar || role == "AXToolbar"
+        if let state = state(of: element, inToolbar: toolbar) {
+            cachedElement = element
+            cachedInToolbar = toolbar
+            return state
         }
         guard let children = attribute(kAXChildrenAttribute as CFString, of: element) as? [AXUIElement] else {
             return nil
         }
         for child in children {
-            if let state = findMuteAction(in: child, depth: depth + 1, remaining: &remaining) { return state }
+            if let state = findMuteAction(in: child, depth: depth + 1, inToolbar: toolbar, remaining: &remaining) { return state }
             if remaining <= 0 { break }
         }
         return nil
@@ -205,6 +257,48 @@ private final class ZoomMuteWatcher {
         guard AXUIElementCopyAttributeValue(element, name, &value) == .success else { return nil }
         return value
     }
+
+    func diagnosticSnapshot() -> [String: Any] {
+        var controls = [[String: Any]]()
+        var budget = 1500
+        func visit(_ element: AXUIElement, depth: Int) {
+            guard depth < 24, budget > 0 else { return }
+            budget -= 1
+            let role = attribute(kAXRoleAttribute as CFString, of: element) as? String ?? ""
+            if ["AXButton", "AXCheckBox", "AXMenuItem"].contains(role) {
+                let title = attribute(kAXTitleAttribute as CFString, of: element) as? String ?? ""
+                let description = attribute(kAXDescriptionAttribute as CFString, of: element) as? String ?? ""
+                let help = attribute(kAXHelpAttribute as CFString, of: element) as? String ?? ""
+                let text = (title + " " + description + " " + help).lowercased()
+                if ["audio", "mute", "микроф", "мой звук"].contains(where: text.contains) {
+                    controls.append(["role": role, "title": title, "description": description,
+                        "help": help, "enabled": attribute(kAXEnabledAttribute as CFString, of: element) as? Bool ?? false,
+                        "identifier": attribute(kAXIdentifierAttribute as CFString, of: element) as? String ?? "",
+                        "value": String(describing: attribute(kAXValueAttribute as CFString, of: element) ?? "" as CFString)])
+                }
+            }
+            let children = attribute(kAXChildrenAttribute as CFString, of: element) as? [AXUIElement] ?? []
+            for child in children { visit(child, depth: depth + 1) }
+        }
+        if let menu = attribute(kAXMenuBarAttribute as CFString, of: application),
+           CFGetTypeID(menu) == AXUIElementGetTypeID() { visit(unsafeBitCast(menu, to: AXUIElement.self), depth: 0) }
+        for window in attribute(kAXWindowsAttribute as CFString, of: application) as? [AXUIElement] ?? [] {
+            visit(window, depth: 0)
+        }
+        return ["state": String(describing: currentState()), "controls": controls]
+    }
+}
+
+func zoomMicrophoneDiagnostics() -> [String: Any] {
+    guard AXIsProcessTrusted() else { return ["accessAllowed": false] }
+    guard let zoom = NSRunningApplication.runningApplications(withBundleIdentifier: "us.zoom.xos").first else {
+        return ["accessAllowed": true, "zoomRunning": false]
+    }
+    let watcher = ZoomMuteWatcher(pid: zoom.processIdentifier, bundleURL: zoom.bundleURL, onChange: { _ in })
+    var result = watcher.diagnosticSnapshot()
+    result["accessAllowed"] = true
+    result["zoomRunning"] = true
+    return result
 }
 
 func silence(_ sample: CMSampleBuffer) throws -> CMSampleBuffer {
@@ -274,7 +368,12 @@ private final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 }
 
-func saveAudio(zoom: URL, mic: URL?, output: URL, delayMilliseconds: Int) async throws {
+func saveAudio(zoom: URL?, mic: URL?, output: URL, delayMilliseconds: Int) async throws {
+    guard let zoom else {
+        guard let mic else { throw RecorderError.message("Не получено ни одной аудиодорожки") }
+        try FileManager.default.copyItem(at: mic, to: output)
+        return
+    }
     guard let mic else {
         try FileManager.default.copyItem(at: zoom, to: output)
         return
@@ -389,12 +488,14 @@ struct ZoomAudio {
         let interrupted = capture.streamError ?? stopError
         let hasZoom = try await capture.zoom.finish()
         let hasMic = try await capture.mic.finish()
-        guard hasZoom else { throw RecorderError.message("Zoom не выдал звук: проверьте вывод аудио и разрешение записи экрана") }
-        let difference = hasMic ? Int(((capture.mic.firstTime! - capture.zoom.firstTime!).seconds * 1000).rounded()) : 0
+        guard hasZoom || (hasMic && capture.hadUnmutedMicrophone) else {
+            throw RecorderError.message("Звук не получен. Войдите в созвон Zoom и проверьте индикатор микрофона в рекордере.")
+        }
+        let difference = hasMic && hasZoom ? Int(((capture.mic.firstTime! - capture.zoom.firstTime!).seconds * 1000).rounded()) : 0
         let completed = output.deletingLastPathComponent()
             .appendingPathComponent(".zoom-recording-\(UUID().uuidString).m4a")
         defer { try? FileManager.default.removeItem(at: completed) }
-        try await saveAudio(zoom: capture.zoom.url, mic: hasMic ? capture.mic.url : nil,
+        try await saveAudio(zoom: hasZoom ? capture.zoom.url : nil, mic: hasMic ? capture.mic.url : nil,
                             output: completed, delayMilliseconds: difference)
         if FileManager.default.fileExists(atPath: output.path) {
             _ = try FileManager.default.replaceItemAt(output, withItemAt: completed)

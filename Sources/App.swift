@@ -45,7 +45,7 @@ final class RecorderModel: ObservableObject {
         switch microphone {
         case .unmuted: return "Ваш микрофон записывается"
         case .muted: return "Ваш микрофон выключен в Zoom"
-        case .unavailable: return "Микрофон не записывается: состояние Zoom недоступно"
+        case .unavailable: return "Ваш голос не записывается — проверьте окно созвона Zoom"
         }
     }
     var micColor: Color {
@@ -161,6 +161,21 @@ final class RecorderModel: ObservableObject {
 }
 
 final class RecorderDelegate: NSObject, NSApplicationDelegate {
+    #if !PREVIEW
+    @MainActor func applicationDidFinishLaunching(_ notification: Notification) {
+        // Read-only developer diagnostics run under this app's own authorization.
+        let arguments = CommandLine.arguments
+        guard let flag = arguments.firstIndex(of: "--diagnose-zoom"), arguments.count > flag + 1 else { return }
+        let path = arguments[flag + 1]
+        Task.detached {
+            let result = zoomMicrophoneDiagnostics()
+            if let data = try? JSONSerialization.data(withJSONObject: result, options: [.prettyPrinted, .sortedKeys]) {
+                try? data.write(to: URL(fileURLWithPath: path), options: .atomic)
+            }
+            await MainActor.run { NSApplication.shared.terminate(nil) }
+        }
+    }
+    #endif
     #if PREVIEW
     @MainActor func applicationDidFinishLaunching(_ notification: Notification) {
         DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
@@ -264,6 +279,10 @@ struct RecorderView: View {
                 if model.phase == .recording {
                     Label(model.micText, systemImage: model.microphone == .unmuted ? "mic.fill" : "mic.slash.fill")
                         .font(.system(size: 12)).foregroundStyle(model.micColor)
+                    if model.microphone == .unavailable {
+                        Text("Войдите в созвон и покажите панель с кнопкой микрофона. Звук собеседников продолжает записываться.")
+                            .font(.system(size: 12)).foregroundStyle(.secondary)
+                    }
                 } else {
                     Text(model.phase == .finished ? "Файл M4A готов. Его можно отправить коллегам." :
                         "Запишет звук Zoom и ваш голос, когда микрофон включён в Zoom.")

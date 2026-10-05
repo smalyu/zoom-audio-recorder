@@ -4,3 +4,4 @@ build/
 *.zip
 *.m4a
 .idea/
+build.noindex/
