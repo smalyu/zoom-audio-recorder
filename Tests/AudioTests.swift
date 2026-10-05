@@ -143,27 +143,45 @@ func checkDevices() throws {
     print("PASS: multichannel devices without speaker positions")
 }
 
-/// Polls of Zoom's mute control start every 0.2 s and finish 10 ms later, like the watcher's.
+/// Polls of Zoom's mute control start every 20 ms and finish 5 ms later, like the
+/// watcher's; while Zoom is `busy` they get no answer.
 struct MutePolls {
     var unmuted: (Double) -> Bool
-    var readings = MuteReadings()
+    var busy: (Double) -> Bool = { _ in false }
+    var timeline = MuteTimeline()
     private var next = 0
-    init(unmuted: @escaping (Double) -> Bool) { self.unmuted = unmuted }
+    init(unmuted: @escaping (Double) -> Bool, busy: @escaping (Double) -> Bool = { _ in false }) {
+        self.unmuted = unmuted
+        self.busy = busy
+    }
     mutating func advance(to clock: Double) {
-        while Double(next) * 0.2 + 0.01 <= clock + 1e-9 {
-            let poll = Double(next) * 0.2
-            if unmuted(poll) {
-                readings.unmuted = 1000 + poll
-                readings.since = min(readings.since, 1000 + poll)
-                readings.open = true
-            } else {
-                readings.other = 1000 + poll
-                readings.since = .infinity
-                readings.open = false
-            }
+        while Double(next) * 0.02 + 0.005 <= clock + 1e-9 {
+            let poll = Double(next) * 0.02
+            if !busy(poll) { timeline.readings.append((1000 + poll, unmuted(poll))) }
             next += 1
         }
     }
+}
+
+func checkTimeline() throws {
+    let on = { (start: Double, end: Double) -> MuteTimeline in
+        MuteTimeline(readings: stride(from: 0.0, to: 4, by: 0.02).map { ($0, $0 >= start && $0 < end) })
+    }
+    let edges = on(1.0, 2.0).voice(from: 0, to: 3.5)!
+    try check(edges.count == 1 && edges[0].lowerBound <= 1.0 && edges[0].upperBound >= 2.0, "speech at an edge lost: \(edges)")
+    try check(edges[0].lowerBound >= 0.9 && edges[0].upperBound <= 2.1, "muted speech kept far from an edge: \(edges)")
+    try check(on(1.0, 2.0).voice(from: 3.0, to: 3.95) == nil, "decided before the next reading")
+    try check(MuteTimeline().voice(from: 0, to: 1, final: true) == [], "no readings must mean silence")
+    // Zoom busy between two "on" readings: its state could not change, the voice holds.
+    let busy = MuteTimeline(readings: [(0.98, true), (3.0, true)])
+    try check(busy.voice(from: 1, to: 2.9) == [1..<2.9], "a busy Zoom silenced the voice")
+    // A gap means Zoom was busy, so a change belongs to the later reading: speech runs on
+    // up to a mute reading, and an unmute starts just before its reading.
+    let muting = MuteTimeline(readings: [(1.0, true), (2.0, false)]).voice(from: 1, to: 1.9)!
+    try check(muting == [1..<1.9], "speech before a delayed mute reading was lost: \(muting)")
+    let unmuting = MuteTimeline(readings: [(1.0, false), (2.0, true)]).voice(from: 1, to: 2, final: true)!
+    try check(unmuting.count == 1 && unmuting[0].lowerBound >= 1.9, "muted audio before a delayed unmute was kept: \(unmuting)")
+    print("PASS: mute timeline keeps edges, stays silent inside, holds across a busy Zoom")
 }
 
 /// Zoom gaps, a long gap that opens a new part, a format change, mute windows where
@@ -174,7 +192,7 @@ func checkCapture(_ folder: URL) async throws {
     var clock = 0.0
     capture.now = { CMTime(seconds: 1000 + clock, preferredTimescale: 48_000) }
     var polls = MutePolls { (0.8..<1.8).contains($0) || $0 >= 3.0 }
-    capture.muteReadings = { polls.readings }
+    capture.muteTimeline = { _ in polls.timeline }
     var voice = 0
     capture.onVoice = { voice += 1 }
     for index in 0..<45 {
@@ -199,8 +217,12 @@ func checkCapture(_ folder: URL) async throws {
                     of: .audio)
     await capture.zoom.finish()
     await capture.mic.finish()
+    await capture.raw.finish()
     try check(capture.zoom.failures == 0 && capture.mic.failures == 0, "writer failed: \(String(describing: capture.zoom.failure ?? capture.mic.failure))")
     try check(capture.hadVoice && voice == 1, "voice not reported once")
+    try check(!capture.needsSafetyCopy, "a working detector asked for the safety copy")
+    let raw = try decode(AudioTrack.parts(named: "raw", in: folder)[0].url)
+    try check(tone(raw, at: 2.5, frequency: 880) > 0.09, "safety copy lacks the muted part")
     let zoomParts = AudioTrack.parts(named: "zoom", in: folder)
     let micParts = AudioTrack.parts(named: "mic", in: folder)
     try check(zoomParts.map(\.start) == [0, 768_000], "unexpected Zoom parts: \(zoomParts.map(\.start))")
@@ -210,11 +232,12 @@ func checkCapture(_ folder: URL) async throws {
     let length = try await exportRecording(zoom: zoomParts, mic: micParts, to: output).duration
     try check(abs(length - 16.1) < 0.15, "mixed duration \(length)")
     let decoded = try decode(output)
-    for time in [0.35, 1.55, 2.5, 2.8] {
+    for time in [0.35, 2.0, 2.5, 2.7] {
         try check(tone(decoded, at: time, frequency: 880) < 0.003, "microphone audible while muted at \(time)")
     }
-    for time in [0.95, 1.15, 3.2, 4.2] {
-        try check(tone(decoded, at: time, frequency: 880) > 0.05, "microphone missing or shifted at \(time)")
+    // Right after unmute and right before mute: nothing of the speech may be lost.
+    for time in [0.8, 1.15, 1.7, 3.0, 4.2] {
+        try check(tone(decoded, at: time, frequency: 880) > 0.09, "microphone missing or shifted at \(time)")
     }
     try check(tone(decoded, at: 2.15, frequency: 440) < 0.003, "Zoom gap collapsed or not silent")
     for time in [1.5, 2.65, 3.6, 16.02] {
@@ -226,16 +249,15 @@ func checkCapture(_ folder: URL) async throws {
     let remote = folder.appendingPathComponent("remote.m4a")
     try await exportRecording(zoom: [zoomParts[0]], mic: [], to: remote)
     try check(tone(try decode(remote), at: 1.5, frequency: 440) > 0.09, "single-track export lost volume")
-    print("PASS: gap filling, new part after a long gap, format change, voice only after a confirming mute reading, aligned mix")
+    print("PASS: gap filling, new part after a long gap, format change, voice exactly while unmuted, aligned mix")
 }
 
-/// The gate was open, but no mute reading ever confirmed it: nothing of the voice is kept.
+/// No mute reading ever saw the microphone on: nothing of the voice is kept.
 func checkUnconfirmedVoice(_ folder: URL) async throws {
     try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
     let capture = Capture(directory: folder, realtime: false)
     var clock = 0.0
     capture.now = { CMTime(seconds: 1000 + clock, preferredTimescale: 48_000) }
-    capture.muteReadings = { MuteReadings(since: 0, open: true) }
     for index in 0..<30 {
         clock = Double(index + 1) * 0.1
         capture.receive(try sample(frequency: 880, start: Int64(48_000_000 + index * 4800)), of: .microphone)
@@ -247,7 +269,47 @@ func checkUnconfirmedVoice(_ folder: URL) async throws {
     for time in [0.2, 1.0, 2.5] {
         try check(tone(decoded, at: time, frequency: 880) < 0.003, "unconfirmed microphone audio written at \(time)")
     }
-    print("PASS: microphone audio without a confirming reading becomes silence")
+    print("PASS: microphone audio without an \"on\" reading becomes silence")
+}
+
+/// Whether speech the mute detector could not judge asks for the whole microphone.
+func checkSafetyCopy(_ folder: URL) async throws {
+    // (name, control missing at time t, seconds of speech, expected, live requests);
+    // the control counts as seen once it has been visible.
+    let cases: [(String, (Double) -> Bool, Int, Bool, Int)] = [
+        ("vanished mid-meeting", { (2.0..<7.0).contains($0) }, 10, true, 1),
+        ("before joining", { $0 < 6.0 }, 10, false, 0),
+        ("listen only", { _ in false }, 12, false, 0),
+        ("never found", { _ in true }, 12, true, 0),
+    ]
+    for (name, missing, seconds, expected, requests) in cases {
+        let directory = folder.appendingPathComponent(name)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let capture = Capture(directory: directory, realtime: false)
+        var clock = 0.0
+        var polls = MutePolls { _ in false }
+        capture.now = { CMTime(seconds: 1000 + clock, preferredTimescale: 48_000) }
+        capture.muteTimeline = { _ in polls.timeline }
+        var seen = false
+        capture.control = {
+            seen = seen || !missing(clock)
+            return (seen, missing(clock))
+        }
+        var asked = 0
+        capture.onUncertainVoice = { asked += 1 }
+        for index in 0..<(seconds * 10) {
+            clock = Double(index + 1) * 0.1
+            polls.advance(to: clock)
+            capture.receive(try sample(frequency: 880, start: Int64(48_000_000 + index * 4800)), of: .microphone)
+        }
+        capture.releaseVoice(flushing: true)
+        await capture.mic.finish()
+        await capture.raw.finish()
+        try check(!capture.hadVoice, "\(name): voice kept while muted")
+        try check(capture.needsSafetyCopy == expected, "\(name): safety copy \(capture.needsSafetyCopy), expected \(expected)")
+        try check(asked == requests, "\(name): live requests \(asked), expected \(requests)")
+    }
+    print("PASS: the whole microphone is kept only when the mute detector failed")
 }
 
 /// Delivery stalls for 2.5 s and the backlog arrives at once: nothing is lost or moved.
@@ -273,14 +335,14 @@ func checkLateDelivery(_ folder: URL) async throws {
 }
 
 /// Writes 20 ms microphone buffers delivered as `arrival` says, with Zoom's label following `unmuted`.
-func voiceTrack(_ folder: URL, seconds: Double, unmuted: @escaping (Double) -> Bool,
+func voiceTrack(_ folder: URL, seconds: Double, unmuted: @escaping (Double) -> Bool, busy: @escaping (Double) -> Bool = { _ in false },
                 arrival: (Int) -> Double) async throws -> AVAudioPCMBuffer {
     try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
     let capture = Capture(directory: folder, realtime: false)
     var clock = 0.0
-    var polls = MutePolls(unmuted: unmuted)
+    var polls = MutePolls(unmuted: unmuted, busy: busy)
     capture.now = { CMTime(seconds: 1000 + clock, preferredTimescale: 48_000) }
-    capture.muteReadings = { polls.readings }
+    capture.muteTimeline = { _ in polls.timeline }
     for index in 0..<Int(seconds / 0.02) {
         clock = arrival(index)
         polls.advance(to: clock)
@@ -298,21 +360,38 @@ func checkMuteEdges(_ folder: URL) async throws {
         let captured = Double($0) * 0.02
         return (1.0..<2.5).contains(captured) ? 2.6 : captured + 0.025
     }
-    for time in [1.2, 1.6, 1.9] {
+    for time in [1.2, 1.6, 1.8] {
         try check(tone(stalled, at: time, frequency: 880) < 0.003, "backlog spoken while muted was kept at \(time)")
     }
-    try check(tone(stalled, at: 3.0, frequency: 880) > 0.05, "voice after unmute lost")
+    for time in [2.0, 3.0] {
+        try check(tone(stalled, at: time, frequency: 880) > 0.09, "voice after unmute lost at \(time)")
+    }
     // A short mute from 2.03 to 2.39 s with exactly one poll inside it.
     let brief = try await voiceTrack(folder.appendingPathComponent("brief"), seconds: 4, unmuted: { !(2.03..<2.39).contains($0) }) {
         Double($0) * 0.02 + 0.025
     }
-    for time in [2.05, 2.15, 2.25] {
-        try check(tone(brief, at: time, frequency: 880) < 0.003, "speech during a short mute was kept at \(time)")
+    try check(tone(brief, at: 2.15, frequency: 880) < 0.003, "speech inside a short mute was kept")
+    // The speech up to the mute and from the unmute stays complete.
+    for time in [1.5, 1.93, 2.4, 3.0] {
+        try check(tone(brief, at: time, frequency: 880) > 0.09, "voice around a short mute lost at \(time)")
     }
-    for time in [1.5, 3.0] {
-        try check(tone(brief, at: time, frequency: 880) > 0.05, "voice around a short mute lost at \(time)")
+    // The recording's first buffers arrive 1.5 s late: the mute edges must not move.
+    let lateStart = try await voiceTrack(folder.appendingPathComponent("late-start"), seconds: 7, unmuted: { (3.0..<6.0).contains($0) }) {
+        max(Double($0) * 0.02, 1.5) + 0.025
     }
-    print("PASS: a stalled backlog and a short mute never let muted speech through")
+    for time in [1.6, 2.7, 6.2] {
+        try check(tone(lateStart, at: time, frequency: 880) < 0.003, "late first buffers shifted the mute edge at \(time)")
+    }
+    for time in [3.0, 5.9] {
+        try check(tone(lateStart, at: time, frequency: 880) > 0.09, "late first buffers lost voice at \(time)")
+    }
+    // Zoom does not answer for 1.5 s while the user keeps talking unmuted.
+    let busy = try await voiceTrack(folder.appendingPathComponent("busy"), seconds: 4, unmuted: { _ in true },
+                                    busy: { (1.0..<2.5).contains($0) }) { Double($0) * 0.02 + 0.025 }
+    for time in [1.2, 2.0, 2.4] {
+        try check(tone(busy, at: time, frequency: 880) > 0.09, "voice lost while Zoom was busy at \(time)")
+    }
+    print("PASS: speech kept right up to mute and from unmute; muted backlog and short mutes stay silent; a busy Zoom loses nothing")
 }
 
 /// The first buffers arrive 3 s late, then delivery catches up: nothing is lost.
@@ -369,7 +448,7 @@ func crashChild(root: URL, destination: URL) async throws -> Never {
     }
     try await Task.sleep(for: .milliseconds(500))
     kill(getpid(), SIGKILL)
-    fatalError("unreachable")
+    while true { pause() }
 }
 
 func checkCrashRecovery(_ folder: URL) async throws {
@@ -451,6 +530,18 @@ func checkSessions(_ folder: URL) async throws {
     try check(retry.count == 1, "kept session not offered again")
     let delivered = try await retry[0].deliver(fallback: fallback)
     try check(delivered.url.lastPathComponent == "Kept.m4a", "retry did not deliver")
+    // A safety copy of the microphone is delivered next to the recording.
+    let guarded = try await makeSession(root: root, destination: destination, name: "Guarded.m4a")
+    let raw = AudioTrack(name: "raw", directory: guarded.folder, channels: 1, realtime: false)
+    let rawPCM = PCMNormalizer(channels: 1)
+    for index in 0..<20 {
+        raw.append(try rawPCM.convert(try sample(frequency: 880, start: Int64(index * 4800))), at: Int64(index * 4800))
+    }
+    await raw.finish()
+    guarded.markSafetyCopy()
+    let both = try await guarded.deliver(fallback: fallback)
+    try check(both.microphone?.lastPathComponent == "Guarded (микрофон).m4a", "safety copy not delivered")
+    try check(tone(try decode(both.microphone!), at: 1.0, frequency: 880) > 0.09, "safety copy lost the microphone")
     // A session abandoned before it was renamed is cleaned up.
     try FileManager.default.createDirectory(at: root.appendingPathComponent(".abandoned"), withIntermediateDirectories: true)
     try check(RecordingSession.interrupted(root: root, fallback: fallback).isEmpty, "abandoned folder offered for recovery")
@@ -484,12 +575,14 @@ func checkStopRequest() async throws {
             try await crashChild(root: URL(fileURLWithPath: arguments[2]), destination: URL(fileURLWithPath: arguments[3]))
         }
         try checkMuteDetection()
+        try checkTimeline()
         let folder = URL(fileURLWithPath: arguments[1], isDirectory: true)
         try checkNormalizer()
         try checkDevices()
         try await checkStopRequest()
         try await checkCapture(folder.appendingPathComponent("capture"))
         try await checkUnconfirmedVoice(folder.appendingPathComponent("unconfirmed"))
+        try await checkSafetyCopy(folder.appendingPathComponent("safety"))
         try await checkLateDelivery(folder.appendingPathComponent("late"))
         try await checkMuteEdges(folder.appendingPathComponent("edges"))
         try await checkLateStart(folder.appendingPathComponent("late-start"))

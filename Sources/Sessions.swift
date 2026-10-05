@@ -103,6 +103,8 @@ final class RecordingSession {
         let duration: Double
         /// Some parts could not be read; they were kept aside rather than deleted.
         let incomplete: Bool
+        /// The whole microphone, saved next to the recording when mute detection may have failed.
+        let microphone: URL?
     }
 
     static let root = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -193,8 +195,26 @@ final class RecordingSession {
 
     var hasVoice: Bool { FileManager.default.fileExists(atPath: folder.appendingPathComponent("voice").path) }
 
+    /// Marks that the whole microphone must be delivered too: mute detection may have failed.
+    func markSafetyCopy() {
+        FileManager.default.createFile(atPath: folder.appendingPathComponent("safety").path, contents: nil)
+    }
+
+    /// Marks that Zoom's microphone control was found during the recording.
+    func markControlSeen() {
+        FileManager.default.createFile(atPath: folder.appendingPathComponent("control").path, contents: nil)
+    }
+
+    /// The whole microphone is delivered too: requested during the recording, or, for a
+    /// recording cut short by a crash, the mute detector never found Zoom's control.
+    func needsSafetyCopy(recovering: Bool) -> Bool {
+        let marked = { FileManager.default.fileExists(atPath: self.folder.appendingPathComponent($0).path) }
+        guard !AudioTrack.parts(named: "raw", in: folder).isEmpty else { return false }
+        return marked("safety") || (recovering && !marked("control") && !hasVoice)
+    }
+
     var hasAudio: Bool {
-        !AudioTrack.parts(named: "zoom", in: folder).isEmpty || hasVoice
+        !AudioTrack.parts(named: "zoom", in: folder).isEmpty || hasVoice || needsSafetyCopy(recovering: true)
     }
 
     private var parts: [TrackPart] {
@@ -211,29 +231,38 @@ final class RecordingSession {
     /// Exports, verifies and copies the recording to its folder (or `fallback` when that
     /// folder is unavailable), then deletes the working files. On failure nothing is
     /// deleted, and the next launch tries again.
-    func deliver(fallback: URL, progress: @escaping (Double) -> Void = { _ in }) async throws -> Delivery {
-        let final = folder.appendingPathComponent("final.m4a")
-        let duration: Double
-        if let existing = try? await verifyRecording(final) {
-            duration = existing
-        } else {
-            let partial = folder.appendingPathComponent("export.m4a")
-            let result = try await exportRecording(zoom: AudioTrack.parts(named: "zoom", in: folder),
-                                                   mic: hasVoice ? AudioTrack.parts(named: "mic", in: folder) : [],
-                                                   to: partial, progress: progress)
-            syncToStorage(partial)
-            try? FileManager.default.removeItem(at: final)
-            try FileManager.default.moveItem(at: partial, to: final)
-            duration = result.duration
-        }
+    func deliver(fallback: URL, recovering: Bool = false,
+                 progress: @escaping (Double) -> Void = { _ in }) async throws -> Delivery {
+        let zoomParts = AudioTrack.parts(named: "zoom", in: folder)
+        let micParts = hasVoice ? AudioTrack.parts(named: "mic", in: folder) : []
+        let rawParts = needsSafetyCopy(recovering: recovering) ? AudioTrack.parts(named: "raw", in: folder) : []
+        // Without any Zoom audio or voice, the safety copy is the recording itself.
+        let main = try await exported("final", zoom: zoomParts, mic: micParts.isEmpty && zoomParts.isEmpty ? rawParts : micParts,
+                                      progress: progress)
+        // A failed safety copy keeps the session for a retry rather than losing the microphone.
+        let safety = rawParts.isEmpty || (zoomParts.isEmpty && micParts.isEmpty) ? nil
+            : try await exported("microphone", zoom: [], mic: rawParts)
         let preferred = URL(fileURLWithPath: manifest.destination, isDirectory: true)
         var failure: Error?
         let incomplete = await keepUnreadableParts()
+        let base = (manifest.name as NSString).deletingPathExtension
         for directory in [preferred, fallback] where directory != preferred || failure == nil {
             do {
-                let url = try await place(final, duration: duration, in: directory)
+                let url = try await place(main.file, named: manifest.name, duration: main.duration, in: directory)
+                var microphone: URL?
+                if let safety {
+                    do {
+                        microphone = try await place(safety.file, named: "\(base) (микрофон).m4a",
+                                                     duration: safety.duration, in: directory)
+                    } catch {
+                        // Both files go to one folder; the next one gets both again.
+                        try? FileManager.default.removeItem(at: url)
+                        throw error
+                    }
+                }
                 retire()
-                return Delivery(url: url, usedFallback: directory != preferred, duration: duration, incomplete: incomplete)
+                return Delivery(url: url, usedFallback: directory != preferred, duration: main.duration,
+                                incomplete: incomplete, microphone: microphone)
             } catch {
                 recorderLog.error("Save to \(directory.path, privacy: .public) failed: \(error.localizedDescription, privacy: .public)")
                 failure = error
@@ -242,9 +271,22 @@ final class RecordingSession {
         throw failure ?? RecorderError.message("Не удалось сохранить запись")
     }
 
+    /// The mixed file in the session folder, exported once and reused on a retry.
+    private func exported(_ name: String, zoom: [TrackPart], mic: [TrackPart],
+                          progress: @escaping (Double) -> Void = { _ in }) async throws -> (file: URL, duration: Double) {
+        let file = folder.appendingPathComponent("\(name).m4a")
+        if let duration = try? await verifyRecording(file) { return (file, duration) }
+        let partial = folder.appendingPathComponent("\(name).partial.m4a")
+        let result = try await exportRecording(zoom: zoom, mic: mic, to: partial, progress: progress)
+        syncToStorage(partial)
+        try? FileManager.default.removeItem(at: file)
+        try FileManager.default.moveItem(at: partial, to: file)
+        return (file, result.duration)
+    }
+
     /// Copies under a hidden name, flushes it to storage and checks that it plays,
     /// then renames: a visible file is always complete and nothing is overwritten.
-    private func place(_ file: URL, duration: Double, in directory: URL) async throws -> URL {
+    private func place(_ file: URL, named name: String, duration: Double, in directory: URL) async throws -> URL {
         let manager = FileManager.default
         // An unmounted drive's path must not be recreated on the startup disk.
         var existing = directory
@@ -255,8 +297,8 @@ final class RecordingSession {
             throw RecorderError.message("Папка «\(directory.lastPathComponent)» недоступна")
         }
         try manager.createDirectory(at: directory, withIntermediateDirectories: true)
-        let base = (manifest.name as NSString).deletingPathExtension
-        var target = directory.appendingPathComponent(manifest.name)
+        let base = (name as NSString).deletingPathExtension
+        var target = directory.appendingPathComponent(name)
         var index = 2
         while manager.fileExists(atPath: target.path) {
             target = directory.appendingPathComponent("\(base) \(index).m4a")

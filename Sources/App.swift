@@ -238,7 +238,9 @@ final class RecorderModel: ObservableObject {
                 session = created
                 let summary = try await ZoomAudio.record(into: created.folder, stop: request, events: { event in
                     Task { @MainActor in self.handle(event) }
-                }, onVoice: { created.markVoice() })
+                }, onVoice: { created.markVoice() }, onUncertainVoice: { created.markSafetyCopy() },
+                   onControlSeen: { created.markControlSeen() })
+                if summary.needsSafetyCopy { created.markSafetyCopy() }
                 tracksClosed = true
                 if cancelled { throw CancellationError() }
                 guard summary.hasAudio else { throw RecorderError.noAudio }
@@ -293,13 +295,14 @@ final class RecorderModel: ObservableObject {
         if summary.zoomQuit { details.append("Zoom закрылся — запись остановлена") }
         if summary.interruptions > 0 { details.append("Связь с Zoom прерывалась: \(summary.interruptions)") }
         if !summary.hasVoice { details.append("Ваш голос не записан") }
+        if delivery.microphone != nil { details.append("Кнопка mute не определялась — микрофон сохранён отдельно") }
         if delivery.incomplete { details.append("Часть звука не прочитана") }
         if delivery.usedFallback {
             details.insert("Папка «\(preferred.lastPathComponent)» недоступна", at: 0)
             return Outcome(kind: .attention, title: "Сохранено в «\(delivery.url.deletingLastPathComponent().lastPathComponent)»",
                            detail: details.joined(separator: "\n"), file: delivery.url)
         }
-        return Outcome(kind: delivery.incomplete ? .attention : .saved, title: "Сохранено",
+        return Outcome(kind: delivery.incomplete || delivery.microphone != nil ? .attention : .saved, title: "Сохранено",
                        detail: details.joined(separator: "\n"), file: delivery.url)
     }
 
@@ -348,7 +351,7 @@ final class RecorderModel: ObservableObject {
                     continue
                 }
                 do {
-                    let delivery = try await session.deliver(fallback: Self.defaultFolder)
+                    let delivery = try await session.deliver(fallback: Self.defaultFolder, recovering: true)
                     recovered.append(delivery.url)
                     if outcome?.file == session.folder { outcome = nil }
                     if unrecovered == session.folder { unrecovered = nil }

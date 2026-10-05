@@ -286,7 +286,6 @@ final class AudioTrack {
         if let end {
             let gap = position - end
             if gap > Self.longGap {
-                flush(within: 0.5)
                 closePart()
             } else if gap > Self.tolerance {
                 var left = gap
@@ -314,14 +313,9 @@ final class AudioTrack {
     /// Writes everything still queued, closes every part and flushes the files to
     /// storage. Call after the last append.
     func finish() async {
-        let deadline = Date().addingTimeInterval(5)
-        while let writer, writer.status == .writing, !pending.isEmpty, Date() < deadline {
-            drain()
-            if !pending.isEmpty { try? await Task.sleep(for: .milliseconds(10)) }
-        }
         closePart()
         let closing = closing
-        await waitAtMost(30) {
+        await waitAtMost(120) {
             await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
                 closing.notify(queue: .global()) { done.resume() }
             }
@@ -397,19 +391,6 @@ final class AudioTrack {
         }
     }
 
-    /// Gives the encoder a moment to take the queued audio before a part is closed.
-    private func flush(within seconds: Double) {
-        let deadline = Date().addingTimeInterval(seconds)
-        drain()
-        while let writer, writer.status == .writing, !pending.isEmpty, Date() < deadline {
-            usleep(5_000)
-            drain()
-        }
-        if !pending.isEmpty, writer?.status == .writing {
-            record(RecorderError.message("Часть звука не успела записаться"))
-        }
-    }
-
     private func record(_ error: Error) {
         recorderLog.error("\(self.name, privacy: .public) track: \(error.localizedDescription, privacy: .public)")
         failure = error
@@ -422,19 +403,47 @@ final class AudioTrack {
         retryAt = Date().addingTimeInterval(retryDelay)
         retryDelay = min(retryDelay * 2, 60)
         // Fragments already on disk stay readable; the next buffer starts a new part.
-        closePart()
+        closePart(keepingQueued: false)
     }
 
-    private func closePart() {
+    /// Closes the current part. Audio still queued for it is handed over and written in
+    /// the background before the file is finished, so closing never drops audio.
+    private func closePart(keepingQueued: Bool = true) {
         if let writer, let input, writer.status == .writing {
-            input.markAsFinished()
+            let queued = Queue(keepingQueued ? pending.compactMap { try? sampleBuffer($0.buffer, at: $0.frame) } : [])
             closing.enter()
-            writer.finishWriting { [closing] in closing.leave() }
+            input.requestMediaDataWhenReady(on: Self.finishing) { [closing] in
+                while input.isReadyForMoreMediaData, writer.status == .writing, let next = queued.next() {
+                    if !input.append(next) { break }
+                }
+                guard queued.isEmpty || writer.status != .writing, queued.close() else { return }
+                input.markAsFinished()
+                if writer.status == .writing {
+                    writer.finishWriting { closing.leave() }
+                } else {
+                    closing.leave()
+                }
+            }
         }
         writer = nil
         input = nil
         pending.removeAll()
         pendingFrames = 0
+    }
+
+    private static let finishing = DispatchQueue(label: "zoom-audio.finishing")
+
+    /// Samples handed over to a closing part; closed exactly once.
+    private final class Queue: @unchecked Sendable {
+        private var samples: ArraySlice<CMSampleBuffer>
+        private var closed = false
+        init(_ samples: [CMSampleBuffer]) { self.samples = samples[...] }
+        var isEmpty: Bool { samples.isEmpty }
+        func next() -> CMSampleBuffer? { samples.popFirst() }
+        func close() -> Bool {
+            defer { closed = true }
+            return !closed
+        }
     }
 
     private func sampleBuffer(_ buffer: AVAudioPCMBuffer, at frame: Int64) throws -> CMSampleBuffer {
@@ -564,16 +573,18 @@ struct ZoomMuteLabels {
 }
 
 private final class ZoomMuteWatcher {
+    private enum Reading { case found(ZoomMuteState), none, busy }
+    private static let attributes = [kAXRoleAttribute, kAXEnabledAttribute, kAXTitleAttribute,
+                                     kAXDescriptionAttribute, kAXHelpAttribute, kAXIdentifierAttribute] as CFArray
     private let application: AXUIElement
     private let queue = DispatchQueue(label: "zoom-audio.mute")
     private let lock = NSLock()
-    private var unmuted = false
-    private var confirmed = 0.0
-    private var readings = MuteReadings()
+    private var history: [(time: Double, unmuted: Bool)] = []
     private var lastScan = 0.0
+    private var lastScanFoundNothing = true
     private var lastMenuCheck = 0.0
     private var lastReported: ZoomMuteState?
-    private var hasReported = false
+    private var controlSeen = false
     private var timer: DispatchSourceTimer?
     private let onChange: (ZoomMuteState) -> Void
     private var labels = ZoomMuteLabels()
@@ -598,27 +609,31 @@ private final class ZoomMuteWatcher {
         }
     }
 
-    /// The gate is open only after a fresh reading: a slow or stuck poll closes it.
-    var latestReadings: MuteReadings {
+    /// Whether Zoom's microphone control has been found, and whether it is missing now.
+    var control: (seen: Bool, missing: Bool) { lock.withLock { (controlSeen, lastReported == .unavailable) } }
+
+    /// Readings from just before `time` on, for deciding captured microphone audio.
+    func timeline(from time: Double) -> MuteTimeline {
         lock.withLock {
-            var current = readings
-            current.open = unmuted && Self.now() - confirmed < 0.6
-            return current
+            let first = history.lastIndex { $0.time < time } ?? history.startIndex
+            return MuteTimeline(readings: Array(history[first...]))
         }
     }
 
     private static func now() -> Double { CMClockGetTime(CMClockGetHostTimeClock()).seconds }
 
+    /// Polls every 20 ms: the cached control is read in a single round trip, so mute and
+    /// unmute edges are known within one polling interval.
     func start() {
         let timer = DispatchSource.makeTimerSource(queue: queue)
-        timer.schedule(deadline: .now(), repeating: .milliseconds(200), leeway: .milliseconds(20))
+        timer.schedule(deadline: .now(), repeating: .milliseconds(20), leeway: .milliseconds(5))
         timer.setEventHandler { [weak self] in self?.refresh() }
         self.timer = timer
         timer.resume()
     }
 
     /// One last reading after any poll still in flight, so the final moments of
-    /// speech are confirmed or rejected before the recording closes.
+    /// speech are decided before the recording closes.
     func finalReading() {
         timer?.cancel()
         queue.sync { refresh() }
@@ -627,93 +642,126 @@ private final class ZoomMuteWatcher {
     func stop() {
         timer?.cancel()
         timer = nil
-        lock.withLock { unmuted = false }
     }
 
     private func refresh() {
         let begun = Self.now()
-        let next = currentState()
+        // No answer means Zoom's main thread is busy, and its mute state cannot change
+        // until it answers again: the previous reading still holds.
+        guard let next = currentState() else { return }
+        // The state was seen somewhere during the read: "on" counts from its start and
+        // "off" from its end, so a slow answer never shortens the user's voice.
+        let time = next == .unmuted ? begun : Self.now()
         lock.lock()
-        unmuted = (next == .unmuted)
-        confirmed = begun
-        if next == .unmuted {
-            readings.unmuted = begun
-            readings.since = min(readings.since, begun)
-        } else {
-            readings.other = begun
-            readings.since = .infinity
-        }
-        let changed = !hasReported || next != lastReported
+        history.append((time, next == .unmuted))
+        if history.count > 6_000 { history.removeFirst(3_000) }
+        let changed = next != lastReported
         lastReported = next
-        hasReported = true
+        controlSeen = controlSeen || next != .unavailable
         lock.unlock()
         if changed { onChange(next) }
     }
 
-    private func currentState() -> ZoomMuteState {
+    /// nil when Zoom did not answer in time.
+    private func currentState() -> ZoomMuteState? {
         if let cachedElement {
             // Zoom's own menu command is the most reliable source; return to it when it appears.
-            if !cachedIsMenu, Self.now() - lastMenuCheck >= 2 {
+            if !cachedIsMenu, Self.now() - lastMenuCheck >= 10 {
                 lastMenuCheck = Self.now()
                 var budget = 1000
-                if let state = menuState(remaining: &budget) { return state }
+                switch menuReading(remaining: &budget) {
+                case let .found(state): return state
+                case .busy: return nil
+                case .none: break
+                }
             }
-            if let state = state(of: cachedElement, inToolbar: cachedInToolbar) { return state }
+            switch reading(of: cachedElement, inToolbar: cachedInToolbar) {
+            case let .found(state): return state
+            case .busy: return nil
+            case .none: break
+            }
         }
         cachedElement = nil
-        // Fail closed during the slow search, and spare Zoom's main thread a full scan
-        // every 200 ms while no control is visible.
-        lock.withLock { unmuted = false }
-        guard Self.now() - lastScan >= 1 else { return .unavailable }
+        // Spare Zoom's main thread a full scan on every poll while no control is visible.
+        // Until a scan completes, nothing is known.
+        guard Self.now() - lastScan >= 1 else { return lastScanFoundNothing ? .unavailable : nil }
         lastScan = Self.now()
+        lastScanFoundNothing = false
         var budget = 2000
         // The own-audio menu command is available even when meeting controls are hidden.
-        if let state = menuState(remaining: &budget) { return state }
+        switch menuReading(remaining: &budget) {
+        case let .found(state): return state
+        case .busy: return nil
+        case .none: break
+        }
         let windows = attribute(kAXWindowsAttribute as CFString, of: application) as? [AXUIElement] ?? []
         for window in windows {
-            if let state = findMuteAction(in: window, depth: 0, inToolbar: false, remaining: &budget) { return state }
+            switch findMuteAction(in: window, depth: 0, inToolbar: false, remaining: &budget) {
+            case let .found(state): return state
+            case .busy: return nil
+            case .none: continue
+            }
         }
+        lastScanFoundNothing = true
         return .unavailable
     }
 
-    private func menuState(remaining: inout Int) -> ZoomMuteState? {
+    private func menuReading(remaining: inout Int) -> Reading {
         guard let menu = attribute(kAXMenuBarAttribute as CFString, of: application),
-              CFGetTypeID(menu) == AXUIElementGetTypeID() else { return nil }
+              CFGetTypeID(menu) == AXUIElementGetTypeID() else { return .none }
         return findMuteAction(in: unsafeBitCast(menu, to: AXUIElement.self), depth: 0, inToolbar: false, remaining: &remaining)
     }
 
-    private func state(of element: AXUIElement, inToolbar: Bool) -> ZoomMuteState? {
-        let role = attribute(kAXRoleAttribute as CFString, of: element) as? String ?? ""
-        guard ["AXButton", "AXCheckBox", "AXMenuItem"].contains(role) else { return nil }
+    /// Reads one control in a single round trip.
+    private func reading(of element: AXUIElement, inToolbar: Bool) -> Reading {
+        var values: CFArray?
+        let error = AXUIElementCopyMultipleAttributeValues(element, Self.attributes, AXCopyMultipleAttributeOptions(rawValue: 0), &values)
+        if error == .cannotComplete { return .busy }
+        guard error == .success, let array = values as? [AnyObject], array.count == 6 else { return .none }
+        // Attributes a control lacks come back as error values.
+        let value = { (index: Int) -> AnyObject? in
+            CFGetTypeID(array[index]) == AXValueGetTypeID() ? nil : array[index]
+        }
+        let role = value(0) as? String ?? ""
+        guard ["AXButton", "AXCheckBox", "AXMenuItem"].contains(role) else { return .none }
         // Disabled menu items exist before joining a meeting and must be ignored.
-        let enabled = attribute(kAXEnabledAttribute as CFString, of: element) as? Bool
-        guard enabled != false, role != "AXMenuItem" || enabled == true else { return nil }
-        let text = [kAXTitleAttribute, kAXDescriptionAttribute, kAXHelpAttribute]
-            .compactMap { attribute($0 as CFString, of: element) as? String }
-        let identifier = attribute(kAXIdentifierAttribute as CFString, of: element) as? String ?? ""
+        let enabled = value(1) as? Bool
+        guard enabled != false, role != "AXMenuItem" || enabled == true else { return .none }
+        let text = [2, 3, 4].compactMap { value($0) as? String }
+        let identifier = value(5) as? String ?? ""
         return labels.state(labels: text, role: role, enabled: true, inToolbar: inToolbar, identifier: identifier)
+            .map(Reading.found) ?? .none
     }
 
     private func findMuteAction(in element: AXUIElement, depth: Int, inToolbar: Bool,
-                              remaining: inout Int) -> ZoomMuteState? {
-        guard depth < 24, remaining > 0 else { return nil }
+                              remaining: inout Int) -> Reading {
+        guard depth < 24, remaining > 0 else { return .none }
         remaining -= 1
         let role = attribute(kAXRoleAttribute as CFString, of: element) as? String ?? ""
         let toolbar = inToolbar || role == "AXToolbar"
-        if let state = state(of: element, inToolbar: toolbar) {
+        switch reading(of: element, inToolbar: toolbar) {
+        case let .found(state):
             cachedElement = element
             cachedInToolbar = toolbar
             cachedIsMenu = role == "AXMenuItem"
-            return state
+            return .found(state)
+        case .busy:
+            return .busy
+        case .none:
+            break
         }
         guard let children = attribute(kAXChildrenAttribute as CFString, of: element) as? [AXUIElement] else {
-            return nil
+            return .none
         }
         for child in children {
-            if let state = findMuteAction(in: child, depth: depth + 1, inToolbar: toolbar, remaining: &remaining) { return state }
-            if remaining <= 0 { break }
+            let found = findMuteAction(in: child, depth: depth + 1, inToolbar: toolbar, remaining: &remaining)
+            if case .none = found {
+                if remaining <= 0 { break }
+                continue
+            }
+            return found
         }
-        return nil
+        return .none
     }
 
     private func attribute(_ name: CFString, of element: AXUIElement) -> CFTypeRef? {
@@ -749,9 +797,9 @@ private final class ZoomMuteWatcher {
         for window in attribute(kAXWindowsAttribute as CFString, of: application) as? [AXUIElement] ?? [] {
             visit(window, depth: 0)
         }
-        return ["state": String(describing: currentState()), "controls": controls]
+        return ["state": String(describing: observedState()), "controls": controls]
     }
-    func observedState() -> ZoomMuteState { currentState() }
+    func observedState() -> ZoomMuteState { currentState() ?? .unavailable }
 }
 
 func zoomMicrophoneDiagnostics(observations: Int = 1) async -> [String: Any] {
@@ -786,42 +834,77 @@ func zoomMicrophoneDiagnostics(observations: Int = 1) async -> [String: Any] {
     return result
 }
 
-/// Zoom mute readings, as start times on the host clock.
-struct MuteReadings {
-    /// The latest reading that saw the microphone on.
-    var unmuted = -Double.infinity
-    /// The latest reading that did not (muted, or the control was not found).
-    var other = -Double.infinity
-    /// The first reading of the current run of "on" readings; infinity while off.
-    var since = Double.infinity
-    /// The latest reading saw the microphone on and is fresh.
-    var open = false
+/// Zoom mute readings on the host clock, and the rule that turns them into the parts of
+/// the microphone recording that are the user's voice. Between two readings that agree,
+/// their state holds. A gap between readings means Zoom was busy and could not change
+/// state, so a change is placed at the later reading: voice runs on up to a mute reading
+/// and starts `reach` before an unmute reading. No speech is lost at either edge; at most
+/// one polling interval plus `pad` of the muted side is kept.
+struct MuteTimeline {
+    /// Longer than the 20 ms polling interval.
+    static let reach = 0.04
+    /// Slack between the microphone's clock and Zoom's label.
+    static let pad = 0.03
+    /// When each poll began, and whether it saw Zoom's microphone on.
+    var readings: [(time: Double, unmuted: Bool)] = []
 
-    /// Audio captured at `time` may be the user's voice: inside the current run of
-    /// "on" readings, never before it.
-    func admits(capturedAt time: Double) -> Bool { open && time >= since + 0.05 }
-
-    /// Held audio admitted during run `run` and arrived before `time`: rejected once the
-    /// run is broken, kept once a later reading saw the microphone on, else undecided.
-    func allowsVoice(run: Double, arrivedBefore time: Double) -> Bool? {
-        if other >= run { return false }
-        return unmuted >= time ? true : nil
+    /// The voice parts of [start, end), or nil while the readings that decide them are
+    /// not in yet. `final` decides now and carries the last reading forward.
+    func voice(from start: Double, to end: Double, final: Bool = false) -> [Range<Double>]? {
+        if !final, (readings.last?.time ?? -.infinity) < end + Self.reach + Self.pad { return nil }
+        var spans: [Range<Double>] = []
+        var previous: (time: Double, unmuted: Bool)?
+        for reading in readings {
+            if reading.unmuted {
+                let from = previous.map { $0.unmuted ? $0.time : max($0.time, reading.time - Self.reach) }
+                    ?? reading.time - Self.reach
+                spans.append(from..<reading.time)
+            } else if let previous, previous.unmuted {
+                spans.append(previous.time..<max(previous.time, reading.time))
+            }
+            previous = reading
+        }
+        if let last = readings.last, last.unmuted {
+            spans.append(last.time..<max(last.time, final ? end : last.time + Self.reach))
+        }
+        var ranges: [Range<Double>] = []
+        for span in spans {
+            let lower = max(start, span.lowerBound - Self.pad)
+            let upper = min(end, span.upperBound + Self.pad)
+            guard lower < upper else { continue }
+            if let last = ranges.last, lower <= last.upperBound {
+                ranges[ranges.count - 1] = last.lowerBound..<max(last.upperBound, upper)
+            } else {
+                ranges.append(lower..<upper)
+            }
+        }
+        return ranges
     }
 }
 
 /// Receives Zoom audio and the microphone on one serial queue and places both on a
-/// shared timeline. Microphone audio is held until the first mute reading taken after
-/// it arrived; only a reading that saw Zoom's microphone on lets it through.
+/// shared timeline. Microphone audio is held in memory until the mute readings around
+/// the moment it was captured are in; only the frames they place in a period with
+/// Zoom's microphone on are written, the rest become silence.
 final class Capture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sendable {
-    /// Zoom may update its label a little after the click.
-    static let confirmationMargin = 0.15
-    static let confirmationTimeout = 1.5
+    /// Longest wait for Zoom to answer before held audio is decided anyway.
+    static let voiceHold = 10.0
+    /// Microphone RMS above this, held for `speechRun`, counts as speech for the safety copy.
+    static let speechLevel: Float = 0.02
+    static let speechRun = 0.5
     let queue = DispatchQueue(label: "zoom-audio.samples")
     let zoom: AudioTrack
     let mic: AudioTrack
-    /// Latest mute readings: they admit microphone audio by the time it was captured,
-    /// and decide whether held audio is kept. Raw audio is not even converted while muted.
-    var muteReadings: () -> MuteReadings = { MuteReadings() }
+    /// The whole microphone, unmuted: a safety copy in case mute detection fails.
+    let raw: AudioTrack
+    /// Mute readings from just before the given host time on.
+    var muteTimeline: (Double) -> MuteTimeline = { _ in MuteTimeline() }
+    /// Whether Zoom's microphone control has been found, and whether it is missing now.
+    var control: () -> (seen: Bool, missing: Bool) = { (false, false) }
+    /// Speech was silenced while Zoom's control was missing in the middle of a meeting.
+    var onUncertainVoice: () -> Void = {}
+    /// Zoom's microphone control was found for the first time.
+    var onControlSeen: () -> Void = {}
     var onVoice: () -> Void = {}
     var onProblem: (String) -> Void = { _ in }
     weak var wake: StopRequest?
@@ -833,7 +916,13 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
     private var origin: (pts: CMTime, host: CMTime)?
     private var anchors: [SCStreamOutputType: Int64] = [:]
     private var expected: [SCStreamOutputType: Int64] = [:]
-    private var voice: [(buffer: AVAudioPCMBuffer, position: Int64, arrival: Double, run: Double, audible: Bool)] = []
+    private var voice: [(buffer: AVAudioPCMBuffer, position: Int64, captured: Double, arrival: Double, speech: Bool)] = []
+    private var speechSeconds = 0.0
+    private var speechRun = 0.0
+    private var missingSpeech = 0.0
+    private var uncertainSeconds = 0.0
+    private(set) var uncertainVoice = false
+    private(set) var controlSeen = false
     private var streamError: Error?
     private var reportedFailures = (zoom: 0, mic: 0)
     private var lastProblem: String?
@@ -844,7 +933,12 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
     init(directory: URL, realtime: Bool = true) {
         zoom = AudioTrack(name: "zoom", directory: directory, channels: 2, realtime: realtime)
         mic = AudioTrack(name: "mic", directory: directory, channels: 1, bitRate: 96_000, realtime: realtime)
+        raw = AudioTrack(name: "raw", directory: directory, channels: 1, bitRate: 64_000, realtime: realtime)
     }
+
+    /// Speech that may be the user's voice did not reach the recording: Zoom's control
+    /// vanished mid-meeting while they talked, or was never found at all.
+    var needsSafetyCopy: Bool { uncertainVoice || (!controlSeen && speechSeconds > 10) }
 
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer,
                 of type: SCStreamOutputType) {
@@ -878,9 +972,9 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
             reportedFailures.zoom = zoom.failures
             report("Ошибка записи звука Zoom: \(zoom.failure?.localizedDescription ?? "неизвестно")")
         }
-        if mic.failures > reportedFailures.mic {
-            reportedFailures.mic = mic.failures
-            report("Ошибка записи микрофона: \(mic.failure?.localizedDescription ?? "неизвестно")")
+        if mic.failures + raw.failures > reportedFailures.mic {
+            reportedFailures.mic = mic.failures + raw.failures
+            report("Ошибка записи микрофона: \((mic.failure ?? raw.failure)?.localizedDescription ?? "неизвестно")")
         }
     }
 
@@ -890,29 +984,79 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
         onProblem(problem)
     }
 
-    /// Writes held microphone audio in order. Audio counts as the user's voice only
-    /// when the mute readings since it arrived all saw the microphone on; undecided
-    /// audio waits, and becomes silence after a timeout or when the recording closes.
+    /// Writes held microphone audio in order, each buffer once the readings around it
+    /// are in. Frames outside the user's voice are silenced first.
     func releaseVoice(flushing: Bool = false) {
+        guard let first = voice.first else { return }
         let now = now().seconds
-        let readings = muteReadings()
-        while let first = voice.first {
-            var entry = first
-            if entry.audible {
-                let decision = readings.allowsVoice(run: entry.run, arrivedBefore: entry.arrival + Self.confirmationMargin)
-                if decision == nil, !flushing, now - entry.arrival <= Self.confirmationTimeout { break }
-                if decision != true {
-                    entry.buffer.silence()
-                    entry.audible = false
-                }
-            }
+        let timeline = muteTimeline(first.captured - 1)
+        while let entry = voice.first {
+            let length = Double(entry.buffer.frameLength) / AudioTrack.rate
+            let late = flushing || now - entry.arrival > Self.voiceHold
+            guard let ranges = timeline.voice(from: entry.captured, to: entry.captured + length, final: late) else { break }
             voice.removeFirst()
-            if entry.audible && !hadVoice {
+            let kept = keep(ranges, of: entry.buffer, capturedAt: entry.captured)
+            if kept, !hadVoice {
                 hadVoice = true
                 onVoice()
             }
+            track(speech: entry.speech, kept: kept, length: length)
             mic.append(entry.buffer, at: entry.position)
         }
+    }
+
+    /// Counts sustained speech the mute decision silenced. Speech while the control was
+    /// missing counts only once the control returns, so recording before joining or
+    /// after leaving a meeting does not ask for the safety copy.
+    private func track(speech: Bool, kept: Bool, length: Double) {
+        let status = control()
+        if status.seen, !controlSeen {
+            controlSeen = true
+            onControlSeen()
+        }
+        if !status.missing {
+            uncertainSeconds += missingSpeech
+            missingSpeech = 0
+        }
+        speechRun = speech ? speechRun + length : 0
+        guard speechRun >= Self.speechRun else { return }
+        // A run just long enough counts in full.
+        let counted = speechRun - length < Self.speechRun ? speechRun : length
+        speechSeconds += counted
+        if !kept, status.missing, controlSeen { missingSpeech += counted }
+        if uncertainSeconds > 3, !uncertainVoice {
+            uncertainVoice = true
+            onUncertainVoice()
+        }
+    }
+
+    static func level(of buffer: AVAudioPCMBuffer) -> Float {
+        guard let samples = buffer.floatChannelData?[0], buffer.frameLength > 0 else { return 0 }
+        let count = Int(buffer.frameLength) * Int(buffer.format.channelCount)
+        var sum: Float = 0
+        for index in 0..<count { sum += samples[index] * samples[index] }
+        return (sum / Float(count)).squareRoot()
+    }
+
+    /// Silences every frame outside `ranges`; true when some voice remains.
+    private func keep(_ ranges: [Range<Double>], of buffer: AVAudioPCMBuffer, capturedAt start: Double) -> Bool {
+        guard let samples = buffer.floatChannelData?[0] else { return false }
+        let frames = Int(buffer.frameLength)
+        let channels = Int(buffer.format.channelCount)
+        func clear(_ from: Int, _ to: Int) {
+            if to > from { memset(samples + from * channels, 0, (to - from) * channels * MemoryLayout<Float>.size) }
+        }
+        var cursor = 0
+        var kept = false
+        for range in ranges {
+            let from = min(frames, max(cursor, Int(((range.lowerBound - start) * AudioTrack.rate).rounded(.down))))
+            let to = min(frames, max(from, Int(((range.upperBound - start) * AudioTrack.rate).rounded(.up))))
+            clear(cursor, from)
+            kept = kept || to > from
+            cursor = max(cursor, to)
+        }
+        clear(cursor, frames)
+        return kept
     }
 
     func takeStreamError() -> Error? {
@@ -930,27 +1074,25 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
         lastProblem = nil
         receivingZoom = false
         current = stream
-        if stream == nil { muteReadings = { MuteReadings() } }
+        if stream == nil {
+            muteTimeline = { _ in MuteTimeline() }
+            control = { (false, false) }
+        }
     }
 
     private func receiveVoice(_ sample: CMSampleBuffer, at position: Int64) {
-        var buffer: AVAudioPCMBuffer?
-        var audible = false
-        let readings = muteReadings()
-        // Judged by when the audio was captured, so a delayed backlog spoken while muted
-        // is not let through by a later unmute.
+        let buffer: AVAudioPCMBuffer
+        do {
+            buffer = try micPCM.convert(sample)
+        } catch {
+            report("Микрофон: \(error.localizedDescription)")
+            guard let quiet = micPCM.silence(like: sample) else { return }
+            buffer = quiet
+        }
+        if let copy = buffer.dropping(frames: 0) { raw.append(copy, at: position) }
+        // Decided by when the audio was captured, never by when it arrived.
         let captured = (origin?.host.seconds ?? now().seconds) + Double(position) / AudioTrack.rate
-        if readings.admits(capturedAt: captured) {
-            do {
-                buffer = try micPCM.convert(sample)
-                audible = true
-            } catch {
-                report("Микрофон: \(error.localizedDescription)")
-            }
-        }
-        if let buffer = buffer ?? micPCM.silence(like: sample) {
-            voice.append((buffer, position, now().seconds, readings.since, audible))
-        }
+        voice.append((buffer, position, captured, now().seconds, Self.level(of: buffer) > Self.speechLevel))
         releaseVoice()
     }
 
@@ -963,9 +1105,13 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
         let sourceRate = CMSampleBufferGetFormatDescription(sample)
             .flatMap { CMAudioFormatDescriptionGetStreamBasicDescription($0)?.pointee.mSampleRate } ?? rate
         let duration = Double(CMSampleBufferGetNumSamples(sample)) / max(sourceRate, 1)
-        // The origin pairs the first sample's clock with the host time it was captured.
+        // The origin pairs the first sample's clock with the host time it was captured:
+        // the timestamp itself when it is on the host clock, else an estimate from arrival.
         let captured = now() - CMTime(seconds: duration, preferredTimescale: CMTimeScale(rate))
-        let origin = self.origin ?? (pts.isNumeric ? pts : captured, captured)
+        // Delivery can only lag, so a host-clock timestamp is at most a little ahead of
+        // arrival and may be well behind it.
+        let hostClock = pts.isNumeric && (pts - captured).seconds < 0.5 && (captured - pts).seconds < 30
+        let origin = self.origin ?? (pts.isNumeric ? pts : captured, hostClock ? pts : captured)
         self.origin = origin
         let byArrival = Int64(((captured - origin.host).seconds) * rate)
         guard pts.isNumeric else { return byArrival }
@@ -995,7 +1141,7 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
 
     /// Flushes the files being written to permanent storage (survives power loss).
     func syncToDisk() {
-        queue.sync { [zoom.currentPart, mic.currentPart].compactMap { $0 } }.forEach(syncToStorage)
+        queue.sync { [zoom.currentPart, mic.currentPart, raw.currentPart].compactMap { $0 } }.forEach(syncToStorage)
     }
 }
 
@@ -1020,6 +1166,8 @@ struct RecordingSummary {
     let interruptions: Int
     /// Zoom quit and did not come back, so the recording stopped by itself.
     let zoomQuit: Bool
+    /// Deliver the whole microphone too: mute detection may have failed.
+    let needsSafetyCopy: Bool
 }
 
 struct ZoomAudio {
@@ -1053,11 +1201,14 @@ struct ZoomAudio {
 
     /// Records into `directory` until `stop` is requested. A broken stream or a Zoom
     /// restart reconnects automatically; the parts on disk stay aligned throughout.
-    static func record(into directory: URL, stop: StopRequest,
-                       events: @escaping (RecorderEvent) -> Void, onVoice: @escaping () -> Void) async throws -> RecordingSummary {
+    static func record(into directory: URL, stop: StopRequest, events: @escaping (RecorderEvent) -> Void,
+                       onVoice: @escaping () -> Void, onUncertainVoice: @escaping () -> Void,
+                       onControlSeen: @escaping () -> Void) async throws -> RecordingSummary {
         let capture = Capture(directory: directory)
         capture.wake = stop
         capture.onVoice = onVoice
+        capture.onUncertainVoice = onUncertainVoice
+        capture.onControlSeen = onControlSeen
         capture.onProblem = { events(.problem($0)) }
         var stream: SCStream?
         var watcher: ZoomMuteWatcher?
@@ -1142,11 +1293,15 @@ struct ZoomAudio {
             }
         }
         await disconnect()
-        await capture.zoom.finish()
-        await capture.mic.finish()
+        async let zoomClosed: Void = capture.zoom.finish()
+        async let micClosed: Void = capture.mic.finish()
+        async let rawClosed: Void = capture.raw.finish()
+        _ = await (zoomClosed, micClosed, rawClosed)
         let hasZoom = !capture.zoom.parts.isEmpty
-        return RecordingSummary(started: started, hasAudio: hasZoom || capture.hadVoice, hasZoom: hasZoom,
-                                hasVoice: capture.hadVoice, interruptions: interruptions, zoomQuit: zoomQuit)
+        let needsSafetyCopy = capture.queue.sync { capture.needsSafetyCopy }
+        return RecordingSummary(started: started, hasAudio: hasZoom || capture.hadVoice || needsSafetyCopy, hasZoom: hasZoom,
+                                hasVoice: capture.hadVoice, interruptions: interruptions, zoomQuit: zoomQuit,
+                                needsSafetyCopy: needsSafetyCopy)
     }
 
     private static func connect(to app: NSRunningApplication, capture: Capture, stop: StopRequest, reconnecting: Bool,
@@ -1192,7 +1347,8 @@ struct ZoomAudio {
         try stream.addStreamOutput(capture, type: .audio, sampleHandlerQueue: capture.queue)
         try stream.addStreamOutput(capture, type: .microphone, sampleHandlerQueue: capture.queue)
         capture.queue.sync {
-            capture.muteReadings = { watcher.latestReadings }
+            capture.muteTimeline = { watcher.timeline(from: $0) }
+            capture.control = { watcher.control }
             capture.attach(stream)
         }
         watcher.start()
