@@ -13,7 +13,7 @@
 
 <sub>Бесплатно · macOS 15 и новее · Apple Silicon и Intel</sub>
 
-<br><br>
+<br>
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset=".github/assets/hero-dark.png">
