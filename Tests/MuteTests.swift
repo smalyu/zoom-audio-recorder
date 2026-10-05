@@ -40,3 +40,66 @@ func checkMuteDetection() throws {
     try check(chinese.state(labels: ["解除静音"], role: "AXMenuItem", enabled: true, identifier: "onMuteAudio:") == .muted, "Chinese menu unmute not recognized")
     print("PASS: own menu, disabled menu, localized checkbox, toolbar, participant isolation, unknown state, whole-label matching (it, pt, sv, zh)")
 }
+
+func checkMuteTips() throws {
+    var labels = ZoomMuteLabels()
+    try check(labels.tipState("Noise removal is on. Mute my audio (⇧⌘A)") == .unmuted, "unmuted tooltip not recognized")
+    try check(labels.tipState("Mute my audio") == .unmuted, "bare tooltip not recognized")
+    try check(labels.tipState("Press (⇧⌘A) to unmute or hold (Space) to temporarily unmute.") == .muted, "muted tooltip not recognized")
+    try check(labels.tipState("Noise removal is on. Unmute my audio (⇧⌘A)") == .muted, "unmute action read as mute")
+    try check(labels.tipState("Mute/unmute my audio (⇧⌘A)") == nil, "toggle description guessed a state")
+    try check(labels.tipState("Audio options") == nil, "unrelated tooltip guessed a state")
+    labels.add(localization: ["Mute My Audio": "Выключить мой звук", "Unmute My Audio": "Включить мой звук",
+        "LN_Unmute_Audio_Tip_803981": "Нажмите (%1$@), чтобы включить звук, или нажмите и удерживайте (%2$@), чтобы временно включить звук."])
+    try check(labels.tipState("Нажмите (⇧⌘A), чтобы включить звук, или нажмите и удерживайте (Пробел), чтобы временно включить звук.") == .muted,
+              "localized muted tooltip not recognized")
+    try check(labels.tipState("Удаление шума: включено. Выключить мой звук (⇧⌘A)") == .unmuted, "localized unmuted tooltip not recognized")
+    // In Italian the Mute title ends with the Unmute title.
+    var italian = ZoomMuteLabels()
+    italian.add(localization: ["Mute My Audio": "Disattiva il mio audio", "Unmute My Audio": "Attiva il mio audio"])
+    try check(italian.tipState("Rimozione del rumore: attiva. Disattiva il mio audio (⇧⌘A)") == .unmuted, "Italian mute read as unmute")
+    try check(italian.tipState("Attiva il mio audio (⇧⌘A)") == .muted, "Italian unmute not recognized")
+    print("PASS: mute button tooltips (en, ru, it), toggle descriptions ignored")
+}
+
+/// The readings Zoom gave in a real meeting: the tooltip changes 0.1 s after a click, the
+/// menu command up to a second later, the label about a second later.
+func checkMuteIndicators() throws {
+    var indicators = MuteIndicators()
+    var time = 0.0
+    func read(_ tip: ZoomMuteState?, _ menu: ZoomMuteState?, _ label: ZoomMuteState?) -> ZoomMuteState {
+        time += 0.02
+        let shown: [MuteIndicators.Kind: ZoomMuteState?] = [.tip: tip, .menu: menu, .label: label]
+        return indicators.update(shown.compactMapValues { $0 }, at: time)
+    }
+    // A stale tooltip at the start is outvoted.
+    try check(read(.unmuted, .muted, .muted) == .muted, "a stale tooltip decided the first reading")
+    try check(read(.unmuted, .muted, .muted) == .muted, "a stale tooltip took over")
+    // A click: the tooltip changes first.
+    try check(read(.muted, .muted, .muted) == .muted, "unchanged state")
+    try check(read(.unmuted, .muted, .muted) == .unmuted, "the tooltip's change was ignored")
+    try check(read(.unmuted, .unmuted, .muted) == .unmuted, "the menu catching up changed the state")
+    try check(read(.unmuted, .unmuted, .unmuted) == .unmuted, "the label catching up changed the state")
+    // The hotkey: the menu changes at once, the tooltip stays stale.
+    try check(read(.unmuted, .muted, .unmuted) == .muted, "the menu's change was ignored")
+    try check(read(.unmuted, .muted, .muted) == .muted, "the stale tooltip came back")
+    // The button disappears right after a click, before the menu caught up.
+    try check(read(.unmuted, .muted, .muted) == .muted, "unchanged state")
+    try check(read(.muted, .muted, .muted) == .muted, "unchanged state")
+    _ = read(.unmuted, .muted, .muted)
+    try check(read(nil, .muted, nil) == .unmuted, "a stale menu undid a click")
+    try check(read(nil, .unmuted, nil) == .unmuted, "the menu catching up changed the state")
+    // The button comes back showing a change made while it was hidden.
+    try check(read(nil, nil, nil) == .unavailable, "no indicator must mean unavailable")
+    try check(read(.unmuted, nil, .unmuted) == .unmuted, "controls that came back were ignored")
+    try check(read(.unmuted, .muted, .unmuted) == .unmuted, "a menu that appeared overrode the button")
+    // Every indicator disagreeing for longer than any of them stays stale wins.
+    var since = time
+    while time - since < MuteIndicators.staleness - 0.1 {
+        try check(read(nil, .muted, nil) == .unmuted, "a lagging menu took over too early")
+    }
+    since = time
+    while time - since < 0.2 { _ = read(nil, .muted, nil) }
+    try check(read(nil, .muted, nil) == .muted, "a lasting disagreement was never resolved")
+    print("PASS: the newest indicator change wins; stale indicators are outvoted")
+}

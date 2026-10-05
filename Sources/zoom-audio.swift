@@ -523,6 +523,9 @@ struct ZoomMuteLabels {
     var ambiguous = ["mute/unmute my audio"]
     var ownActionMute = ["mute audio"]
     var ownActionUnmute = ["unmute audio"]
+    /// The muted button's tooltip, split at its hotkey placeholders.
+    var unmuteTips = ["Press (%1$@) to unmute or hold (%2$@) to temporarily unmute.",
+                      "Press %@ to unmute or hold space bar to temporarily unmute."].map(Self.fragments)
 
     /// Adds one of Zoom's localizations. A long label that equals the short Mute or
     /// Unmute word (as in Chinese) would match participant buttons, so it stays short.
@@ -538,6 +541,46 @@ struct ZoomMuteLabels {
         if let text = value("LN_Hotkey_Mute_Audio_123974") { ambiguous.append(text) }
         if let text = value("Mute Audio") { ownActionMute.append(text) }
         if let text = value("Unmute Audio") { ownActionUnmute.append(text) }
+        for key in ["LN_Unmute_Audio_Tip_803981", "LN_Unmute_Audio_Button_Tip_542"] {
+            if let text = value(key) { unmuteTips.append(Self.fragments(text)) }
+        }
+    }
+
+    /// The state shown by the tooltip of the user's own mute button, which Zoom updates
+    /// about 0.1 s after a click, long before the button's label: "Noise removal is on.
+    /// Mute my audio (⇧⌘A)" or "Press (⇧⌘A) to unmute or hold (Space) to temporarily unmute."
+    func tipState(_ help: String) -> ZoomMuteState? {
+        let text = help.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+        if unmuteTips.contains(where: { Self.follows(text, $0) }) { return .muted }
+        // Otherwise the last sentence names the action, optionally followed by its hotkey.
+        var action = Substring(text)
+        if action.hasSuffix(")"), let hotkey = action.range(of: " (", options: .backwards) {
+            action = action[..<hotkey.lowerBound]
+        }
+        func names(_ label: String) -> Bool {
+            action.hasSuffix(label) && action.dropLast(label.count).last.map { !$0.isLetter && !$0.isNumber } != false
+        }
+        if ambiguous.contains(where: names) { return nil }
+        if unmute.contains(where: names) { return .muted }
+        if mute.contains(where: names) { return .unmuted }
+        return nil
+    }
+
+    static func fragments(_ format: String) -> [String] {
+        format.lowercased().replacingOccurrences(of: "%\\d+\\$@", with: "%@", options: .regularExpression)
+            .components(separatedBy: "%@")
+    }
+
+    /// Whether `text` is `fragments` with anything in place of the placeholders.
+    static func follows(_ text: String, _ fragments: [String]) -> Bool {
+        guard fragments.joined().count >= 12, let first = fragments.first, let last = fragments.last,
+              text.count >= first.count + last.count, text.hasPrefix(first), text.hasSuffix(last) else { return false }
+        var rest = text.dropFirst(first.count).dropLast(last.count)
+        for fragment in fragments.dropFirst().dropLast() {
+            guard let range = rest.range(of: fragment) else { return false }
+            rest = rest[range.upperBound...]
+        }
+        return fragments.count > 1 || text == first
     }
 
     func state(labels: [String], role: String, enabled: Bool,
@@ -572,25 +615,63 @@ struct ZoomMuteLabels {
     }
 }
 
+/// Zoom refreshes each of its mute indicators on its own schedule. After a click the
+/// button's tooltip changes within 0.15 s, the menu command within a second (at once for
+/// its hotkey), the button's label after about a second. Each refresh shows the current
+/// state, so the newest change is the state. An indicator that has not changed may be
+/// stale: the tooltip, for instance, only refreshes while the pointer is on the button.
+struct MuteIndicators {
+    /// Freshest first.
+    enum Kind: CaseIterable { case tip, menu, label }
+    /// Longer than the menu command and the label take to refresh.
+    static let staleness = 2.0
+    private var shown: [Kind: ZoomMuteState] = [:]
+    private var state: ZoomMuteState?
+    private var disagreeing: Double?
+
+    mutating func update(_ now: [Kind: ZoomMuteState], at time: Double) -> ZoomMuteState {
+        defer { shown = now }
+        if let changed = Kind.allCases.first(where: { now[$0] != nil && shown[$0] != nil && now[$0] != shown[$0] }) {
+            state = now[changed]
+        } else if let state, now.isEmpty || now.values.contains(state) {
+            // Unchanged; an indicator still showing the previous state is stale.
+        } else {
+            // A first reading, controls that came back showing another state, or every
+            // indicator disagreeing for too long: trust the ones that are never stale for long.
+            let since = disagreeing ?? time
+            if state == nil || now.keys.contains(where: { shown[$0] == nil }) || time - since > Self.staleness {
+                state = [Kind.menu, .label, .tip].lazy.compactMap { now[$0] }.first
+            }
+        }
+        if now.isEmpty { state = nil }
+        disagreeing = state.map(now.values.contains) == false ? disagreeing ?? time : nil
+        return state ?? .unavailable
+    }
+}
+
 private final class ZoomMuteWatcher {
-    private enum Reading { case found(ZoomMuteState), none, busy }
+    private enum Reading { case found(label: ZoomMuteState, tip: ZoomMuteState?), none, busy }
+    private struct Control {
+        let element: AXUIElement
+        let inToolbar: Bool
+        let isMenu: Bool
+    }
+    private enum Search { case found(Control, label: ZoomMuteState, tip: ZoomMuteState?), none, busy }
     private static let attributes = [kAXRoleAttribute, kAXEnabledAttribute, kAXTitleAttribute,
                                      kAXDescriptionAttribute, kAXHelpAttribute, kAXIdentifierAttribute] as CFArray
     private let application: AXUIElement
     private let queue = DispatchQueue(label: "zoom-audio.mute")
     private let lock = NSLock()
     private var history: [(time: Double, unmuted: Bool)] = []
-    private var lastScan = 0.0
-    private var lastScanFoundNothing = true
-    private var lastMenuCheck = 0.0
+    private var lastScan = -Double.infinity
     private var lastReported: ZoomMuteState?
     private var controlSeen = false
     private var timer: DispatchSourceTimer?
     private let onChange: (ZoomMuteState) -> Void
     private var labels = ZoomMuteLabels()
-    private var cachedElement: AXUIElement?
-    private var cachedInToolbar = false
-    private var cachedIsMenu = false
+    /// Zoom's own menu command and meeting button, once found.
+    private var controls: [Control] = []
+    private var indicators = MuteIndicators()
 
     init(pid: pid_t, bundleURL: URL?, onChange: @escaping (ZoomMuteState) -> Void) {
         application = AXUIElementCreateApplication(pid)
@@ -622,8 +703,8 @@ private final class ZoomMuteWatcher {
 
     private static func now() -> Double { CMClockGetTime(CMClockGetHostTimeClock()).seconds }
 
-    /// Polls every 20 ms: the cached control is read in a single round trip, so mute and
-    /// unmute edges are known within one polling interval.
+    /// Polls every 20 ms: each known control is read in a single round trip, so a change
+    /// is seen within one polling interval of Zoom showing it.
     func start() {
         let timer = DispatchSource.makeTimerSource(queue: queue)
         timer.schedule(deadline: .now(), repeating: .milliseconds(20), leeway: .milliseconds(5))
@@ -664,55 +745,54 @@ private final class ZoomMuteWatcher {
 
     /// nil when Zoom did not answer in time.
     private func currentState() -> ZoomMuteState? {
-        if let cachedElement {
-            // Zoom's own menu command is the most reliable source; return to it when it appears.
-            if !cachedIsMenu, Self.now() - lastMenuCheck >= 10 {
-                lastMenuCheck = Self.now()
-                var budget = 1000
-                switch menuReading(remaining: &budget) {
-                case let .found(state): return state
-                case .busy: return nil
-                case .none: break
-                }
-            }
-            switch reading(of: cachedElement, inToolbar: cachedInToolbar) {
-            case let .found(state): return state
-            case .busy: return nil
-            case .none: break
-            }
-        }
-        cachedElement = nil
-        // Spare Zoom's main thread a full scan on every poll while no control is visible.
-        // Until a scan completes, nothing is known.
-        guard Self.now() - lastScan >= 1 else { return lastScanFoundNothing ? .unavailable : nil }
-        lastScan = Self.now()
-        lastScanFoundNothing = false
-        var budget = 2000
-        // The own-audio menu command is available even when meeting controls are hidden.
-        switch menuReading(remaining: &budget) {
-        case let .found(state): return state
-        case .busy: return nil
-        case .none: break
-        }
-        let windows = attribute(kAXWindowsAttribute as CFString, of: application) as? [AXUIElement] ?? []
-        for window in windows {
-            switch findMuteAction(in: window, depth: 0, inToolbar: false, remaining: &budget) {
-            case let .found(state): return state
+        var shown: [MuteIndicators.Kind: ZoomMuteState] = [:]
+        let previous = controls.count
+        var kept: [Control] = []
+        for control in controls {
+            switch reading(of: control.element, inToolbar: control.inToolbar) {
+            case let .found(label, tip):
+                kept.append(control)
+                shown[control.isMenu ? .menu : .label] = label
+                if let tip { shown[.tip] = tip }
             case .busy: return nil
             case .none: continue
             }
         }
-        lastScanFoundNothing = true
-        return .unavailable
+        controls = kept
+        // Look for a missing control at once when the last one vanished, every second while
+        // none is found, and otherwise every ten seconds: a scan loads Zoom's main thread.
+        let time = Self.now()
+        let missingMenu = !controls.contains(where: \.isMenu)
+        let missingButton = !controls.contains { !$0.isMenu }
+        if missingMenu || missingButton,
+           (previous > 0 && controls.isEmpty) || time - lastScan >= (controls.isEmpty ? 1 : 10) {
+            lastScan = time
+            var budget = 2000
+            var roots: [AXUIElement] = []
+            // The own-audio menu command is available even when meeting controls are hidden.
+            if missingMenu, let menu = attribute(kAXMenuBarAttribute as CFString, of: application),
+               CFGetTypeID(menu) == AXUIElementGetTypeID() {
+                roots.append(unsafeBitCast(menu, to: AXUIElement.self))
+            }
+            if missingButton {
+                roots += attribute(kAXWindowsAttribute as CFString, of: application) as? [AXUIElement] ?? []
+            }
+            for root in roots {
+                switch findMuteControl(in: root, depth: 0, inToolbar: false, remaining: &budget) {
+                case let .found(control, label, tip):
+                    guard control.isMenu ? missingMenu : missingButton, shown[control.isMenu ? .menu : .label] == nil else { continue }
+                    controls.append(control)
+                    shown[control.isMenu ? .menu : .label] = label
+                    if let tip { shown[.tip] = tip }
+                case .busy: return nil
+                case .none: continue
+                }
+            }
+        }
+        return indicators.update(shown, at: time)
     }
 
-    private func menuReading(remaining: inout Int) -> Reading {
-        guard let menu = attribute(kAXMenuBarAttribute as CFString, of: application),
-              CFGetTypeID(menu) == AXUIElementGetTypeID() else { return .none }
-        return findMuteAction(in: unsafeBitCast(menu, to: AXUIElement.self), depth: 0, inToolbar: false, remaining: &remaining)
-    }
-
-    /// Reads one control in a single round trip.
+    /// Reads one control in a single round trip: its label, and a button's tooltip.
     private func reading(of element: AXUIElement, inToolbar: Bool) -> Reading {
         var values: CFArray?
         let error = AXUIElementCopyMultipleAttributeValues(element, Self.attributes, AXCopyMultipleAttributeOptions(rawValue: 0), &values)
@@ -729,22 +809,22 @@ private final class ZoomMuteWatcher {
         guard enabled != false, role != "AXMenuItem" || enabled == true else { return .none }
         let text = [2, 3, 4].compactMap { value($0) as? String }
         let identifier = value(5) as? String ?? ""
-        return labels.state(labels: text, role: role, enabled: true, inToolbar: inToolbar, identifier: identifier)
-            .map(Reading.found) ?? .none
+        guard let label = labels.state(labels: text, role: role, enabled: true, inToolbar: inToolbar, identifier: identifier) else {
+            return .none
+        }
+        let tip = role == "AXMenuItem" ? nil : (value(4) as? String).flatMap(labels.tipState)
+        return .found(label: label, tip: tip)
     }
 
-    private func findMuteAction(in element: AXUIElement, depth: Int, inToolbar: Bool,
-                              remaining: inout Int) -> Reading {
+    private func findMuteControl(in element: AXUIElement, depth: Int, inToolbar: Bool,
+                                 remaining: inout Int) -> Search {
         guard depth < 24, remaining > 0 else { return .none }
         remaining -= 1
         let role = attribute(kAXRoleAttribute as CFString, of: element) as? String ?? ""
         let toolbar = inToolbar || role == "AXToolbar"
         switch reading(of: element, inToolbar: toolbar) {
-        case let .found(state):
-            cachedElement = element
-            cachedInToolbar = toolbar
-            cachedIsMenu = role == "AXMenuItem"
-            return .found(state)
+        case let .found(label, tip):
+            return .found(Control(element: element, inToolbar: toolbar, isMenu: role == "AXMenuItem"), label: label, tip: tip)
         case .busy:
             return .busy
         case .none:
@@ -754,7 +834,7 @@ private final class ZoomMuteWatcher {
             return .none
         }
         for child in children {
-            let found = findMuteAction(in: child, depth: depth + 1, inToolbar: toolbar, remaining: &remaining)
+            let found = findMuteControl(in: child, depth: depth + 1, inToolbar: toolbar, remaining: &remaining)
             if case .none = found {
                 if remaining <= 0 { break }
                 continue
@@ -836,13 +916,14 @@ func zoomMicrophoneDiagnostics(observations: Int = 1) async -> [String: Any] {
 
 /// Zoom mute readings on the host clock, and the rule that turns them into the parts of
 /// the microphone recording that are the user's voice. Between two readings that agree,
-/// their state holds. A gap between readings means Zoom was busy and could not change
-/// state, so a change is placed at the later reading: voice runs on up to a mute reading
-/// and starts `reach` before an unmute reading. No speech is lost at either edge; at most
-/// one polling interval plus `pad` of the muted side is kept.
+/// their state holds: a gap between readings means Zoom was busy. Zoom shows a change
+/// a little after the click, so voice runs on up to a mute reading and starts `lead`
+/// before an unmute reading. No speech is lost at either edge; a little of the muted side
+/// is kept instead.
 struct MuteTimeline {
-    /// Longer than the 20 ms polling interval.
-    static let reach = 0.04
+    /// Measured from the press to the change being read: up to 0.31 s for a click on
+    /// Zoom's button, 0.02 s for its hotkey, 0.38 s for holding Space.
+    static let lead = 0.5
     /// Slack between the microphone's clock and Zoom's label.
     static let pad = 0.03
     /// When each poll began, and whether it saw Zoom's microphone on.
@@ -851,21 +932,20 @@ struct MuteTimeline {
     /// The voice parts of [start, end), or nil while the readings that decide them are
     /// not in yet. `final` decides now and carries the last reading forward.
     func voice(from start: Double, to end: Double, final: Bool = false) -> [Range<Double>]? {
-        if !final, (readings.last?.time ?? -.infinity) < end + Self.reach + Self.pad { return nil }
+        if !final, (readings.last?.time ?? -.infinity) < end + Self.lead + Self.pad { return nil }
         var spans: [Range<Double>] = []
         var previous: (time: Double, unmuted: Bool)?
         for reading in readings {
             if reading.unmuted {
-                let from = previous.map { $0.unmuted ? $0.time : max($0.time, reading.time - Self.reach) }
-                    ?? reading.time - Self.reach
+                let from = previous.flatMap { $0.unmuted ? $0.time : nil } ?? reading.time - Self.lead
                 spans.append(from..<reading.time)
             } else if let previous, previous.unmuted {
                 spans.append(previous.time..<max(previous.time, reading.time))
             }
             previous = reading
         }
-        if let last = readings.last, last.unmuted {
-            spans.append(last.time..<max(last.time, final ? end : last.time + Self.reach))
+        if final, let last = readings.last, last.unmuted {
+            spans.append(last.time..<max(last.time, end))
         }
         var ranges: [Range<Double>] = []
         for span in spans {
