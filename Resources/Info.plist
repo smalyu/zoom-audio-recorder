@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>local.zoom-audio-recorder</string>
+    <key>CFBundleName</key>
+    <string>Zoom Audio Recorder</string>
+    <key>CFBundleDisplayName</key>
+    <string>Zoom Audio Recorder</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0</string>
+    <key>CFBundleVersion</key>
+    <string>2</string>
+    <key>CFBundleExecutable</key>
+    <string>zoom-audio</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
+    <key>CFBundleIconName</key>
+    <string>AppIcon</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>15.0</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Запись собственного голоса в созвоне Zoom, когда микрофон включён.</string>
+    <key>NSAudioCaptureUsageDescription</key>
+    <string>Запись звука созвона Zoom.</string>
+    <key>NSScreenCaptureUsageDescription</key>
+    <string>ScreenCaptureKit выбирает приложение Zoom для записи его звука; видео не сохраняется.</string>
+</dict>
+</plist>
