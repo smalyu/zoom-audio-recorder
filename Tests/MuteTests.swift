@@ -21,5 +21,22 @@ func checkMuteDetection() throws {
     try check(matcher.state(labels: ["Mute my audio.txt"], role: "AXMenuItem", enabled: true, identifier: "_recentItemRequested:") == nil, "recent file interpreted as a microphone command")
     matcher.ownActionUnmute.append("включить звук")
     try check(matcher.state(labels: ["Включить звук"], role: "AXMenuItem", enabled: true, identifier: "onMuteAudio:") == .muted, "localized own audio action not recognized")
-    print("PASS: own menu, disabled menu, localized checkbox, toolbar, participant isolation, unknown state")
+    // In Italian, Portuguese and Swedish the Mute title contains the Unmute title.
+    for (mute, unmute) in [("Disattiva audio", "Attiva audio"), ("Desativar áudio", "Ativar áudio"), ("Inaktivera ljud", "Aktivera ljud")] {
+        var labels = ZoomMuteLabels()
+        labels.add(localization: ["Mute Audio": mute, "Unmute Audio": unmute])
+        try check(labels.state(labels: [mute], role: "AXMenuItem", enabled: true, identifier: "onMuteAudio:") == .unmuted, "\(mute) read as muted")
+        try check(labels.state(labels: [unmute], role: "AXMenuItem", enabled: true, identifier: "onMuteAudio:") == .muted, "\(unmute) read as unmuted")
+    }
+    // In Chinese the long label equals the short word, so participant and settings controls must not match.
+    var chinese = ZoomMuteLabels()
+    chinese.add(localization: ["Mute": "静音", "Unmute": "解除静音", "Mute My Audio": "静音", "Unmute My Audio": "解除静音",
+                               "Mute Audio": "静音", "Unmute Audio": "解除静音"])
+    for label in ["静音", "全体静音", "解除全体静音", "加入会议时将麦克风静音", "保持静音"] {
+        try check(chinese.state(labels: [label], role: "AXButton", enabled: true) == nil, "\(label) outside the toolbar enabled the microphone")
+        try check(chinese.state(labels: [label], role: "AXCheckBox", enabled: true) == nil, "\(label) checkbox enabled the microphone")
+    }
+    try check(chinese.state(labels: ["静音"], role: "AXButton", enabled: true, inToolbar: true) == .unmuted, "Chinese toolbar mute not recognized")
+    try check(chinese.state(labels: ["解除静音"], role: "AXMenuItem", enabled: true, identifier: "onMuteAudio:") == .muted, "Chinese menu unmute not recognized")
+    print("PASS: own menu, disabled menu, localized checkbox, toolbar, participant isolation, unknown state, whole-label matching (it, pt, sv, zh)")
 }

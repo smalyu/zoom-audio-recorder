@@ -8,7 +8,7 @@ mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp Resources/Info.plist "$app/Contents/Info.plist"
 for arch in arm64 x86_64; do
   CLANG_MODULE_CACHE_PATH="$cache_dir" SWIFT_MODULECACHE_PATH="$cache_dir" \
-    xcrun swiftc -target "$arch-apple-macos15.0" -O -parse-as-library Sources/zoom-audio.swift Sources/App.swift \
+    xcrun swiftc -target "$arch-apple-macos15.0" -O -parse-as-library Sources/*.swift \
     -o "$cache_dir/zoom-audio-$arch"
 done
 xcrun lipo -create "$cache_dir/zoom-audio-arm64" "$cache_dir/zoom-audio-x86_64" \

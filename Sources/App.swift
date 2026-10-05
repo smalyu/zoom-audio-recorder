@@ -8,70 +8,165 @@ import UniformTypeIdentifiers
 @MainActor
 final class RecorderModel: ObservableObject {
     static let shared = RecorderModel()
-    enum Phase { case idle, preparing, recording, saving, finished }
-    enum Access: String, CaseIterable { case screen, microphone, zoom }
+    static let defaultFolder = FileManager.default.urls(for: .musicDirectory, in: .userDomainMask)[0]
+        .appendingPathComponent("Записи Zoom", isDirectory: true)
+    enum Phase { case idle, preparing, recording, saving }
+    enum Access: CaseIterable { case screen, microphone, zoom }
+
+    /// The result of the last recording; stays visible until the next one starts.
+    struct Outcome: Equatable {
+        enum Kind { case saved, attention, failed }
+        var kind: Kind
+        var title: String
+        var detail: String?
+        var file: URL?
+    }
 
     @Published var phase: Phase = .idle
     @Published var screenAllowed = false
     @Published var microphoneAllowed = false
     @Published var zoomAllowed = false
+    @Published var zoomRunning = false
     @Published var microphone: ZoomMuteState = .unavailable
+    @Published var connected = true
+    @Published var problem: String?
+    @Published var lowDiskSpace = false
+    @Published var zoomAudio = true
     @Published var elapsed = 0
-    @Published var error: String?
-    @Published var output: URL?
-    @Published var result = ""
+    @Published var progress: Double?
+    @Published var outcome: Outcome?
+    @Published var recovered: [URL] = []
+    @Published var unrecovered: URL?
+    @Published var recovering = false
+    @Published var folder: URL
+    @Published var folderAvailable = true
+    @Published var attention = false
+    @Published var quitting = false
+    /// Logout, restart or shutdown: close the tracks and leave saving to the next launch.
+    private var systemQuit = false
+    /// Cancel pressed while connecting: nothing is saved.
+    private var cancelled = false
+    private var tracksClosed = false
     private var stop: StopRequest?
-    private var started: Date?
+    private var started: TimeInterval?
     private var timer: Timer?
-    private var quitAfterSave = false
+    var quitConfirmed = false
 
     var ready: Bool { screenAllowed && microphoneAllowed && zoomAllowed }
-    var busy: Bool { phase == .preparing || phase == .recording || phase == .saving }
-    var time: String {
-        elapsed >= 3600
-            ? String(format: "%02d:%02d:%02d", elapsed / 3600, elapsed / 60 % 60, elapsed % 60)
-            : String(format: "%02d:%02d", elapsed / 60, elapsed % 60)
-    }
-    var title: String {
-        switch phase {
-        case .idle: return ready ? "Готов к записи" : "Настроим доступ"
-        case .preparing: return "Подключаюсь к Zoom…"
-        case .recording: return "Запись идёт"
-        case .saving: return "Сохраняю запись…"
-        case .finished: return result
+    var busy: Bool { phase != .idle }
+    var time: String { Self.clock(elapsed) }
+    var micText: String {
+        guard connected else { return "Переподключаюсь к Zoom…" }
+        switch microphone {
+        case .unmuted: return "Ваш голос записывается"
+        case .muted: return "Микрофон выключен в Zoom"
+        case .unavailable: return "Голос не записывается"
         }
     }
-    var micText: String {
+    var micIcon: String {
+        guard connected else { return "arrow.triangle.2.circlepath" }
         switch microphone {
-        case .unmuted: return "Ваш микрофон записывается"
-        case .muted: return "Ваш микрофон выключен в Zoom"
-        case .unavailable: return "Ваш голос не записывается — проверьте окно созвона Zoom"
+        case .unmuted: return "mic.fill"
+        case .muted: return "mic.slash"
+        case .unavailable: return "exclamationmark.triangle"
         }
     }
     var micColor: Color {
+        guard connected else { return .orange }
         switch microphone {
         case .unmuted: return .green
         case .muted: return .secondary
         case .unavailable: return .orange
         }
     }
-
-    init() {
-        refreshAccess()
-        timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
-            Task { @MainActor in
-                guard let self else { return }
-                if let started = self.started, self.phase == .recording { self.elapsed = Int(Date().timeIntervalSince(started)) }
-                if !self.busy { self.refreshAccess() }
-            }
-        }
+    var lastFile: URL? { outcome?.file ?? recovered.last }
+    /// A recording is kept in its working folder because it could not be saved yet.
+    var unsaved: Bool {
+        unrecovered != nil || (outcome?.kind == .attention && outcome?.file.map { $0.pathExtension != "m4a" } == true)
     }
 
-    func refreshAccess() {
+    nonisolated static func clock(_ seconds: Int) -> String {
+        seconds >= 3600
+            ? String(format: "%d:%02d:%02d", seconds / 3600, seconds / 60 % 60, seconds % 60)
+            : String(format: "%02d:%02d", seconds / 60, seconds % 60)
+    }
+
+    init() {
+        let saved = UserDefaults.standard.string(forKey: "folder")
+        folder = saved.map { URL(fileURLWithPath: $0, isDirectory: true) } ?? Self.defaultFolder
+        refresh()
+        checkFolder()
+        let timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.tick() }
+        }
+        // Common modes keep the clock running during alerts and a pending quit.
+        RunLoop.main.add(timer, forMode: .common)
+        self.timer = timer
+    }
+
+    private func tick() {
+        if let started, phase == .recording {
+            elapsed = Int(ProcessInfo.processInfo.systemUptime - started)
+        }
+        if !busy { refresh() }
+    }
+
+    /// Permissions and Zoom: cheap, so checked every second while idle.
+    func refresh() {
+        #if !PREVIEW
         screenAllowed = CGPreflightScreenCaptureAccess()
         microphoneAllowed = AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
         zoomAllowed = AXIsProcessTrusted()
+        zoomRunning = ZoomAudio.runningZoom() != nil
+        #endif
     }
+
+    /// The folder and free space. These calls can block on a network share, so they
+    /// run off the main thread: at launch, on activation and when the folder changes.
+    func checkFolder() {
+        #if !PREVIEW
+        let folder = folder
+        Task {
+            let (available, free) = await Task.detached(priority: .utility) {
+                (Self.reachable(folder), Self.freeSpace())
+            }.value
+            guard folder == self.folder else { return }
+            folderAvailable = available
+            if !busy { lowDiskSpace = free < 1_000_000_000 }
+        }
+        #endif
+    }
+
+    nonisolated static func freeSpace() -> Int64 {
+        (try? FileManager.default.homeDirectoryForCurrentUser
+            .resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]))?
+            .volumeAvailableCapacityForImportantUsage ?? .max
+    }
+
+    /// Creates the folder and writes a test file, so a privacy prompt for a protected
+    /// folder appears now, while the user is here, rather than at save time.
+    nonisolated static func probe(_ folder: URL) -> Bool {
+        guard reachable(folder) else { return false }
+        let test = folder.appendingPathComponent(".zoom-audio-recorder-test")
+        do {
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            try Data().write(to: test)
+            try FileManager.default.removeItem(at: test)
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    /// False for a folder on a drive that is not connected.
+    nonisolated static func reachable(_ folder: URL) -> Bool {
+        var existing = folder
+        while !FileManager.default.fileExists(atPath: existing.path), existing.pathComponents.count > 1 {
+            existing.deleteLastPathComponent()
+        }
+        return existing.path != "/Volumes" && FileManager.default.isWritableFile(atPath: existing.path)
+    }
+
     func allowed(_ access: Access) -> Bool {
         switch access {
         case .screen: return screenAllowed
@@ -79,6 +174,7 @@ final class RecorderModel: ObservableObject {
         case .zoom: return zoomAllowed
         }
     }
+
     func request(_ access: Access) {
         switch access {
         case .screen:
@@ -87,15 +183,16 @@ final class RecorderModel: ObservableObject {
             if AVCaptureDevice.authorizationStatus(for: .audio) == .notDetermined {
                 Task {
                     _ = await AVCaptureDevice.requestAccess(for: .audio)
-                    refreshAccess()
+                    refresh()
                 }
             } else { openSettings("Privacy_Microphone") }
         case .zoom:
             _ = AXIsProcessTrustedWithOptions(["AXTrustedCheckOptionPrompt": true] as CFDictionary)
             openSettings("Privacy_Accessibility")
         }
-        refreshAccess()
+        refresh()
     }
+
     private func openSettings(_ pane: String) {
         if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?\(pane)") {
             NSWorkspace.shared.open(url)
@@ -103,60 +200,267 @@ final class RecorderModel: ObservableObject {
     }
 
     func start() {
-        refreshAccess()
-        guard ready, !busy else { return }
-        let panel = NSSavePanel()
-        panel.title = "Куда сохранить созвон?"
-        panel.prompt = "Начать запись"
-        panel.allowedContentTypes = [.mpeg4Audio]
-        panel.canCreateDirectories = true
-        let formatter = DateFormatter()
-        formatter.dateFormat = "yyyy-MM-dd HH-mm"
-        panel.nameFieldStringValue = "Zoom \(formatter.string(from: Date())).m4a"
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-        error = nil
-        output = url
-        elapsed = 0
+        refresh()
+        guard ready, !busy, zoomRunning, !quitting else { return }
+        // A recording still waiting to be saved stays visible as a banner.
+        if unsaved, unrecovered == nil { unrecovered = outcome?.file }
+        outcome = nil
+        problem = nil
+        zoomAudio = true
         microphone = .unavailable
+        connected = true
+        progress = nil
+        elapsed = 0
+        attention = false
+        cancelled = false
+        tracksClosed = false
+        systemQuit = false
         phase = .preparing
         let request = StopRequest()
         stop = request
+        let destination = folder
+        // The probe can hang on a dead network share; recording never waits for it.
         Task {
+            let available = await Task.detached(priority: .utility) { Self.probe(destination) }.value
+            if destination == folder { folderAvailable = available }
+        }
+        Task {
+            // Keeps the Mac awake and App Nap away until the file is saved.
+            let activity = ProcessInfo.processInfo.beginActivity(
+                options: [.userInitiated, .idleSystemSleepDisabled], reason: "Запись созвона Zoom")
+            defer { ProcessInfo.processInfo.endActivity(activity) }
+            var session: RecordingSession?
             do {
-                let recording = try await ZoomAudio.record(stop: request, output: url,
-                    onStarted: { Task { @MainActor in
-                        self.started = Date()
-                        if self.phase != .saving { self.phase = .recording }
-                    }},
-                    onMicrophone: { value in Task { @MainActor in self.microphone = value } })
-                result = recording.hasMicrophone ? "Запись сохранена" : "Сохранён звук собеседников"
-                self.error = recording.warning
-                phase = .finished
+                try await ZoomAudio.prepare()
+                guard !request.isRequested else { throw CancellationError() }
+                let created = try RecordingSession.create(destination: destination,
+                                                          name: RecordingSession.fileName(for: Date()))
+                session = created
+                let summary = try await ZoomAudio.record(into: created.folder, stop: request, events: { event in
+                    Task { @MainActor in self.handle(event) }
+                }, onVoice: { created.markVoice() })
+                tracksClosed = true
+                if cancelled { throw CancellationError() }
+                guard summary.hasAudio else { throw RecorderError.noAudio }
+                if systemQuit {
+                    recorderLog.notice("System quit: tracks closed, saving on next launch")
+                } else {
+                    phase = .saving
+                    let delivery = try await created.deliver(fallback: Self.defaultFolder) { value in
+                        Task { @MainActor in self.progress = value }
+                    }
+                    outcome = Self.outcome(for: delivery, summary: summary, preferred: destination)
+                }
+            } catch is CancellationError where cancelled || !(session?.hasAudio ?? false) {
+                session?.remove()
             } catch {
-                self.error = error.localizedDescription
-                phase = .idle
+                tracksClosed = true
+                if let session, session.hasAudio {
+                    // Captured audio stays on disk; the next launch saves it again.
+                    outcome = Outcome(kind: .attention, title: "Запись не потеряна",
+                                      detail: "Файл не сохранён: \(Self.sentence(error)) Повторю при следующем запуске.",
+                                      file: session.folder)
+                } else {
+                    session?.remove()
+                    outcome = Outcome(kind: .failed, title: "Не удалось записать", detail: error.localizedDescription)
+                }
             }
+            if let outcome, outcome.kind != .saved {
+                attention = true
+                NSApplication.shared.requestUserAttention(.criticalRequest)
+            }
+            phase = .idle
             started = nil
             stop = nil
-            if quitAfterSave { NSApplication.shared.reply(toApplicationShouldTerminate: true) }
+            progress = nil
+            refresh()
+            checkFolder()
+            if quitting && (!recovering || systemQuit) { NSApplication.shared.reply(toApplicationShouldTerminate: true) }
         }
     }
+
+    private static func sentence(_ error: Error) -> String {
+        let text = error.localizedDescription
+        return text.hasSuffix(".") ? text : text + "."
+    }
+
+    private static func outcome(for delivery: RecordingSession.Delivery, summary: RecordingSummary,
+                                preferred: URL) -> Outcome {
+        let size = (try? FileManager.default.attributesOfItem(atPath: delivery.url.path)[.size] as? Int) ?? 0
+        var details = [clock(Int(delivery.duration.rounded())) + " · "
+                       + ByteCountFormatter.string(fromByteCount: Int64(size), countStyle: .file)]
+        if !summary.hasZoom { details.append("Звук собеседников не получен") }
+        if summary.zoomQuit { details.append("Zoom закрылся — запись остановлена") }
+        if summary.interruptions > 0 { details.append("Связь с Zoom прерывалась: \(summary.interruptions)") }
+        if !summary.hasVoice { details.append("Ваш голос не записан") }
+        if delivery.incomplete { details.append("Часть звука не прочитана") }
+        if delivery.usedFallback {
+            details.insert("Папка «\(preferred.lastPathComponent)» недоступна", at: 0)
+            return Outcome(kind: .attention, title: "Сохранено в «\(delivery.url.deletingLastPathComponent().lastPathComponent)»",
+                           detail: details.joined(separator: "\n"), file: delivery.url)
+        }
+        return Outcome(kind: delivery.incomplete ? .attention : .saved, title: "Сохранено",
+                       detail: details.joined(separator: "\n"), file: delivery.url)
+    }
+
+    private func handle(_ event: RecorderEvent) {
+        switch event {
+        case .started:
+            guard !cancelled else { return }
+            started = ProcessInfo.processInfo.systemUptime
+            if phase == .preparing { phase = .recording }
+        case .connected:
+            connected = true
+            problem = nil
+        case .reconnecting:
+            if connected { NSApplication.shared.requestUserAttention(.informationalRequest) }
+            connected = false
+        case let .microphone(state):
+            microphone = state
+        case let .problem(message):
+            problem = message
+        case let .lowDiskSpace(low):
+            lowDiskSpace = low
+        case let .zoomAudio(receiving):
+            zoomAudio = receiving
+        }
+    }
+
     func finish() {
         guard phase == .recording || phase == .preparing else { return }
-        phase = .saving
+        if phase == .preparing { cancelled = true }
+        if phase == .recording { phase = .saving }
         stop?.stop()
     }
-    func reveal() {
-        if let output { NSWorkspace.shared.activateFileViewerSelecting([output]) }
+
+    /// Saves recordings left by a crash, a forced quit or a failed save.
+    func recover() {
+        guard !recovering else { return }
+        recovering = true
+        Task {
+            let activity = ProcessInfo.processInfo.beginActivity(
+                options: [.userInitiated, .idleSystemSleepDisabled], reason: "Восстановление записи")
+            defer { ProcessInfo.processInfo.endActivity(activity) }
+            for session in RecordingSession.interrupted(fallback: Self.defaultFolder) {
+                // A crash in the first second leaves nothing playable to save.
+                guard session.hasAudio else {
+                    session.remove()
+                    continue
+                }
+                do {
+                    let delivery = try await session.deliver(fallback: Self.defaultFolder)
+                    recovered.append(delivery.url)
+                    if outcome?.file == session.folder { outcome = nil }
+                    if unrecovered == session.folder { unrecovered = nil }
+                } catch RecorderError.noAudio where session.recordedBytes < 1_000_000 {
+                    session.remove()
+                } catch {
+                    recorderLog.error("Recovery failed: \(error.localizedDescription, privacy: .public)")
+                    unrecovered = session.folder
+                    attention = true
+                    NSApplication.shared.requestUserAttention(.criticalRequest)
+                }
+            }
+            recovering = false
+            if quitting && !busy { NSApplication.shared.reply(toApplicationShouldTerminate: true) }
+        }
     }
+
+    func dismissRecovery() {
+        recovered = []
+        unrecovered = nil
+        attention = false
+    }
+
+    /// The recovered files were shown; a recording still waiting to be saved stays visible.
+    func dismissRecovered() {
+        recovered = []
+        if !unsaved { attention = false }
+    }
+
+    func reveal(_ urls: [URL]) {
+        NSWorkspace.shared.activateFileViewerSelecting(urls)
+    }
+
     func revealApplication() {
         NSWorkspace.shared.activateFileViewerSelecting([Bundle.main.bundleURL])
     }
+
+    func openFolder() {
+        let folder = folder
+        Task {
+            let ready = await Task.detached(priority: .userInitiated) { () -> Bool in
+                guard Self.reachable(folder) else { return false }
+                try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+                return true
+            }.value
+            if ready { NSWorkspace.shared.open(folder) }
+        }
+    }
+
+    func chooseFolder() {
+        let panel = NSOpenPanel()
+        panel.title = "Папка для записей"
+        panel.prompt = "Выбрать"
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.canCreateDirectories = true
+        panel.directoryURL = folder
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        setFolder(url)
+    }
+
+    func setFolder(_ url: URL) {
+        folder = url
+        if url == Self.defaultFolder {
+            UserDefaults.standard.removeObject(forKey: "folder")
+        } else {
+            UserDefaults.standard.set(url.path, forKey: "folder")
+        }
+        checkFolder()
+    }
+
     func quit() -> NSApplication.TerminateReply {
-        guard busy else { return .terminateNow }
-        quitAfterSave = true
-        finish()
+        // Logout, restart and shutdown never ask and never wait for an export.
+        let system = Self.isSystemQuit
+        switch phase {
+        case .idle:
+            // A recovery in progress finishes first; its folder survives a forced exit anyway.
+            guard recovering, !system else { return .terminateNow }
+        case .recording:
+            if system {
+                systemQuit = true
+            } else if !quitConfirmed {
+                let alert = NSAlert()
+                alert.messageText = "Остановить запись и выйти?"
+                alert.informativeText = "Запись будет сохранена."
+                alert.addButton(withTitle: "Сохранить и выйти")
+                alert.addButton(withTitle: "Продолжить запись")
+                guard alert.runModal() == .alertFirstButtonReturn else { return .terminateCancel }
+                // The recording may have ended on its own while the alert was open.
+                if phase == .idle {
+                    guard recovering else { return .terminateNow }
+                    quitting = true
+                    return .terminateLater
+                }
+            }
+            finish()
+        case .preparing:
+            if system { systemQuit = true }
+            finish()
+        case .saving:
+            if system {
+                // Closed tracks are safe: an interrupted export is redone at next launch.
+                if tracksClosed { return .terminateNow }
+                systemQuit = true
+            }
+        }
+        quitting = true
         return .terminateLater
+    }
+
+    private static var isSystemQuit: Bool {
+        NSAppleEventManager.shared().currentAppleEvent?.attributeDescriptor(forKeyword: kAEQuitReason) != nil
     }
 }
 
@@ -165,7 +469,10 @@ final class RecorderDelegate: NSObject, NSApplicationDelegate {
     @MainActor func applicationDidFinishLaunching(_ notification: Notification) {
         // Read-only developer diagnostics run under this app's own authorization.
         let arguments = CommandLine.arguments
-        guard let flag = arguments.firstIndex(of: "--diagnose-zoom"), arguments.count > flag + 1 else { return }
+        guard let flag = arguments.firstIndex(of: "--diagnose-zoom"), arguments.count > flag + 1 else {
+            RecorderModel.shared.recover()
+            return
+        }
         let path = arguments[flag + 1]
         let observations = arguments.contains("--observe") ? 150 : 1
         Task.detached {
@@ -179,25 +486,57 @@ final class RecorderDelegate: NSObject, NSApplicationDelegate {
     #endif
     #if PREVIEW
     @MainActor func applicationDidFinishLaunching(_ notification: Notification) {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
-            let model = RecorderModel.shared
-            if CommandLine.arguments.contains("--recording") {
-                model.screenAllowed = true; model.microphoneAllowed = true; model.zoomAllowed = true
-                model.phase = .recording; model.microphone = .muted; model.elapsed = 143
+        // Renders one state to a PNG: zoom-audio <output.png> <state>.
+        let model = RecorderModel.shared
+        let state = CommandLine.arguments.count > 2 ? CommandLine.arguments[2] : "idle"
+        model.screenAllowed = true
+        model.microphoneAllowed = state != "permissions"
+        model.zoomAllowed = state != "permissions"
+        model.zoomRunning = state != "nozoom"
+        let file = RecorderModel.defaultFolder.appendingPathComponent("Zoom 2026-10-05 14-30.m4a")
+        switch state {
+        case "recording": model.phase = .recording; model.microphone = .unmuted; model.elapsed = 754
+        case "muted": model.phase = .recording; model.microphone = .muted; model.elapsed = 754
+        case "unknown": model.phase = .recording; model.microphone = .unavailable; model.elapsed = 754
+        case "reconnecting": model.phase = .recording; model.connected = false; model.elapsed = 754
+        case "saving": model.phase = .saving; model.elapsed = 2832; model.progress = 0.62
+        case "preparing": model.phase = .preparing
+        case "saved":
+            model.outcome = .init(kind: .saved, title: "Сохранено", detail: "47:12 · 38,2 МБ", file: file)
+        case "fallback":
+            model.outcome = .init(kind: .attention, title: "Сохранено в «Записи Zoom»",
+                                  detail: "Папка «Meetings» недоступна\n47:12 · 38,2 МБ", file: file)
+        case "kept":
+            model.outcome = .init(kind: .attention, title: "Запись не потеряна",
+                                  detail: "Файл не сохранён: на диске нет места. Повторю при следующем запуске.",
+                                  file: RecordingSession.root.appendingPathComponent("2026-10-05 14-30-00 1A2B3C4D"))
+        case "failed":
+            model.outcome = .init(kind: .failed, title: "Не удалось записать", detail: "Откройте Zoom и войдите в созвон")
+        case "recovered": model.recovered = [file]
+        case "recovering": model.recovering = true
+        default: break
+        }
+        let host = NSHostingView(rootView: RecorderView(model: model)
+            .background(Color(nsColor: .windowBackgroundColor)))
+        host.frame.size = host.fittingSize
+        let window = NSWindow(contentRect: host.frame, styleMask: [.titled, .fullSizeContentView],
+                              backing: .buffered, defer: false)
+        window.titlebarAppearsTransparent = true
+        window.contentView = host
+        NSApplication.shared.setActivationPolicy(.regular)
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+            host.layoutSubtreeIfNeeded()
+            if let bitmap = host.bitmapImageRepForCachingDisplay(in: host.bounds) {
+                host.cacheDisplay(in: host.bounds, to: bitmap)
+                try? bitmap.representation(using: .png, properties: [:])?.write(to:
+                    URL(fileURLWithPath: CommandLine.arguments[1]))
             }
-            NSApplication.shared.activate(ignoringOtherApps: true)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                if let window = NSApplication.shared.windows.first(where: { $0.title == "Zoom Audio Recorder" }),
-                   let view = window.contentView,
-                   let bitmap = view.bitmapImageRepForCachingDisplay(in: view.bounds) {
-                    view.cacheDisplay(in: view.bounds, to: bitmap)
-                    try? bitmap.representation(using: .png, properties: [:])?.write(to:
-                        URL(fileURLWithPath: CommandLine.arguments[1]))
-                }
-                // Preview simulations never enter the recording shutdown path.
-                model.phase = .idle
-                NSApplication.shared.terminate(nil)
-            }
+            // Preview simulations never enter the recording shutdown path.
+            model.phase = .idle
+            model.recovering = false
+            NSApplication.shared.terminate(nil)
         }
     }
     #endif
@@ -213,18 +552,59 @@ struct RecorderApplication: App {
     var body: some Scene {
         Window("Zoom Audio Recorder", id: "recorder") {
             RecorderView(model: model)
-                .frame(width: 560)
-                .fixedSize(horizontal: false, vertical: true)
         }
         .windowResizability(.contentSize)
+        .windowStyle(.hiddenTitleBar)
         .defaultPosition(.center)
-        .commands {
-            CommandGroup(replacing: .newItem) {}
+        .commands { RecorderCommands(model: model) }
+        Window("Справка", id: "help") {
+            HelpView().padding(24).frame(width: 340)
         }
+        .windowResizability(.contentSize)
         MenuBarExtra {
             RecorderMenu(model: model)
         } label: {
-            Image(systemName: model.busy ? "record.circle.fill" : "waveform")
+            MenuBarLabel(model: model)
+        }
+    }
+}
+
+struct RecorderCommands: Commands {
+    @ObservedObject var model: RecorderModel
+    @Environment(\.openWindow) private var openWindow
+    var body: some Commands {
+        CommandGroup(replacing: .newItem) {}
+        CommandMenu("Запись") {
+            Button("Начать запись") { model.start() }
+                .keyboardShortcut("r")
+                .disabled(model.busy || !model.ready || !model.zoomRunning || model.quitting)
+            Button("Остановить запись") { model.finish() }
+                .keyboardShortcut(".")
+                .disabled(model.phase != .recording && model.phase != .preparing)
+            Divider()
+            Button("Открыть папку записей") { model.openFolder() }
+            Button("Изменить папку…") { model.chooseFolder() }
+                .disabled(model.busy)
+        }
+        CommandGroup(replacing: .help) {
+            Button("Справка Zoom Audio Recorder") { openWindow(id: "help") }
+                .keyboardShortcut("?")
+        }
+    }
+}
+
+struct MenuBarLabel: View {
+    @ObservedObject var model: RecorderModel
+    var body: some View {
+        switch model.phase {
+        case .recording:
+            Text("\(Image(systemName: model.micIcon)) \(model.time)").monospacedDigit()
+        case .preparing:
+            Image(systemName: "record.circle")
+        case .saving:
+            Image(systemName: "arrow.down.circle")
+        case .idle:
+            Image(systemName: model.attention ? "exclamationmark.triangle" : "waveform")
         }
     }
 }
@@ -233,122 +613,265 @@ struct RecorderMenu: View {
     @ObservedObject var model: RecorderModel
     @Environment(\.openWindow) private var openWindow
     var body: some View {
-        Text(model.title)
-        Button("Открыть рекордер") {
+        if !model.recovered.isEmpty {
+            Button(model.recovered.count == 1 ? "Восстановлена запись — показать"
+                   : "Восстановлено записей: \(model.recovered.count) — показать") {
+                model.reveal(model.recovered)
+                model.dismissRecovered()
+            }
+            Divider()
+        }
+        switch model.phase {
+        case .recording:
+            Text(model.connected ? "Запись · \(model.time)" : "Запись · \(model.time) · нет связи с Zoom")
+            Text(model.micText)
+        case .preparing: Text("Подключаюсь к Zoom…")
+        case .saving: Text("Сохраняю…")
+        case .idle: if let outcome = model.outcome { Text(outcome.title) }
+        }
+        Divider()
+        if model.phase == .recording || model.phase == .preparing {
+            Button("Остановить запись") { model.finish() }
+        } else {
+            Button("Начать запись") { model.start() }
+                .disabled(model.busy || !model.ready || !model.zoomRunning || model.quitting)
+        }
+        if let file = model.lastFile, !model.busy {
+            Button("Показать последнюю запись") { model.reveal([file]) }
+        }
+        Button("Открыть папку записей") { model.openFolder() }
+        Divider()
+        Button("Показать окно") {
             openWindow(id: "recorder")
             NSApplication.shared.activate(ignoringOtherApps: true)
         }
-        if model.busy {
-            Button("Остановить и сохранить") { model.finish() }
-                .disabled(model.phase == .saving)
+        Button("Справка") {
+            openWindow(id: "help")
+            NSApplication.shared.activate(ignoringOtherApps: true)
         }
         Divider()
-        Button("Выйти") { NSApplication.shared.terminate(nil) }
+        // A second terminate while one is pending would skip saving.
+        Button(model.phase == .recording ? "Остановить и выйти" : "Выйти") {
+            guard !model.quitting else { return }
+            model.quitConfirmed = true
+            NSApplication.shared.terminate(nil)
+        }
+        .disabled(model.quitting)
     }
 }
 
 struct RecorderView: View {
     @ObservedObject var model: RecorderModel
-    @State private var showHelp = false
     var body: some View {
-        VStack(alignment: .leading, spacing: 22) {
-            HStack(spacing: 16) {
-                Image(nsImage: NSImage(named: NSImage.applicationIconName) ?? NSImage())
-                    .resizable().frame(width: 66, height: 66)
-                VStack(alignment: .leading, spacing: 5) {
-                    Text("Zoom Audio Recorder").font(.system(size: 24, weight: .semibold))
-                    Text("Созвоны команды — в одном аудиофайле")
-                        .font(.system(size: 13)).foregroundStyle(.secondary)
-                }
-                Spacer()
-                Button { showHelp.toggle() } label: {
-                    Image(systemName: "questionmark.circle").font(.system(size: 19))
-                }
-                .buttonStyle(.plain).foregroundStyle(.secondary)
-                .popover(isPresented: $showHelp) { HelpView().padding(22).frame(width: 360) }
+        VStack(spacing: 16) {
+            if !model.recovered.isEmpty || model.unrecovered != nil {
+                RecoveryBanner(model: model)
             }
-
-            VStack(alignment: .leading, spacing: 14) {
-                HStack {
-                    Circle().fill(model.phase == .recording ? Color.red : Color.accentColor.opacity(0.6))
-                        .frame(width: 9, height: 9)
-                    Text(model.title).font(.system(size: 16, weight: .medium))
-                    Spacer()
-                    Text(model.time).font(.system(size: 28, weight: .medium, design: .monospaced))
-                        .monospacedDigit().foregroundStyle(model.busy ? .primary : .secondary)
-                }
-                if model.phase == .recording {
-                    Label(model.micText, systemImage: model.microphone == .unmuted ? "mic.fill" : "mic.slash.fill")
-                        .font(.system(size: 12)).foregroundStyle(model.micColor)
-                    if model.microphone == .unavailable {
-                        Text("Войдите в созвон и покажите панель с кнопкой микрофона. Звук собеседников продолжает записываться.")
-                            .font(.system(size: 12)).foregroundStyle(.secondary)
-                    }
-                } else {
-                    Text(model.phase == .finished ? "Файл M4A готов. Его можно отправить коллегам." :
-                        "Запишет звук Zoom и ваш голос, когда микрофон включён в Zoom.")
-                        .font(.system(size: 13)).foregroundStyle(.secondary)
-                }
-                HStack(spacing: 12) {
-                    if model.busy {
-                        Button { model.finish() } label: {
-                            Label(model.phase == .saving ? "Сохраняю…" : "Остановить и сохранить",
-                                  systemImage: "stop.fill").frame(maxWidth: .infinity)
-                        }.disabled(model.phase == .saving)
-                    } else {
-                        Button { model.start() } label: {
-                            Label("Начать запись", systemImage: "record.circle")
-                                .frame(maxWidth: .infinity)
-                        }.disabled(!model.ready)
-                    }
-                    if model.phase == .finished {
-                        Button { model.reveal() } label: { Image(systemName: "folder") }
-                            .help("Показать сохранённый файл")
-                    }
-                }
-                .buttonStyle(.borderedProminent).controlSize(.large)
-            }
-            .padding(20)
-            .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 16))
-
-            if let error = model.error {
-                Label(error, systemImage: "exclamationmark.triangle")
-                    .font(.system(size: 12)).foregroundStyle(.red)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            if !model.ready {
-                VStack(alignment: .leading, spacing: 13) {
-                    Text("Первый запуск").font(.system(size: 14, weight: .semibold))
-                    Text("Разрешите доступ для Zoom Audio Recorder. В следующий раз этот шаг не понадобится.")
-                        .font(.system(size: 12)).foregroundStyle(.secondary)
-                    accessRow(.screen, "Звук Zoom", "Запись экрана и системного аудио", "speaker.wave.2")
-                    accessRow(.microphone, "Ваш голос", "Доступ к микрофону", "mic")
-                    accessRow(.zoom, "Состояние микрофона в Zoom", "Управление приложениями", "switch.2")
-                    Text("Нет приложения в списке настроек? Нажмите «+» под списком и выберите Zoom Audio Recorder.app в папке «Программы».")
-                        .font(.system(size: 11)).foregroundStyle(.secondary)
-                    Button("Показать приложение в Finder") { model.revealApplication() }
-                        .buttonStyle(.link).font(.system(size: 11))
+            if !model.ready && !model.busy {
+                PermissionsView(model: model)
+            } else {
+                switch model.phase {
+                case .idle: IdleView(model: model)
+                case .preparing: PreparingView(model: model)
+                case .recording: RecordingView(model: model)
+                case .saving: SavingView(model: model)
                 }
             }
-            HStack {
-                Label("Только на вашем Mac", systemImage: "lock")
-                Spacer()
-                Text("M4A · macOS 15+")
-            }.font(.system(size: 11)).foregroundStyle(.tertiary)
         }
-        .padding(28)
-        .background(Color(nsColor: .windowBackgroundColor))
+        .padding(.horizontal, 20)
+        .padding(.top, 30)
+        .padding(.bottom, 20)
+        .frame(width: 320)
+        .fixedSize(horizontal: false, vertical: true)
+        .animation(.snappy, value: model.phase)
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
-            model.refreshAccess()
+            if !model.busy {
+                model.refresh()
+                model.checkFolder()
+            }
+            // Seen now; only a recording still waiting to be saved keeps the warning.
+            if !model.unsaved { model.attention = false }
         }
     }
-    private func accessRow(_ access: RecorderModel.Access, _ title: String, _ detail: String, _ icon: String) -> some View {
-        HStack(spacing: 12) {
-            Image(systemName: icon).frame(width: 22).foregroundStyle(.secondary)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title).font(.system(size: 12, weight: .medium))
-                Text(detail).font(.system(size: 11)).foregroundStyle(.secondary)
+}
+
+private let wideButton: CGFloat = 200
+
+struct IdleView: View {
+    @ObservedObject var model: RecorderModel
+    var body: some View {
+        VStack(spacing: 14) {
+            if let outcome = model.outcome {
+                OutcomeView(model: model, outcome: outcome)
+            } else {
+                Text(model.zoomRunning ? "Готов к записи" : "Откройте Zoom и войдите в созвон")
+                    .font(.title3.weight(.medium))
+                    .foregroundStyle(model.zoomRunning ? .primary : .secondary)
+                    .multilineTextAlignment(.center)
             }
+            Button { model.start() } label: {
+                Label("Начать запись", systemImage: "record.circle").frame(width: wideButton)
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.large)
+            .keyboardShortcut(.defaultAction)
+            .disabled(!model.zoomRunning || model.quitting)
+            VStack(spacing: 4) {
+                FolderMenu(model: model)
+                if !model.folderAvailable {
+                    Caption("Папка недоступна — сохраню в «\(RecorderModel.defaultFolder.lastPathComponent)»", color: .orange)
+                }
+                if model.lowDiskSpace { Caption("Мало места на диске", color: .orange) }
+                if model.recovering { Caption("Восстанавливаю прерванную запись…") }
+            }
+        }
+    }
+}
+
+struct OutcomeView: View {
+    @ObservedObject var model: RecorderModel
+    let outcome: RecorderModel.Outcome
+    var body: some View {
+        VStack(spacing: 8) {
+            Label {
+                Text(outcome.title)
+            } icon: {
+                Image(systemName: icon).foregroundStyle(color)
+            }
+            .font(.title3.weight(.medium))
+            .multilineTextAlignment(.center)
+            if let file = outcome.file {
+                Button { model.reveal([file]) } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: file.pathExtension == "m4a" ? "waveform" : "folder")
+                        Text(file.lastPathComponent).lineLimit(1).truncationMode(.middle)
+                    }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 5)
+                    .background(.quaternary.opacity(0.6), in: Capsule())
+                }
+                .buttonStyle(.plain)
+                .help("Показать в Finder")
+                .onDrag { NSItemProvider(contentsOf: file) ?? NSItemProvider() }
+            }
+            if let detail = outcome.detail {
+                Text(detail)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+    private var color: Color {
+        switch outcome.kind {
+        case .saved: return .green
+        case .attention: return .orange
+        case .failed: return .red
+        }
+    }
+    private var icon: String {
+        switch outcome.kind {
+        case .saved: return "checkmark.circle.fill"
+        case .attention: return "exclamationmark.triangle.fill"
+        case .failed: return "xmark.octagon.fill"
+        }
+    }
+}
+
+struct PreparingView: View {
+    @ObservedObject var model: RecorderModel
+    var body: some View {
+        VStack(spacing: 14) {
+            HStack(spacing: 8) {
+                ProgressView().controlSize(.small)
+                Text("Подключаюсь к Zoom…").font(.title3.weight(.medium))
+            }
+            Button("Отменить") { model.finish() }
+                .controlSize(.large)
+                .keyboardShortcut(.cancelAction)
+        }
+    }
+}
+
+struct RecordingView: View {
+    @ObservedObject var model: RecorderModel
+    var body: some View {
+        VStack(spacing: 10) {
+            HStack(spacing: 10) {
+                Image(systemName: "circle.fill")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.red)
+                    .symbolEffect(.pulse, options: .repeating)
+                Text(model.time)
+                    .font(.system(size: 40, weight: .light))
+                    .monospacedDigit()
+                    .contentTransition(.numericText())
+            }
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("Идёт запись, \(model.time)")
+            Label(model.micText, systemImage: model.micIcon)
+                .font(.callout)
+                .foregroundStyle(model.micColor)
+            if model.connected && model.microphone == .unavailable {
+                Caption("Покажите панель управления встречей в Zoom")
+            }
+            if model.connected && !model.zoomAudio { Caption("Звук Zoom не поступает", color: .orange) }
+            if let problem = model.problem { Caption(problem, color: .orange) }
+            if model.lowDiskSpace { Caption("Мало места на диске", color: .orange) }
+            Button { model.finish() } label: {
+                Label("Остановить", systemImage: "stop.fill").frame(width: wideButton)
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(.red)
+            .controlSize(.large)
+            .padding(.top, 6)
+        }
+    }
+}
+
+struct SavingView: View {
+    @ObservedObject var model: RecorderModel
+    var body: some View {
+        VStack(spacing: 12) {
+            Text(model.time)
+                .font(.system(size: 40, weight: .light))
+                .monospacedDigit()
+                .foregroundStyle(.secondary)
+            Text(model.quitting ? "Сохраняю перед выходом…" : "Сохраняю…").font(.callout)
+            if let progress = model.progress {
+                ProgressView(value: progress).frame(width: wideButton)
+            } else {
+                ProgressView().controlSize(.small)
+            }
+        }
+    }
+}
+
+struct PermissionsView: View {
+    @ObservedObject var model: RecorderModel
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Нужен доступ").font(.title3.weight(.medium))
+            row(.screen, "Звук Zoom", "speaker.wave.2", "«Запись экрана и системного звука»")
+            row(.microphone, "Микрофон", "mic", "«Микрофон»")
+            row(.zoom, "Кнопка mute в Zoom", "hand.tap",
+                "«Универсальный доступ» (в macOS 27 — «Управление устройством и доступ к данным»)")
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Нет в списке? Нажмите «+» и выберите приложение.")
+                    .font(.caption).foregroundStyle(.secondary)
+                Button("Показать приложение в Finder") { model.revealApplication() }
+                    .buttonStyle(.link).font(.caption)
+            }
+            .padding(.top, 2)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+    private func row(_ access: RecorderModel.Access, _ title: String, _ icon: String, _ pane: String) -> some View {
+        HStack(spacing: 10) {
+            Image(systemName: icon).frame(width: 20).foregroundStyle(.secondary)
+            Text(title)
             Spacer()
             if model.allowed(access) {
                 Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
@@ -356,20 +879,86 @@ struct RecorderView: View {
                 Button("Разрешить") { model.request(access) }.controlSize(.small)
             }
         }
+        .help("Конфиденциальность и безопасность → \(pane)")
+    }
+}
+
+struct RecoveryBanner: View {
+    @ObservedObject var model: RecorderModel
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: model.unrecovered == nil ? "arrow.uturn.backward.circle.fill" : "exclamationmark.triangle.fill")
+                .foregroundStyle(model.unrecovered == nil ? Color.accentColor : .orange)
+            Text(text).font(.callout).lineLimit(2).fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 4)
+            Button("Показать") {
+                model.reveal(model.unrecovered.map { [$0] } ?? model.recovered)
+            }
+            .controlSize(.small)
+            Button { model.dismissRecovery() } label: { Image(systemName: "xmark") }
+                .buttonStyle(.borderless)
+                .controlSize(.small)
+                .help("Скрыть")
+        }
+        .padding(10)
+        .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 10))
+    }
+    private var text: String {
+        if model.unrecovered != nil { return "Запись ещё не сохранена — повторю при следующем запуске" }
+        return model.recovered.count == 1 ? "Восстановлена прерванная запись"
+            : "Восстановлено записей: \(model.recovered.count)"
+    }
+}
+
+struct FolderMenu: View {
+    @ObservedObject var model: RecorderModel
+    var body: some View {
+        Menu {
+            Button("Открыть в Finder") { model.openFolder() }
+            Button("Изменить папку…") { model.chooseFolder() }
+            if model.folder != RecorderModel.defaultFolder {
+                Button("По умолчанию: «\(RecorderModel.defaultFolder.lastPathComponent)»") {
+                    model.setFolder(RecorderModel.defaultFolder)
+                }
+            }
+        } label: {
+            Label(model.folder.lastPathComponent, systemImage: "folder")
+        } primaryAction: {
+            model.openFolder()
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        .font(.callout)
+        .foregroundStyle(.secondary)
+        .help(model.folder.path)
+    }
+}
+
+struct Caption: View {
+    let text: String
+    var color: Color = .secondary
+    init(_ text: String, color: Color = .secondary) {
+        self.text = text
+        self.color = color
+    }
+    var body: some View {
+        Text(text)
+            .font(.caption)
+            .foregroundStyle(color)
+            .multilineTextAlignment(.center)
+            .fixedSize(horizontal: false, vertical: true)
     }
 }
 
 struct HelpView: View {
     var body: some View {
-        VStack(alignment: .leading, spacing: 13) {
-            Text("Как записать созвон").font(.headline)
-            Text("Откройте Zoom, войдите в созвон и нажмите «Начать запись». Выберите файл. После встречи нажмите «Остановить и сохранить».")
-            Text("Микрофон").font(.subheadline.bold())
-            Text("Используется системный микрофон Mac. Выберите тот же микрофон в Zoom. Приложение читает кнопку mute Zoom; если кнопка недоступна, ваш микрофон заглушается. Индикатор показывает это во время записи.")
-            Text("Разрешения").font(.subheadline.bold())
-            Text("В настройках macOS включайте Zoom Audio Recorder. Если его нет в списке, нажмите «+» и выберите приложение в папке «Программы». Терминалу доступ не нужен. macOS 27 называет доступ к кнопке Zoom «Device Control and Data Access», ранние версии — «Accessibility».")
-            Text("Все записи остаются в выбранном вами месте. Приложение ничего не отправляет в интернет.")
-            Text("Перед записью предупредите участников.").foregroundStyle(.secondary)
-        }.font(.system(size: 12))
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Войдите в созвон Zoom → «Начать запись» → «Остановить». Файл появится в папке записей.")
+            Text("Ваш голос записывается, только когда микрофон включён в Zoom. В Zoom и macOS должен быть выбран один микрофон.")
+            Text("Прерванная запись восстанавливается при следующем запуске.")
+            Text("Предупредите участников о записи.").foregroundStyle(.secondary)
+        }
+        .font(.callout)
+        .fixedSize(horizontal: false, vertical: true)
     }
 }
