@@ -12,7 +12,7 @@ import ScreenCaptureKit
 
 let recorderLog = Logger(subsystem: "local.zoom-audio-recorder", category: "capture")
 
-enum RecorderError: Error, LocalizedError {
+enum RecorderError: Error, LocalizedError, Equatable {
     case message(String)
     case noAudio
     var errorDescription: String? {
@@ -109,6 +109,15 @@ extension AVAudioPCMBuffer {
         for buffer in UnsafeMutableAudioBufferListPointer(mutableAudioBufferList) {
             if let data = buffer.mData { memset(data, 0, Int(buffer.mDataByteSize)) }
         }
+    }
+
+    /// Root mean square of an interleaved Float32 buffer, such as PCMNormalizer's.
+    var level: Float {
+        guard let samples = floatChannelData?[0], frameLength > 0 else { return 0 }
+        let count = Int(frameLength) * Int(format.channelCount)
+        var sum: Float = 0
+        for index in 0..<count { sum += samples[index] * samples[index] }
+        return (sum / Float(count)).squareRoot()
     }
 }
 
@@ -238,7 +247,13 @@ struct TrackPart: Equatable {
 /// to its last one-second fragment.
 final class AudioTrack {
     static let rate = 48_000.0
+    /// Buffers this close to where the previous one ended are written back to back.
     static let tolerance: Int64 = 960
+    /// A device clock drifting from the host clock opens a gap slowly. Up to this size it
+    /// is closed in a pause, where added silence or dropped audio cannot be heard, rather
+    /// than in the middle of a word.
+    static let drift: Int64 = 4_800
+    static let quiet: Float = 0.005
     static let longGap: Int64 = 480_000
     static let maxParts = 10_000
     let name: String
@@ -255,6 +270,7 @@ final class AudioTrack {
     private let closing = DispatchGroup()
     private var retryAt = Date.distantPast
     private var retryDelay = 5.0
+    private var previousQuiet = false
     private(set) var parts: [URL] = []
     private(set) var failure: Error?
     private(set) var failures = 0
@@ -286,17 +302,20 @@ final class AudioTrack {
         guard buffer.frameLength > 0 else { return }
         var buffer = buffer
         var position = position
+        let quiet = buffer.level < Self.quiet
+        defer { previousQuiet = quiet }
         if let end {
             let gap = position - end
+            let correct = abs(gap) > Self.drift || (quiet && previousQuiet)
             if gap > Self.longGap {
                 closePart()
-            } else if gap > Self.tolerance {
+            } else if gap > Self.tolerance, correct {
                 var left = gap
-                while left > 0, let quiet = PCMNormalizer.silence(format: format, frames: min(left, 48_000)) {
-                    enqueue(quiet)
-                    left -= Int64(quiet.frameLength)
+                while left > 0, let silence = PCMNormalizer.silence(format: format, frames: min(left, 48_000)) {
+                    enqueue(silence)
+                    left -= Int64(silence.frameLength)
                 }
-            } else if gap < -Self.tolerance {
+            } else if gap < -Self.tolerance, correct {
                 guard let rest = buffer.dropping(frames: -gap) else { return }
                 buffer = rest
             }
@@ -676,7 +695,6 @@ private final class ZoomMuteWatcher {
         let inToolbar: Bool
         let isMenu: Bool
     }
-    private enum Search { case found(Control, label: ZoomMuteState, tip: ZoomMuteState?), none, busy }
     private static let attributes = [kAXRoleAttribute, kAXEnabledAttribute, kAXTitleAttribute,
                                      kAXDescriptionAttribute, kAXHelpAttribute, kAXIdentifierAttribute] as CFArray
     private let application: AXUIElement
@@ -692,6 +710,11 @@ private final class ZoomMuteWatcher {
     /// Zoom's own menu command and meeting button, once found.
     private var controls: [Control] = []
     private var indicators = MuteIndicators()
+    /// A search for a missing control, walked depth first a few milliseconds per poll: a
+    /// whole walk of Zoom's windows takes most of a second, and polling never waits for it.
+    private var scan: [(element: AXUIElement, depth: Int, inToolbar: Bool, root: Int)] = []
+    private var scanBudget = 0
+    private static let scanSlice = 0.008
 
     init(pid: pid_t, bundleURL: URL?, onChange: @escaping (ZoomMuteState) -> Void) {
         application = AXUIElementCreateApplication(pid)
@@ -763,7 +786,7 @@ private final class ZoomMuteWatcher {
         if changed { onChange(next) }
     }
 
-    /// nil when Zoom did not answer in time.
+    /// nil when Zoom did not answer in time, or while a search has nothing to show yet.
     private func currentState() -> ZoomMuteState? {
         var shown: [MuteIndicators.Kind: ZoomMuteState] = [:]
         let previous = controls.count
@@ -779,15 +802,15 @@ private final class ZoomMuteWatcher {
             }
         }
         controls = kept
-        // Look for a missing control at once when the last one vanished, every second while
-        // none is found, and otherwise every ten seconds: a scan loads Zoom's main thread.
         let time = Self.now()
-        let missingMenu = !controls.contains(where: \.isMenu)
-        let missingButton = !controls.contains { !$0.isMenu }
-        if missingMenu || missingButton,
+        var missingMenu = !controls.contains(where: \.isMenu)
+        var missingButton = !controls.contains { !$0.isMenu }
+        // Look for a missing control at once when the last one vanished, a second after the
+        // last search while none is found, and otherwise every ten seconds: a search loads
+        // Zoom's main thread.
+        if scan.isEmpty, missingMenu || missingButton,
            (previous > 0 && controls.isEmpty) || time - lastScan >= (controls.isEmpty ? 1 : 10) {
-            lastScan = time
-            var budget = 2000
+            scanBudget = 2000
             var roots: [AXUIElement] = []
             // The own-audio menu command is available even when meeting controls are hidden.
             if missingMenu, let menu = attribute(kAXMenuBarAttribute as CFString, of: application),
@@ -797,18 +820,40 @@ private final class ZoomMuteWatcher {
             if missingButton {
                 roots += attribute(kAXWindowsAttribute as CFString, of: application) as? [AXUIElement] ?? []
             }
-            for root in roots {
-                switch findMuteControl(in: root, depth: 0, inToolbar: false, remaining: &budget) {
-                case let .found(control, label, tip):
-                    guard control.isMenu ? missingMenu : missingButton, shown[control.isMenu ? .menu : .label] == nil else { continue }
-                    controls.append(control)
-                    shown[control.isMenu ? .menu : .label] = label
-                    if let tip { shown[.tip] = tip }
-                case .busy: return nil
-                case .none: continue
-                }
+            scan = roots.enumerated().reversed().map { ($0.element, 0, false, $0.offset) }
+            lastScan = time
+        }
+        while !scan.isEmpty, Self.now() - time < Self.scanSlice {
+            let next = scan.removeLast()
+            guard next.depth < 24, scanBudget > 0 else { continue }
+            scanBudget -= 1
+            let role = attribute(kAXRoleAttribute as CFString, of: next.element) as? String ?? ""
+            let toolbar = next.inToolbar || role == "AXToolbar"
+            switch reading(of: next.element, inToolbar: toolbar) {
+            case let .found(label, tip):
+                // The first control in each root: Zoom's own menu command or meeting button.
+                scan.removeAll { $0.root == next.root }
+                let isMenu = role == "AXMenuItem"
+                guard isMenu ? missingMenu : missingButton else { continue }
+                controls.append(Control(element: next.element, inToolbar: toolbar, isMenu: isMenu))
+                shown[isMenu ? .menu : .label] = label
+                if let tip { shown[.tip] = tip }
+                if isMenu { missingMenu = false } else { missingButton = false }
+            case .busy:
+                scan.append(next)
+                return nil
+            case .none:
+                let children = attribute(kAXChildrenAttribute as CFString, of: next.element) as? [AXUIElement] ?? []
+                scan += children.reversed().map { ($0, next.depth + 1, toolbar, next.root) }
             }
         }
+        if (!missingMenu && !missingButton) || scanBudget <= 0 { scan.removeAll() }
+        guard scan.isEmpty || !shown.isEmpty else {
+            // No reading until the search ends: as while Zoom is busy, the last one holds.
+            lastScan = time
+            return nil
+        }
+        if !scan.isEmpty { lastScan = time }
         return indicators.update(shown, at: time)
     }
 
@@ -834,34 +879,6 @@ private final class ZoomMuteWatcher {
         }
         let tip = role == "AXMenuItem" ? nil : (value(4) as? String).flatMap(labels.tipState)
         return .found(label: label, tip: tip)
-    }
-
-    private func findMuteControl(in element: AXUIElement, depth: Int, inToolbar: Bool,
-                                 remaining: inout Int) -> Search {
-        guard depth < 24, remaining > 0 else { return .none }
-        remaining -= 1
-        let role = attribute(kAXRoleAttribute as CFString, of: element) as? String ?? ""
-        let toolbar = inToolbar || role == "AXToolbar"
-        switch reading(of: element, inToolbar: toolbar) {
-        case let .found(label, tip):
-            return .found(Control(element: element, inToolbar: toolbar, isMenu: role == "AXMenuItem"), label: label, tip: tip)
-        case .busy:
-            return .busy
-        case .none:
-            break
-        }
-        guard let children = attribute(kAXChildrenAttribute as CFString, of: element) as? [AXUIElement] else {
-            return .none
-        }
-        for child in children {
-            let found = findMuteControl(in: child, depth: depth + 1, inToolbar: toolbar, remaining: &remaining)
-            if case .none = found {
-                if remaining <= 0 { break }
-                continue
-            }
-            return found
-        }
-        return .none
     }
 
     private func attribute(_ name: CFString, of element: AXUIElement) -> CFTypeRef? {
@@ -899,7 +916,12 @@ private final class ZoomMuteWatcher {
         }
         return ["state": String(describing: observedState()), "controls": controls]
     }
-    func observedState() -> ZoomMuteState { currentState() ?? .unavailable }
+    /// A whole reading for diagnostics: a search under way runs to its end.
+    func observedState() -> ZoomMuteState {
+        var state = currentState()
+        for _ in 0..<1000 where !scan.isEmpty { state = currentState() }
+        return state ?? .unavailable
+    }
 }
 
 func zoomMicrophoneDiagnostics(observations: Int = 1) async -> [String: Any] {
@@ -1130,14 +1152,6 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
         }
     }
 
-    static func level(of buffer: AVAudioPCMBuffer) -> Float {
-        guard let samples = buffer.floatChannelData?[0], buffer.frameLength > 0 else { return 0 }
-        let count = Int(buffer.frameLength) * Int(buffer.format.channelCount)
-        var sum: Float = 0
-        for index in 0..<count { sum += samples[index] * samples[index] }
-        return (sum / Float(count)).squareRoot()
-    }
-
     /// Silences every frame outside `ranges`; true when some voice remains.
     private func keep(_ ranges: [Range<Double>], of buffer: AVAudioPCMBuffer, capturedAt start: Double) -> Bool {
         guard let samples = buffer.floatChannelData?[0] else { return false }
@@ -1192,7 +1206,7 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
         if let copy = buffer.dropping(frames: 0) { raw.append(copy, at: position) }
         // Decided by when the audio was captured, never by when it arrived.
         let captured = (origin?.host.seconds ?? now().seconds) + Double(position) / AudioTrack.rate
-        voice.append((buffer, position, captured, now().seconds, Self.level(of: buffer) > Self.speechLevel))
+        voice.append((buffer, position, captured, now().seconds, buffer.level > Self.speechLevel))
         releaseVoice()
     }
 

@@ -567,13 +567,13 @@ func checkSessions(_ folder: URL) async throws {
     } catch is TestError { throw TestError.failed("delivery deleted an unpreserved source") }
     catch {}
     try check(FileManager.default.fileExists(atPath: badPart.path), "unpreserved source deleted")
-    try check(try await verifyRecording(damaged.folder.appendingPathComponent("final.m4a")) > 1.9, "verified mix lost after preservation failure")
+    try check(AudioTrack.parts(named: "zoom", in: damaged.folder).count == 2, "readable source lost after preservation failure")
     try FileManager.default.removeItem(at: unreadable)
     // If copying fails after damaged parts were moved, the warning must survive a retry.
     let blockedOutput = folder.appendingPathComponent("blocked-output")
     try Data("blocked".utf8).write(to: blockedOutput)
     let retryDamage = try await makeSession(root: root, destination: blockedOutput, name: "Retry damage.m4a")
-    try Data(repeating: 0x43, count: 1024).write(to: retryDamage.folder.appendingPathComponent("raw-2-96000.m4a"))
+    try Data(repeating: 0x43, count: 1024).write(to: retryDamage.folder.appendingPathComponent("zoom-2-96000.m4a"))
     do {
         _ = try await retryDamage.deliver(fallback: blockedOutput)
         throw TestError.failed("blocked destination succeeded")
@@ -619,11 +619,117 @@ func checkSessions(_ folder: URL) async throws {
     try check(!FileManager.default.fileExists(atPath: root.appendingPathComponent(".abandoned").path), "abandoned folder kept")
     // A session without audio is recognised as empty.
     let empty = try RecordingSession.create(destination: destination, name: "Empty.m4a", root: root)
-    try check(!empty.hasAudio && empty.recordedBytes == 0, "empty session reports audio")
+    try check(!empty.hasAudio, "empty session reports audio")
     empty.remove()
     try check(try FileManager.default.contentsOfDirectory(atPath: root.path).isEmpty, "sessions left behind")
     print("PASS: session locks, unique names, no overwrite, offline drive fallback, kept on failure and retried")
     print("PASS: paired safety filenames, damaged sources retained on failure, damage warning survives retries")
+}
+
+/// A device clock running 1000 ppm off the host clock, faster and slower, with a tone that
+/// pauses for 0.5 s every 2.5 s: each correction falls into a pause, never into the tone,
+/// and the track stays on the host timeline.
+func checkDrift(_ folder: URL) async throws {
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    for (name, rate) in [("slow", 1.001), ("fast", 0.999)] {
+        let track = AudioTrack(name: name, directory: folder, channels: 1, realtime: false)
+        let frames = 480
+        for index in 0..<6000 {
+            let buffer = PCMNormalizer.silence(format: track.format, frames: Int64(frames))!
+            for frame in 0..<frames where (index * frames + frame) % 120_000 < 96_000 {
+                buffer.floatChannelData![0][frame] = Float(sin(2 * .pi * 440 * Double(index * frames + frame) / 48_000) * 0.2)
+            }
+            track.append(buffer, at: Int64((Double(index * frames) * rate).rounded()))
+        }
+        await track.finish()
+        try check(track.failures == 0 && track.parts.count == 1, "\(name): writer failed or split")
+        let decoded = try decode(track.parts[0])
+        let samples = decoded.floatChannelData![0]
+        // Runs of 5 ms windows: a pause lasts about 0.5 s, a dropout inside the tone would not.
+        var run = 0, holes = 0
+        for window in 0..<Int(decoded.frameLength) / 240 {
+            var sum: Float = 0
+            for index in window * 240..<(window + 1) * 240 { sum += samples[index] * samples[index] }
+            if (sum / 240).squareRoot() < 0.01 { run += 1; continue }
+            if run > 0, run < 80 { holes += 1 }
+            run = 0
+        }
+        try check(holes == 0, "\(name): \(holes) dropouts inside the tone")
+        let expected = 6000.0 * Double(frames) * rate / 48_000
+        try check(abs(Double(decoded.frameLength) / 48_000 - expected) < 0.1,
+                  "\(name): \(Double(decoded.frameLength) / 48_000) s instead of \(expected) s on the host timeline")
+    }
+    print("PASS: clock drift is corrected in pauses, never inside the sound, and the track keeps host time")
+}
+
+/// A part as AVAssetWriter leaves it when the app dies in its first second: the file
+/// type, then media data still open, without the header written with the first fragment.
+func writeEarlyPart(_ url: URL) throws {
+    var bytes: [UInt8] = [0, 0, 0, 28] + Array("ftypM4A ".utf8) + [0, 0, 0, 0] + Array("M4A mp42isom".utf8) + [0, 0, 0, 0]
+    bytes += [0, 0, 0, 8] + Array("wide".utf8) + [0, 0, 0, 0] + Array("mdat".utf8)
+    bytes += (0..<1500).map { UInt8(truncatingIfNeeded: $0 &* 37) }
+    try Data(bytes).write(to: url)
+}
+
+func checkInterruptedSaves(_ folder: URL) async throws {
+    let root = folder.appendingPathComponent("sessions")
+    let destination = folder.appendingPathComponent("meetings")
+    let fallback = folder.appendingPathComponent("fallback")
+    let unreadable = folder.appendingPathComponent("Unreadable")
+    // A crash in the first second: no part can be played, so nothing is left to save or to keep.
+    let early = try RecordingSession.create(destination: destination, name: "Early.m4a", root: root)
+    for name in ["zoom-1-0", "mic-1-0", "raw-1-0"] { try writeEarlyPart(early.folder.appendingPathComponent(name + ".m4a")) }
+    try check(RecordingSession.beforeFirstFragment(early.folder.appendingPathComponent("zoom-1-0.m4a")), "early part not recognised")
+    try check(early.hasAudio, "early session not offered for saving")
+    do {
+        _ = try await early.deliver(fallback: fallback, recovering: true)
+        throw TestError.failed("an early crash produced a recording")
+    } catch RecorderError.noAudio {}
+    try check(AudioTrack.parts(named: "zoom", in: early.folder).isEmpty && AudioTrack.parts(named: "raw", in: early.folder).isEmpty,
+              "unplayable early parts kept")
+    try check(!FileManager.default.fileExists(atPath: unreadable.appendingPathComponent(early.folder.lastPathComponent).path),
+              "unplayable early parts reported as damage")
+    early.remove()
+    // An unreadable Zoom part never hides the microphone that has to be saved instead.
+    let micOnly = try await makeSession(root: root, destination: destination, name: "Mic only.m4a")
+    try FileManager.default.moveItem(at: micOnly.folder.appendingPathComponent("zoom-1-0.m4a"),
+                                     to: micOnly.folder.appendingPathComponent("raw-1-0.m4a"))
+    try Data(repeating: 0x44, count: 5000).write(to: micOnly.folder.appendingPathComponent("zoom-1-0.m4a"))
+    micOnly.markSafetyCopy()
+    // A copy cut short by a crash is replaced, not left hidden in the user's folder.
+    try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+    try Data("stale".utf8).write(to: destination.appendingPathComponent(
+        ".zoom-recording-\(micOnly.folder.lastPathComponent)-final.partial.m4a"))
+    let saved = try await micOnly.deliver(fallback: fallback)
+    try check(saved.url.lastPathComponent == "Mic only.m4a" && saved.microphone == nil && saved.incomplete,
+              "microphone lost behind an unreadable Zoom part")
+    try check(try FileManager.default.contentsOfDirectory(atPath: destination.path) == ["Mic only.m4a"], "stale copy left")
+    // A recording that stopped normally keeps its own safety decision when a save is retried.
+    let stopped = try RecordingSession.create(destination: destination, name: "Stopped.m4a", root: root)
+    try FileManager.default.copyItem(at: saved.url, to: stopped.folder.appendingPathComponent("raw-1-0.m4a"))
+    try check(stopped.needsSafetyCopy(recovering: true), "a crashed recording without mute readings lost its microphone")
+    stopped.markFinished()
+    try check(!stopped.needsSafetyCopy(recovering: true) && !stopped.hasAudio, "unfiltered microphone saved after a normal stop")
+    stopped.remove()
+    // A save cut short after its rename is not saved twice.
+    let blocked = folder.appendingPathComponent("blocked")
+    let target = folder.appendingPathComponent("twice")
+    try Data("blocked".utf8).write(to: blocked)
+    try Data("blocked".utf8).write(to: target)
+    let twice = try await makeSession(root: root, destination: target, name: "Twice.m4a")
+    do {
+        _ = try await twice.deliver(fallback: blocked)
+        throw TestError.failed("blocked destination succeeded")
+    } catch RecorderError.message {}
+    try FileManager.default.removeItem(at: target)
+    try FileManager.default.createDirectory(at: target, withIntermediateDirectories: true)
+    let placed = target.appendingPathComponent("Twice.m4a")
+    try FileManager.default.copyItem(at: twice.folder.appendingPathComponent("final.m4a"), to: placed)
+    try Data(placed.path.utf8).write(to: twice.folder.appendingPathComponent("placed-final"))
+    let again = try await twice.deliver(fallback: fallback)
+    try check(again.url == placed && !again.usedFallback, "a placed recording was saved again as \(again.url.lastPathComponent)")
+    try check(try FileManager.default.contentsOfDirectory(atPath: target.path) == ["Twice.m4a"], "recording saved twice")
+    print("PASS: early crash leaves nothing behind, unreadable Zoom part, normal-stop safety decision, no duplicate after an interrupted save")
 }
 
 func checkStorage(_ folder: URL) throws {
@@ -725,8 +831,10 @@ func checkBoundedOperations() async throws {
         try await checkLateDelivery(folder.appendingPathComponent("late"))
         try await checkMuteEdges(folder.appendingPathComponent("edges"))
         try await checkLateStart(folder.appendingPathComponent("late-start"))
+        try await checkDrift(folder.appendingPathComponent("drift"))
         try await checkOffsets(folder.appendingPathComponent("offsets"))
         try await checkSessions(folder.appendingPathComponent("sessions"))
+        try await checkInterruptedSaves(folder.appendingPathComponent("interrupted"))
         try await checkCrashRecovery(folder.appendingPathComponent("crash"))
     }
 }

@@ -232,26 +232,23 @@ final class RecordingSession {
         FileManager.default.createFile(atPath: folder.appendingPathComponent("control").path, contents: nil)
     }
 
+    /// Marks that the recording stopped normally and the markers above are final.
+    func markFinished() {
+        FileManager.default.createFile(atPath: folder.appendingPathComponent("finished").path, contents: nil)
+    }
+
     /// The whole microphone is delivered too: requested during the recording, or, for a
     /// recording cut short by a crash, the mute detector never found Zoom's control.
     func needsSafetyCopy(recovering: Bool) -> Bool {
         let marked = { FileManager.default.fileExists(atPath: self.folder.appendingPathComponent($0).path) }
         guard !AudioTrack.parts(named: "raw", in: folder).isEmpty else { return false }
-        return marked("safety") || (recovering && !marked("control") && !hasVoice)
+        return marked("safety") || (recovering && !marked("finished") && !marked("control") && !hasVoice)
     }
 
     var hasAudio: Bool {
         !AudioTrack.parts(named: "zoom", in: folder).isEmpty || hasVoice || needsSafetyCopy(recovering: true)
             || Self.size(folder.appendingPathComponent("final.m4a")) > 0
     }
-
-    private var parts: [TrackPart] {
-        AudioTrack.parts(named: "zoom", in: folder) + AudioTrack.parts(named: "mic", in: folder)
-            + AudioTrack.parts(named: "raw", in: folder)
-    }
-
-    /// Bytes of all source tracks, including the safety microphone.
-    var recordedBytes: Int { parts.reduce(0) { $0 + Self.size($1.url) } }
 
     private static func size(_ url: URL) -> Int {
         (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int) ?? 0
@@ -262,9 +259,12 @@ final class RecordingSession {
     /// deleted, and the next launch tries again.
     func deliver(fallback: URL, recovering: Bool = false,
                  progress: @escaping (Double) -> Void = { _ in }) async throws -> Delivery {
+        let tracks = ["zoom"] + (hasVoice ? ["mic"] : []) + (needsSafetyCopy(recovering: recovering) ? ["raw"] : [])
+        // Unreadable parts go aside first, so they never decide which tracks are mixed.
+        let incomplete = try await keepUnreadableParts(of: tracks)
         let zoomParts = AudioTrack.parts(named: "zoom", in: folder)
-        let micParts = hasVoice ? AudioTrack.parts(named: "mic", in: folder) : []
-        let rawParts = needsSafetyCopy(recovering: recovering) ? AudioTrack.parts(named: "raw", in: folder) : []
+        let micParts = tracks.contains("mic") ? AudioTrack.parts(named: "mic", in: folder) : []
+        let rawParts = tracks.contains("raw") ? AudioTrack.parts(named: "raw", in: folder) : []
         // Without any Zoom audio or voice, the safety copy is the recording itself.
         let main = try await exported("final", zoom: zoomParts, mic: micParts.isEmpty && zoomParts.isEmpty ? rawParts : micParts,
                                       progress: progress)
@@ -274,24 +274,27 @@ final class RecordingSession {
             : try await exported("microphone", zoom: [], mic: rawParts)
         let preferred = URL(fileURLWithPath: manifest.destination, isDirectory: true)
         var failure: Error?
-        let incomplete = try await keepUnreadableParts()
         for directory in [preferred, fallback] where directory != preferred || failure == nil {
             do {
                 let url = try await place(main.file, named: manifest.name, duration: main.duration, in: directory)
+                // An earlier attempt may have placed it in the other folder already.
+                let placed = url.deletingLastPathComponent()
                 var microphone: URL?
                 if let safety {
                     do {
                         let base = url.deletingPathExtension().lastPathComponent
                         microphone = try await place(safety.file, named: "\(base) (микрофон).m4a",
-                                                     duration: safety.duration, in: directory)
+                                                     duration: safety.duration, in: placed)
                     } catch {
                         // Both files go to one folder; the next one gets both again.
                         try? FileManager.default.removeItem(at: url)
+                        try? FileManager.default.removeItem(at: placement(of: main.file))
                         throw error
                     }
                 }
                 retire()
-                return Delivery(url: url, usedFallback: directory != preferred, duration: main.duration,
+                return Delivery(url: url, usedFallback: placed.standardizedFileURL.path != preferred.standardizedFileURL.path,
+                                duration: main.duration,
                                 incomplete: incomplete, unreadableFolder: incomplete ? unreadableFolder : nil,
                                 microphone: microphone)
             } catch {
@@ -315,17 +318,30 @@ final class RecordingSession {
         return (file, result.duration)
     }
 
+    /// Where an exported file was placed, recorded until the session is retired.
+    private func placement(of file: URL) -> URL {
+        folder.appendingPathComponent("placed-" + file.deletingPathExtension().lastPathComponent)
+    }
+
     /// Copies under a hidden name, flushes it to storage and checks that it plays,
     /// then renames: a visible file is always complete and nothing is overwritten.
     private func place(_ file: URL, named name: String, duration: Double, in directory: URL) async throws -> URL {
         let manager = FileManager.default
+        // A save cut short after the rename, by a crash or a shutdown, already put it in place.
+        let record = placement(of: file)
+        if let path = try? String(contentsOf: record, encoding: .utf8), Self.size(URL(fileURLWithPath: path)) == Self.size(file) {
+            return URL(fileURLWithPath: path)
+        }
         // An unmounted drive's path must not be recreated on the startup disk.
         guard RecordingStorage.reachable(directory) else {
             throw RecorderError.message("Папка «\(directory.lastPathComponent)» недоступна")
         }
         try manager.createDirectory(at: directory, withIntermediateDirectories: true)
         let base = (name as NSString).deletingPathExtension
-        let temporary = directory.appendingPathComponent(".zoom-recording-\(UUID().uuidString).partial.m4a")
+        // Named after the session, so a copy cut short is replaced by the next attempt.
+        let temporary = directory.appendingPathComponent(
+            ".zoom-recording-\(folder.lastPathComponent)-\(file.deletingPathExtension().lastPathComponent).partial.m4a")
+        try? manager.removeItem(at: temporary)
         defer { try? manager.removeItem(at: temporary) }
         try manager.copyItem(at: file, to: temporary)
         syncToStorage(temporary)
@@ -339,11 +355,19 @@ final class RecordingSession {
             if !manager.fileExists(atPath: target.path) {
                 // FileManager's existence check and move can race with another save.
                 // RENAME_EXCL makes refusing an existing filename part of the rename itself.
-                if renamex_np(temporary.path, target.path, UInt32(RENAME_EXCL)) == 0 {
+                // exFAT and some network shares lack it; there the check above has to do.
+                var renamed = renamex_np(temporary.path, target.path, UInt32(RENAME_EXCL)) == 0
+                var code = errno
+                if !renamed, code == ENOTSUP || code == EINVAL {
+                    renamed = rename(temporary.path, target.path) == 0
+                    code = errno
+                }
+                if renamed {
                     syncToStorage(directory)
+                    try? Data(target.path.utf8).write(to: record, options: .atomic)
+                    syncToStorage(record)
                     return target
                 }
-                let code = errno
                 guard code == EEXIST else {
                     throw NSError(domain: NSPOSIXErrorDomain, code: Int(code),
                                   userInfo: [NSFilePathErrorKey: target.path])
@@ -354,13 +378,19 @@ final class RecordingSession {
         }
     }
 
-    /// Parts that cannot be opened are moved aside instead of being deleted with the session.
-    private func keepUnreadableParts() async throws -> Bool {
+    /// Parts of `tracks` that cannot be opened are moved aside instead of being deleted
+    /// with the session. A part cut short before its first fragment holds under a second
+    /// that nothing can play, so it is simply dropped.
+    private func keepUnreadableParts(of tracks: [String]) async throws -> Bool {
         let aside = unreadableFolder
         // A previous delivery may have moved parts aside before its destination failed.
         var kept = FileManager.default.fileExists(atPath: aside.path)
-        for part in parts where Self.size(part.url) > 0 {
+        for part in tracks.flatMap({ AudioTrack.parts(named: $0, in: folder) }) {
             guard (try? await verifyRecording(part.url)) == nil else { continue }
+            if Self.size(part.url) == 0 || Self.beforeFirstFragment(part.url) {
+                try FileManager.default.removeItem(at: part.url)
+                continue
+            }
             // If preservation fails, retain the entire session for a retry.
             try FileManager.default.createDirectory(at: aside, withIntermediateDirectories: true,
                                                     attributes: [.posixPermissions: 0o700])
@@ -368,6 +398,25 @@ final class RecordingSession {
             kept = true
         }
         return kept
+    }
+
+    /// Whether a fragmented M4A was cut off before its header: it starts like one but
+    /// holds no movie or fragment header yet, only the first, still open media data.
+    static func beforeFirstFragment(_ url: URL) -> Bool {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return false }
+        defer { try? handle.close() }
+        var offset: UInt64 = 0
+        var types: [String] = []
+        while (try? handle.seek(toOffset: offset)) != nil, let header = try? handle.read(upToCount: 16), header.count >= 8 {
+            let bytes = [UInt8](header)
+            types.append(String(decoding: bytes[4..<8], as: UTF8.self))
+            var size = bytes[0..<4].reduce(UInt64(0)) { $0 << 8 | UInt64($1) }
+            if size == 1, bytes.count == 16 { size = bytes[8..<16].reduce(UInt64(0)) { $0 << 8 | UInt64($1) } }
+            // Zero: the box runs to the end of the file.
+            guard size >= 8 else { break }
+            offset += size
+        }
+        return types.first == "ftyp" && !types.contains("moov") && !types.contains("moof")
     }
 
     private var unreadableFolder: URL {
