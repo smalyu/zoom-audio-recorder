@@ -45,6 +45,88 @@ struct ExportResult {
     let unreadable: [URL]
 }
 
+/// Mixes `tracks` into stereo AAC at the bit rate they were recorded with, on a background
+/// thread, then calls `done` with whether it worked. A packet the decoder rejects, as a
+/// power loss can leave behind, costs a quarter second of silence, not the recording.
+private func encodeMix(of composition: AVComposition, tracks: [AVAssetTrack], mix: AVAudioMix, to output: URL,
+                       progress: @escaping (Double) -> Void, done: @escaping (Bool) -> Void) {
+    DispatchQueue.global(qos: .userInitiated).async {
+        let rate = CMTimeScale(AudioTrack.rate)
+        let format = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: AudioTrack.rate, channels: 2, interleaved: true)!
+        do {
+            let writer = try AVAssetWriter(outputURL: output, fileType: .m4a)
+            let input = AVAssetWriterInput(mediaType: .audio, outputSettings: [
+                AVFormatIDKey: kAudioFormatMPEG4AAC, AVSampleRateKey: AudioTrack.rate,
+                AVNumberOfChannelsKey: 2, AVEncoderBitRateKey: 128_000], sourceFormatHint: format.formatDescription)
+            input.expectsMediaDataInRealTime = false
+            writer.add(input)
+            guard writer.startWriting() else { throw writer.error ?? RecorderError.message("Не удалось подготовить сведение") }
+            writer.startSession(atSourceTime: .zero)
+            defer { if writer.status == .writing { writer.cancelWriting() } }
+            let end = CMTimeConvertScale(composition.duration, timescale: rate, method: .roundHalfAwayFromZero).value
+            var written: Int64 = 0
+            var retried = false
+            func write(_ buffer: AVAudioPCMBuffer) throws {
+                while !input.isReadyForMoreMediaData, writer.status == .writing { Thread.sleep(forTimeInterval: 0.005) }
+                guard input.append(try buffer.sampleBuffer(at: written)) else {
+                    throw writer.error ?? RecorderError.message("Не удалось сохранить запись")
+                }
+                written += Int64(buffer.frameLength)
+            }
+            func silence(until frame: Int64) throws {
+                while written < frame, let quiet = PCMNormalizer.silence(format: format, frames: min(frame - written, 48_000)) {
+                    try write(quiet)
+                }
+            }
+            while written < end {
+                let reader = try AVAssetReader(asset: composition)
+                reader.timeRange = CMTimeRange(start: CMTime(value: written, timescale: rate), end: composition.duration)
+                let mixed = AVAssetReaderAudioMixOutput(audioTracks: tracks, audioSettings: format.settings)
+                mixed.audioMix = mix
+                reader.add(mixed)
+                guard reader.startReading() else { throw reader.error ?? RecorderError.message("Не удалось подготовить сведение") }
+                let restart = written
+                while let sample = mixed.copyNextSampleBuffer() {
+                    let frames = AVAudioFrameCount(CMSampleBufferGetNumSamples(sample))
+                    guard frames > 0, let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frames) else { continue }
+                    buffer.frameLength = frames
+                    guard CMSampleBufferCopyPCMDataIntoAudioBufferList(sample, at: 0, frameCount: Int32(frames),
+                                                                       into: buffer.mutableAudioBufferList) == noErr else {
+                        throw RecorderError.message("Не удалось прочитать звуковой буфер")
+                    }
+                    // Time the mix leaves out stays on the timeline as silence.
+                    let start = CMSampleBufferGetPresentationTimeStamp(sample)
+                    try silence(until: CMTimeConvertScale(start, timescale: rate, method: .roundHalfAwayFromZero).value)
+                    try write(buffer)
+                    progress(Double(written) / Double(max(end, 1)))
+                }
+                if reader.status == .completed { break }
+                guard (reader.error as? AVError)?.code == .decodeFailed else {
+                    throw reader.error ?? RecorderError.message("Не удалось сохранить запись")
+                }
+                // The decoder fails ahead of what it delivered, at times before delivering
+                // anything: read on, and try once more, up to the damage itself.
+                guard written == restart, retried else {
+                    retried = written == restart
+                    continue
+                }
+                retried = false
+                recorderLog.error("Damaged audio at \(Double(written) / AudioTrack.rate, privacy: .public) s skipped")
+                try silence(until: written + Int64(AudioTrack.rate / 4))
+            }
+            input.markAsFinished()
+            let finished = DispatchSemaphore(value: 0)
+            writer.finishWriting { finished.signal() }
+            finished.wait()
+            guard writer.status == .completed else { throw writer.error ?? RecorderError.message("Не удалось сохранить запись") }
+            done(true)
+        } catch {
+            recorderLog.error("Mix encoder failed, using the export preset: \(error.localizedDescription, privacy: .public)")
+            done(false)
+        }
+    }
+}
+
 /// Mixes the recorded parts into one ordinary M4A file and verifies it. Each track's
 /// parts are laid out on one composition track at their offsets. Parts cut short by a
 /// crash are used up to their last readable fragment.
@@ -83,26 +165,35 @@ func exportRecording(zoom: [TrackPart], mic: [TrackPart], to output: URL,
         }
     }
     guard !tracks.isEmpty else { throw RecorderError.noAudio }
-    guard let exporter = AVAssetExportSession(asset: composition, presetName: AVAssetExportPresetAppleM4A) else {
-        throw RecorderError.message("Не удалось подготовить сведение")
-    }
-    if tracks.count > 1 {
-        let mix = AVMutableAudioMix()
-        mix.inputParameters = tracks.map { track in
-            let volume = AVMutableAudioMixInputParameters(track: track)
-            volume.setVolume(0.7, at: .zero)
-            return volume
-        }
-        exporter.audioMix = mix
+    let mix = tracks.count > 1 ? AVMutableAudioMix() : nil
+    mix?.inputParameters = tracks.map { track in
+        let volume = AVMutableAudioMixInputParameters(track: track)
+        volume.setVolume(0.7, at: .zero)
+        return volume
     }
     try? FileManager.default.removeItem(at: output)
-    let monitor = Task {
-        for await state in exporter.states(updateInterval: 0.25) {
-            if case let .exporting(current) = state { progress(current.fractionCompleted) }
+    // Apple's M4A preset copies a single track unchanged and plays through damaged packets,
+    // but encodes a mix of two at twice their bit rate: a mix goes to an encoder at theirs.
+    var encoded = false
+    if let mix {
+        encoded = await withCheckedContinuation { finished in
+            encodeMix(of: composition, tracks: tracks, mix: mix, to: output, progress: progress) { finished.resume(returning: $0) }
         }
     }
-    defer { monitor.cancel() }
-    try await exporter.export(to: output, as: .m4a)
+    if !encoded {
+        try? FileManager.default.removeItem(at: output)
+        guard let exporter = AVAssetExportSession(asset: composition, presetName: AVAssetExportPresetAppleM4A) else {
+            throw RecorderError.message("Не удалось подготовить сведение")
+        }
+        exporter.audioMix = mix
+        let monitor = Task {
+            for await state in exporter.states(updateInterval: 0.25) {
+                if case let .exporting(current) = state { progress(current.fractionCompleted) }
+            }
+        }
+        defer { monitor.cancel() }
+        try await exporter.export(to: output, as: .m4a)
+    }
     withExtendedLifetime(assets) {}
     let duration = try await verifyRecording(output)
     guard duration > expected - 1 else {
@@ -274,6 +365,10 @@ final class RecordingSession {
             : try await exported("microphone", zoom: [], mic: rawParts)
         let preferred = URL(fileURLWithPath: manifest.destination, isDirectory: true)
         var failure: Error?
+        // A network share that went away must not hold up saving to the fallback folder.
+        if await !answers(within: 10, { RecordingStorage.reachable(preferred) }) {
+            failure = RecorderError.message("Папка «\(preferred.lastPathComponent)» недоступна")
+        }
         for directory in [preferred, fallback] where directory != preferred || failure == nil {
             do {
                 let url = try await place(main.file, named: manifest.name, duration: main.duration, in: directory)
@@ -353,6 +448,9 @@ final class RecordingSession {
         var index = 2
         while true {
             if !manager.fileExists(atPath: target.path) {
+                // Recorded before the rename, so a save cut short right after it is not repeated.
+                try? Data(target.path.utf8).write(to: record, options: .atomic)
+                syncToStorage(record)
                 // FileManager's existence check and move can race with another save.
                 // RENAME_EXCL makes refusing an existing filename part of the rename itself.
                 // exFAT and some network shares lack it; there the check above has to do.
@@ -364,11 +462,10 @@ final class RecordingSession {
                 }
                 if renamed {
                     syncToStorage(directory)
-                    try? Data(target.path.utf8).write(to: record, options: .atomic)
-                    syncToStorage(record)
                     return target
                 }
                 guard code == EEXIST else {
+                    try? manager.removeItem(at: record)
                     throw NSError(domain: NSPOSIXErrorDomain, code: Int(code),
                                   userInfo: [NSFilePathErrorKey: target.path])
                 }

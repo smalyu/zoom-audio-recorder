@@ -96,10 +96,10 @@
 Нужны macOS 15 и Xcode.
 
 ```sh
-zsh scripts/build.sh    # приложение
-zsh scripts/test.sh     # тесты
-zsh scripts/preview.sh  # все состояния окна в светлой и тёмной теме
-zsh scripts/package.sh  # DMG
+zsh scripts/build.sh
+zsh scripts/test.sh
+zsh scripts/preview.sh
+zsh scripts/package.sh
 ```
 
 ---

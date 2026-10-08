@@ -31,12 +31,14 @@ if not keychain.exists():
             '[dn]\nCN=Zoom Audio Recorder Local Code Signing\n'
             '[signing]\nbasicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\n'
             'extendedKeyUsage=critical,codeSigning\nsubjectKeyIdentifier=hash\n')
-        run(['openssl', 'req', '-new', '-x509', '-newkey', 'rsa:3072', '-nodes', '-sha256',
+        # macOS's own LibreSSL writes the PKCS#12 format `security import` accepts;
+        # OpenSSL 3 from Homebrew would need -legacy, which LibreSSL rejects.
+        run(['/usr/bin/openssl', 'req', '-new', '-x509', '-newkey', 'rsa:3072', '-nodes', '-sha256',
              '-days', '3650', '-config', str(config), '-keyout', str(path / 'private.pem'),
              '-out', str(certificate)])
-        run(['openssl', 'pkcs12', '-export', '-inkey', str(path / 'private.pem'),
+        run(['/usr/bin/openssl', 'pkcs12', '-export', '-inkey', str(path / 'private.pem'),
              '-in', str(certificate), '-out', str(path / 'identity.p12'),
-             '-passout', 'pass:' + password, '-legacy'])
+             '-passout', 'pass:' + password])
         try:
             run(['/usr/bin/security', 'create-keychain', '-p', password, str(keychain)])
             run(['/usr/bin/security', 'unlock-keychain', '-p', password, str(keychain)])

@@ -46,6 +46,8 @@ final class RecorderModel: ObservableObject {
     @Published var quitting = false
     /// Logout, restart or shutdown: close the tracks and leave saving to the next launch.
     private var systemQuit = false
+    /// Recordings started so far: an outcome on screen is told apart from a newer equal one.
+    private var recordings = 0
     /// Cancel pressed while connecting: nothing is saved.
     private var cancelled = false
     private var tracksClosed = false
@@ -211,6 +213,7 @@ final class RecorderModel: ObservableObject {
         tracksClosed = false
         systemQuit = false
         phase = .preparing
+        recordings += 1
         let request = StopRequest()
         stop = request
         let destination = folder
@@ -301,6 +304,9 @@ final class RecorderModel: ObservableObject {
                        + ByteCountFormatter.string(fromByteCount: Int64(size), countStyle: .file)]
         if let summary {
             if !summary.hasZoom { details.append("Звук собеседников не получен") }
+            if !summary.hasZoom, !summary.hasVoice, summary.needsSafetyCopy {
+                details.append("Кнопка mute не определялась — записан весь микрофон")
+            }
             if summary.zoomQuit { details.append("Zoom закрылся — запись остановлена") }
             if summary.interruptions > 0 { details.append("Связь с Zoom прерывалась: \(summary.interruptions)") }
             if !summary.hasVoice && delivery.microphone == nil && summary.hasZoom { details.append("Микрофон оставался выключен или не определялся") }
@@ -354,10 +360,15 @@ final class RecorderModel: ObservableObject {
     func recover() {
         guard !recovering, !busy, !quitting else { return }
         recovering = true
+        // A result on screen now may give way to a recovered one; a later recording's may not.
+        let shown = outcome
+        let started = recordings
         Task {
             let activity = ProcessInfo.processInfo.beginActivity(
                 options: [.userInitiated, .idleSystemSleepDisabled], reason: "Восстановление записи")
             defer { ProcessInfo.processInfo.endActivity(activity) }
+            // Warnings that could not be shown yet, shown once the screen is free.
+            var withheld: Outcome?
             for session in RecordingSession.interrupted(fallback: Self.defaultFolder) {
                 // A crash in the first second leaves nothing playable to save.
                 guard session.hasAudio else {
@@ -370,10 +381,13 @@ final class RecorderModel: ObservableObject {
                     if outcome?.file == session.folder { outcome = nil }
                     if unrecovered == session.folder { unrecovered = nil }
                     if delivery.incomplete || delivery.microphone != nil || delivery.usedFallback {
-                        // A recording started meanwhile shows its own outcome.
-                        if outcome == nil, !busy {
-                            outcome = Self.outcome(for: delivery,
-                                preferred: URL(fileURLWithPath: session.manifest.destination, isDirectory: true))
+                        let result = Self.outcome(for: delivery,
+                            preferred: URL(fileURLWithPath: session.manifest.destination, isDirectory: true))
+                        // Warnings already on screen stay, and so does a newer recording's result.
+                        if !busy, outcome == nil || (recordings == started && outcome == shown && outcome?.kind != .attention) {
+                            outcome = result
+                        } else {
+                            withheld = withheld ?? result
                         }
                         raiseAttention()
                     }
@@ -394,6 +408,7 @@ final class RecorderModel: ObservableObject {
                     NSApplication.shared.requestUserAttention(.criticalRequest)
                 }
             }
+            if let withheld, outcome == nil, !busy { outcome = withheld }
             recovering = false
             if !unsaved, NSApplication.shared.isActive { attention = false }
             if quitting && !busy { NSApplication.shared.reply(toApplicationShouldTerminate: true) }
@@ -424,11 +439,17 @@ final class RecorderModel: ObservableObject {
             if ready { NSWorkspace.shared.open(folder) }
             else {
                 folderAvailable = false
-                let alert = NSAlert()
-                alert.messageText = "Не удалось открыть папку записей"
-                alert.informativeText = "\(folder.path)\n\nПодключите диск или выберите другую папку в приложении."
-                alert.addButton(withTitle: "Понятно")
-                alert.runModal()
+                // A modal run inside this main-queue job would stall every other main-actor
+                // job, including saving and the reply to a pending quit.
+                RunLoop.main.perform {
+                    MainActor.assumeIsolated {
+                        let alert = NSAlert()
+                        alert.messageText = "Не удалось открыть папку записей"
+                        alert.informativeText = "\(folder.path)\n\nПодключите диск или выберите другую папку в приложении."
+                        alert.addButton(withTitle: "Понятно")
+                        alert.runModal()
+                    }
+                }
             }
         }
     }
@@ -535,10 +556,14 @@ final class RecorderDelegate: NSObject, NSApplicationDelegate {
         case "muted": model.phase = .recording; model.microphone = .muted; model.elapsed = 754
         case "unknown": model.phase = .recording; model.microphone = .unavailable; model.elapsed = 754
         case "reconnecting": model.phase = .recording; model.connected = false; model.elapsed = 754
+        case "warnings":
+            model.phase = .recording; model.microphone = .unmuted; model.elapsed = 754
+            model.zoomAudio = false; model.lowDiskSpace = true
         case "saving": model.phase = .saving; model.elapsed = 2832; model.progress = 0.62
         case "preparing": model.phase = .preparing
-        case "saved":
+        case "saved", "closed":
             model.outcome = .init(kind: .saved, title: "Сохранено", detail: "47:12 · 38,2 МБ", file: file)
+            model.zoomRunning = state != "closed"
         case "fallback":
             model.outcome = .init(kind: .attention, title: "Сохранено в «Записи Zoom»",
                                   detail: "Папка «Meetings» недоступна\n47:12 · 38,2 МБ", file: file)
@@ -547,7 +572,7 @@ final class RecorderDelegate: NSObject, NSApplicationDelegate {
                                   detail: "Файл не сохранён: на диске нет места. Можно повторить сохранение.",
                                   file: RecordingSession.root.appendingPathComponent("2026-10-05 14-30-00 1A2B3C4D"))
         case "failed":
-            model.outcome = .init(kind: .failed, title: "Не удалось записать", detail: "Откройте Zoom и войдите в созвон")
+            model.outcome = .init(kind: .failed, title: "Не удалось записать", detail: openZoomHint)
         case "recovered": model.recovered = [file]
         case "recovering": model.recovering = true
         case "longfolder":
@@ -651,9 +676,9 @@ struct MenuBarLabel: View {
             Text("\(Image(systemName: model.micIcon)) \(model.time)").monospacedDigit()
                 .accessibilityLabel("Идёт запись, \(model.time). \(model.micText)")
         case .preparing:
-            Image(systemName: "record.circle")
+            Image(systemName: "record.circle").accessibilityLabel("Подключаюсь к Zoom…")
         case .saving:
-            Image(systemName: "arrow.down.circle")
+            Image(systemName: "arrow.down.circle").accessibilityLabel("Сохраняю…")
         case .idle:
             Image(systemName: model.attention ? "exclamationmark.triangle" : "waveform")
                 .accessibilityLabel(model.attention ? "Zoom Audio Recorder: нужно внимание" : "Zoom Audio Recorder")
@@ -680,9 +705,12 @@ struct RecorderMenu: View {
         case .preparing: Text("Подключаюсь к Zoom…")
         case .saving: Text("Сохраняю…")
         case .idle:
+            if model.recovering {
+                Text(model.quitting ? "Сохраняю перед выходом…" : "Восстанавливаю прерванную запись…")
+            }
             if let outcome = model.outcome { Text(outcome.title) }
-            else if !model.ready { Text("Нужен доступ") }
-            else if !model.zoomRunning { Text("Откройте Zoom и войдите в созвон") }
+            if !model.ready { Text("Нужен доступ") }
+            else if !model.zoomRunning { Text(openZoomHint) }
         }
         Divider()
         if model.phase == .preparing {
@@ -771,7 +799,7 @@ struct IdleView: View {
             if let outcome = model.outcome {
                 OutcomeView(model: model, outcome: outcome)
             } else {
-                Text(model.zoomRunning ? "Готов к записи" : "Откройте Zoom и войдите в созвон")
+                Text(model.zoomRunning ? "Готов к записи" : openZoomHint)
                     .font(.title3.weight(.medium))
                     .foregroundStyle(model.zoomRunning ? .primary : .secondary)
                     .multilineTextAlignment(.center)
@@ -784,11 +812,14 @@ struct IdleView: View {
             .keyboardShortcut(.defaultAction)
             .disabled(!model.zoomRunning || model.quitting)
             VStack(spacing: 4) {
+                if let outcome = model.outcome, !model.zoomRunning, outcome.detail != openZoomHint {
+                    Caption(openZoomHint)
+                }
                 FolderMenu(model: model)
                 if !model.folderAvailable {
-                    Caption("Папка недоступна — сохраню в «\(RecorderModel.defaultFolder.lastPathComponent)»", color: .orange)
+                    Caption("Папка недоступна — сохраню в «\(RecorderModel.defaultFolder.lastPathComponent)»", warning: true)
                 }
-                if model.lowDiskSpace { Caption("Мало места на диске", color: .orange) }
+                if model.lowDiskSpace { Caption("Мало места на диске", warning: true) }
                 if model.recovering {
                     Caption(model.quitting ? "Сохраняю перед выходом…" : "Восстанавливаю прерванную запись…")
                 }
@@ -895,15 +926,20 @@ struct RecordingView: View {
             }
             .accessibilityElement(children: .ignore)
             .accessibilityLabel("Идёт запись, \(model.time)")
-            Label(model.micText, systemImage: model.micIcon)
-                .font(.callout)
-                .foregroundStyle(model.micColor)
+            // Color marks the icon only: orange and green text is hard to read on a light window.
+            Label {
+                Text(model.micText)
+                    .foregroundStyle(model.connected && model.microphone == .muted ? .secondary : .primary)
+            } icon: {
+                Image(systemName: model.micIcon).foregroundStyle(model.micColor)
+            }
+            .font(.callout)
             if model.connected && model.microphone == .unavailable {
                 Caption("Покажите панель управления встречей в Zoom")
             }
-            if model.connected && !model.zoomAudio { Caption("Звук Zoom не поступает", color: .orange) }
-            if let problem = model.problem { Caption(problem, color: .orange) }
-            if model.lowDiskSpace { Caption("Мало места на диске", color: .orange) }
+            if model.connected && !model.zoomAudio { Caption("Звук Zoom не поступает", warning: true) }
+            if let problem = model.problem { Caption(problem, warning: true) }
+            if model.lowDiskSpace { Caption("Мало места на диске", warning: true) }
             Button { model.finish() } label: {
                 Label("Остановить", systemImage: "stop.fill").frame(width: wideButton)
             }
@@ -1049,17 +1085,26 @@ struct FolderMenu: View {
 
 struct Caption: View {
     let text: String
-    var color: Color = .secondary
-    init(_ text: String, color: Color = .secondary) {
+    let warning: Bool
+    init(_ text: String, warning: Bool = false) {
         self.text = text
-        self.color = color
+        self.warning = warning
     }
     var body: some View {
-        Text(text)
-            .font(.caption)
-            .foregroundStyle(color)
-            .multilineTextAlignment(.center)
-            .fixedSize(horizontal: false, vertical: true)
+        Group {
+            if warning {
+                Label {
+                    Text(text)
+                } icon: {
+                    Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+                }
+            } else {
+                Text(text).foregroundStyle(.secondary)
+            }
+        }
+        .font(.caption)
+        .multilineTextAlignment(.center)
+        .fixedSize(horizontal: false, vertical: true)
     }
 }
 

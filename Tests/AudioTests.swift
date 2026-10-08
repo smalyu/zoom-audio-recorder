@@ -255,6 +255,45 @@ func checkCapture(_ folder: URL) async throws {
     print("PASS: gap filling, new part after a long gap, format change, voice while unmuted and just before, aligned mix")
 }
 
+/// Noise in both tracks: mixing them, Apple's M4A preset encodes at twice their bit rate.
+func checkExportSize(_ folder: URL) async throws {
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    let zoom = AudioTrack(name: "zoom", directory: folder, channels: 2, realtime: false)
+    let mic = AudioTrack(name: "mic", directory: folder, channels: 1, bitRate: 96_000, realtime: false)
+    var seed: UInt32 = 7
+    func noise(_ track: AudioTrack) -> AVAudioPCMBuffer {
+        let buffer = PCMNormalizer.silence(format: track.format, frames: 4800)!
+        for index in 0..<(4800 * Int(track.format.channelCount)) {
+            seed = seed &* 1_664_525 &+ 1_013_904_223
+            buffer.floatChannelData![0][index] = Float(Int32(bitPattern: seed)) / Float(Int32.max) * 0.1
+        }
+        return buffer
+    }
+    for index in 0..<100 {
+        zoom.append(noise(zoom), at: Int64(index * 4800))
+        mic.append(noise(mic), at: Int64(index * 4800))
+    }
+    await zoom.finish()
+    await mic.finish()
+    let zoomParts = AudioTrack.parts(named: "zoom", in: folder)
+    let micParts = AudioTrack.parts(named: "mic", in: folder)
+    let output = folder.appendingPathComponent("mixed.m4a")
+    let length = try await exportRecording(zoom: zoomParts, mic: micParts, to: output).duration
+    let rate = Double(try FileManager.default.attributesOfItem(atPath: output.path)[.size] as! Int) * 8 / length
+    try check(abs(length - 10) < 0.05, "mix lasts \(length) s")
+    try check(try AVAudioFile(forReading: output).fileFormat.channelCount == 2, "mix is not stereo")
+    try check(rate < 150_000, "mix encoded at \(Int(rate / 1000)) kbps")
+    // A packet the decoder rejects, as a power loss can leave: the preset plays through it.
+    let size = try FileManager.default.attributesOfItem(atPath: zoomParts[0].url.path)[.size] as! Int
+    let handle = try FileHandle(forWritingTo: zoomParts[0].url)
+    try handle.seek(toOffset: UInt64(size / 3))
+    handle.write(Data(count: 2000))
+    try handle.close()
+    let damaged = try await exportRecording(zoom: zoomParts, mic: micParts, to: folder.appendingPathComponent("damaged.m4a"))
+    try check(abs(damaged.duration - 10) < 0.05, "a damaged packet cut the mix to \(damaged.duration) s")
+    print("PASS: a mix keeps the tracks' bit rate; a damaged packet does not stop it")
+}
+
 /// No mute reading ever saw the microphone on: nothing of the voice is kept.
 func checkUnconfirmedVoice(_ folder: URL) async throws {
     try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
@@ -640,6 +679,8 @@ func checkDrift(_ folder: URL) async throws {
                 buffer.floatChannelData![0][frame] = Float(sin(2 * .pi * 440 * Double(index * frames + frame) / 48_000) * 0.2)
             }
             track.append(buffer, at: Int64((Double(index * frames) * rate).rounded()))
+            // A minute of audio at once would outrun a busy machine's encoder and trip its stall limit.
+            if index % 50 == 49 { try await Task.sleep(for: .milliseconds(2)) }
         }
         await track.finish()
         try check(track.failures == 0 && track.parts.count == 1, "\(name): writer failed or split")
@@ -729,6 +770,13 @@ func checkInterruptedSaves(_ folder: URL) async throws {
     let again = try await twice.deliver(fallback: fallback)
     try check(again.url == placed && !again.usedFallback, "a placed recording was saved again as \(again.url.lastPathComponent)")
     try check(try FileManager.default.contentsOfDirectory(atPath: target.path) == ["Twice.m4a"], "recording saved twice")
+    // The record of a save cut short before its rename names a file that is not there.
+    let unrenamed = try await makeSession(root: root, destination: target, name: "Unrenamed.m4a")
+    try Data(target.appendingPathComponent("Unrenamed.m4a").path.utf8)
+        .write(to: unrenamed.folder.appendingPathComponent("placed-final"))
+    let renamed = try await unrenamed.deliver(fallback: fallback)
+    try check(renamed.url.lastPathComponent == "Unrenamed.m4a" && !renamed.usedFallback,
+              "a save cut short before its rename was not finished: \(renamed.url.lastPathComponent)")
     print("PASS: early crash leaves nothing behind, unreadable Zoom part, normal-stop safety decision, no duplicate after an interrupted save")
 }
 
@@ -806,7 +854,15 @@ func checkBoundedOperations() async throws {
     } catch is RecorderError {}
     await timedOut.wait(timeout: 1)
     try check(timedOut.isRequested, "timed-out operation's late result was not cleaned up")
-    print("PASS: bounded operations cancel promptly and clean up late starts")
+    let quick = await answers(within: 1) { true }
+    try check(quick, "a quick check timed out")
+    let begun = Date()
+    let hung = await answers(within: 0.1) {
+        Thread.sleep(forTimeInterval: 0.5)
+        return true
+    }
+    try check(!hung && Date().timeIntervalSince(begun) < 0.4, "a hung check held up its caller")
+    print("PASS: bounded operations cancel promptly and clean up late starts, hung file checks time out")
 }
 
 @main struct AudioTests {
@@ -826,6 +882,7 @@ func checkBoundedOperations() async throws {
         try await checkStopRequest()
         try await checkBoundedOperations()
         try await checkCapture(folder.appendingPathComponent("capture"))
+        try await checkExportSize(folder.appendingPathComponent("export-size"))
         try await checkUnconfirmedVoice(folder.appendingPathComponent("unconfirmed"))
         try await checkSafetyCopy(folder.appendingPathComponent("safety"))
         try await checkLateDelivery(folder.appendingPathComponent("late"))

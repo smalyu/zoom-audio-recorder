@@ -23,6 +23,7 @@ enum RecorderError: Error, LocalizedError, Equatable {
     }
 }
 
+let openZoomHint = "Откройте Zoom и войдите в созвон"
 private let screenAccessHint = "Разрешите Zoom Audio Recorder «Запись экрана и системного звука» в Системных настройках и перезапустите приложение."
 
 private final class Once: @unchecked Sendable {
@@ -47,6 +48,19 @@ func waitAtMost(_ seconds: Double, _ operation: @escaping () async -> Void) asyn
             once.run { finished.resume() }
         }
         DispatchQueue.global().asyncAfter(deadline: .now() + seconds) { once.run { finished.resume() } }
+    }
+}
+
+/// Runs a blocking `check` on a background thread; false when it takes longer than
+/// `seconds`, as file calls on a network share that went away can for minutes.
+func answers(within seconds: Double, _ check: @escaping () -> Bool) async -> Bool {
+    let once = Once()
+    return await withCheckedContinuation { (result: CheckedContinuation<Bool, Never>) in
+        DispatchQueue.global(qos: .utility).async {
+            let value = check()
+            once.run { result.resume(returning: value) }
+        }
+        DispatchQueue.global().asyncAfter(deadline: .now() + seconds) { once.run { result.resume(returning: false) } }
     }
 }
 
@@ -103,6 +117,25 @@ extension AVAudioPCMBuffer {
             memcpy(to, from + Int(count) * frameBytes, Int(rest) * frameBytes)
         }
         return copy
+    }
+
+    /// The audio as a sample buffer at `frame` on the 48 kHz timeline.
+    func sampleBuffer(at frame: Int64) throws -> CMSampleBuffer {
+        var timing = CMSampleTimingInfo(duration: CMTime(value: 1, timescale: CMTimeScale(AudioTrack.rate)),
+                                        presentationTimeStamp: CMTime(value: frame, timescale: CMTimeScale(AudioTrack.rate)),
+                                        decodeTimeStamp: .invalid)
+        var sample: CMSampleBuffer?
+        guard CMSampleBufferCreate(allocator: kCFAllocatorDefault, dataBuffer: nil, dataReady: false,
+                                   makeDataReadyCallback: nil, refcon: nil, formatDescription: format.formatDescription,
+                                   sampleCount: CMItemCount(frameLength), sampleTimingEntryCount: 1,
+                                   sampleTimingArray: &timing, sampleSizeEntryCount: 0, sampleSizeArray: nil,
+                                   sampleBufferOut: &sample) == noErr, let sample,
+              CMSampleBufferSetDataBufferFromAudioBufferList(sample, blockBufferAllocator: kCFAllocatorDefault,
+                                                             blockBufferMemoryAllocator: kCFAllocatorDefault,
+                                                             flags: 0, bufferList: audioBufferList) == noErr else {
+            throw RecorderError.message("Не удалось подготовить звуковой буфер")
+        }
+        return sample
     }
 
     func silence() {
@@ -397,7 +430,7 @@ final class AudioTrack {
             pending.removeFirst()
             pendingFrames -= Int64(next.buffer.frameLength)
             do {
-                guard input.append(try sampleBuffer(next.buffer, at: next.frame)) else {
+                guard input.append(try next.buffer.sampleBuffer(at: next.frame)) else {
                     throw writer.error ?? RecorderError.message("Не удалось записать звук")
                 }
             } catch {
@@ -432,7 +465,7 @@ final class AudioTrack {
     /// the background before the file is finished, so closing never drops audio.
     private func closePart(keepingQueued: Bool = true) {
         if let writer, let input, writer.status == .writing {
-            let queued = Queue(keepingQueued ? pending.compactMap { try? sampleBuffer($0.buffer, at: $0.frame) } : [])
+            let queued = Queue(keepingQueued ? pending.compactMap { try? $0.buffer.sampleBuffer(at: $0.frame) } : [])
             closing.enter()
             input.requestMediaDataWhenReady(on: Self.finishing) { [closing] in
                 while input.isReadyForMoreMediaData, writer.status == .writing, let next = queued.next() {
@@ -466,24 +499,6 @@ final class AudioTrack {
             defer { closed = true }
             return !closed
         }
-    }
-
-    private func sampleBuffer(_ buffer: AVAudioPCMBuffer, at frame: Int64) throws -> CMSampleBuffer {
-        var timing = CMSampleTimingInfo(duration: CMTime(value: 1, timescale: CMTimeScale(Self.rate)),
-                                        presentationTimeStamp: CMTime(value: frame, timescale: CMTimeScale(Self.rate)),
-                                        decodeTimeStamp: .invalid)
-        var sample: CMSampleBuffer?
-        guard CMSampleBufferCreate(allocator: kCFAllocatorDefault, dataBuffer: nil, dataReady: false,
-                                   makeDataReadyCallback: nil, refcon: nil, formatDescription: format.formatDescription,
-                                   sampleCount: CMItemCount(buffer.frameLength), sampleTimingEntryCount: 1,
-                                   sampleTimingArray: &timing, sampleSizeEntryCount: 0, sampleSizeArray: nil,
-                                   sampleBufferOut: &sample) == noErr, let sample,
-              CMSampleBufferSetDataBufferFromAudioBufferList(sample, blockBufferAllocator: kCFAllocatorDefault,
-                                                             blockBufferMemoryAllocator: kCFAllocatorDefault,
-                                                             flags: 0, bufferList: buffer.audioBufferList) == noErr else {
-            throw RecorderError.message("Не удалось подготовить звуковой буфер")
-        }
-        return sample
     }
 }
 
@@ -698,6 +713,7 @@ private final class ZoomMuteWatcher {
     private static let attributes = [kAXRoleAttribute, kAXEnabledAttribute, kAXTitleAttribute,
                                      kAXDescriptionAttribute, kAXHelpAttribute, kAXIdentifierAttribute] as CFArray
     private let application: AXUIElement
+    private let pid: pid_t
     private let queue = DispatchQueue(label: "zoom-audio.mute")
     private let lock = NSLock()
     private var history: [(time: Double, unmuted: Bool)] = []
@@ -706,10 +722,17 @@ private final class ZoomMuteWatcher {
     private var controlSeen = false
     private var timer: DispatchSourceTimer?
     private let onChange: (ZoomMuteState) -> Void
-    private var labels = ZoomMuteLabels()
+    private let labels: ZoomMuteLabels
+    /// Parsing Zoom's localizations takes a third of a second; a reconnect to the same
+    /// Zoom process reuses them.
+    private static var parsed: (pid: pid_t, labels: ZoomMuteLabels)?
+    private static let parsedLock = NSLock()
     /// Zoom's own menu command and meeting button, once found.
     private var controls: [Control] = []
     private var indicators = MuteIndicators()
+    /// When the last known control vanished, as when a meeting ends. A search that then
+    /// finds none dates the microphone off from that moment, not from its own end.
+    private var vanished: Double?
     /// A search for a missing control, walked depth first a few milliseconds per poll: a
     /// whole walk of Zoom's windows takes most of a second, and polling never waits for it.
     private var scan: [(element: AXUIElement, depth: Int, inToolbar: Bool, root: Int)] = []
@@ -718,10 +741,16 @@ private final class ZoomMuteWatcher {
 
     init(pid: pid_t, bundleURL: URL?, onChange: @escaping (ZoomMuteState) -> Void) {
         application = AXUIElementCreateApplication(pid)
+        self.pid = pid
         self.onChange = onChange
         // Child elements use the process-wide timeout: a hung Zoom must not stall polling.
         AXUIElementSetMessagingTimeout(AXUIElementCreateSystemWide(), 0.25)
         AXUIElementSetMessagingTimeout(application, 0.2)
+        if let cached = Self.parsedLock.withLock({ Self.parsed }), cached.pid == pid {
+            labels = cached.labels
+            return
+        }
+        var labels = ZoomMuteLabels()
         if let bundleURL, let bundle = Bundle(url: bundleURL) {
             for language in bundle.localizations {
                 guard let path = bundle.path(forResource: "Localizable", ofType: "strings",
@@ -731,6 +760,8 @@ private final class ZoomMuteWatcher {
                 labels.add(localization: strings)
             }
         }
+        self.labels = labels
+        Self.parsedLock.withLock { Self.parsed = (pid, labels) }
     }
 
     /// Whether Zoom's microphone control has been found, and whether it is missing now.
@@ -760,7 +791,11 @@ private final class ZoomMuteWatcher {
     /// speech are decided before the recording closes.
     func finalReading() {
         timer?.cancel()
-        queue.sync { refresh() }
+        queue.sync {
+            refresh()
+            // A search for controls that vanished does not get to finish: the microphone is off from then.
+            if let vanished { record(.unavailable, at: vanished) }
+        }
     }
 
     func stop() {
@@ -771,11 +806,21 @@ private final class ZoomMuteWatcher {
     private func refresh() {
         let begun = Self.now()
         // No answer means Zoom's main thread is busy, and its mute state cannot change
-        // until it answers again: the previous reading still holds.
-        guard let next = currentState() else { return }
+        // until it answers again: the previous reading still holds. A Zoom that has quit
+        // does not answer either, and its microphone is off.
+        guard let next = currentState() ?? (zoomExited ? .unavailable : nil) else {
+            // Speech held meanwhile is decided after Capture.voiceHold: a search for vanished
+            // controls that drags on is not waited for.
+            if let vanished, Self.now() - vanished > Capture.voiceHold / 2 { record(.unavailable, at: vanished) }
+            return
+        }
         // The state was seen somewhere during the read: "on" counts from its start and
         // "off" from its end, so a slow answer never shortens the user's voice.
-        let time = next == .unmuted ? begun : Self.now()
+        record(next, at: next == .unmuted ? begun : (next == .unavailable ? vanished : nil) ?? Self.now())
+    }
+
+    private func record(_ next: ZoomMuteState, at time: Double) {
+        vanished = nil
         lock.lock()
         history.append((time, next == .unmuted))
         if history.count > 6_000 { history.removeFirst(3_000) }
@@ -785,6 +830,8 @@ private final class ZoomMuteWatcher {
         lock.unlock()
         if changed { onChange(next) }
     }
+
+    private var zoomExited: Bool { kill(pid, 0) != 0 && errno == ESRCH }
 
     /// nil when Zoom did not answer in time, or while a search has nothing to show yet.
     private func currentState() -> ZoomMuteState? {
@@ -801,6 +848,7 @@ private final class ZoomMuteWatcher {
             case .none: continue
             }
         }
+        if kept.isEmpty, !controls.isEmpty { vanished = Self.now() }
         controls = kept
         let time = Self.now()
         var missingMenu = !controls.contains(where: \.isMenu)
@@ -808,8 +856,8 @@ private final class ZoomMuteWatcher {
         // Look for a missing control at once when the last one vanished, a second after the
         // last search while none is found, and otherwise every ten seconds: a search loads
         // Zoom's main thread.
-        if scan.isEmpty, missingMenu || missingButton,
-           (previous > 0 && controls.isEmpty) || time - lastScan >= (controls.isEmpty ? 1 : 10) {
+        if missingMenu || missingButton,
+           (previous > 0 && controls.isEmpty) || (scan.isEmpty && time - lastScan >= (controls.isEmpty ? 1 : 10)) {
             scanBudget = 2000
             var roots: [AXUIElement] = []
             // The own-audio menu command is available even when meeting controls are hidden.
@@ -840,6 +888,8 @@ private final class ZoomMuteWatcher {
                 if let tip { shown[.tip] = tip }
                 if isMenu { missingMenu = false } else { missingButton = false }
             case .busy:
+                // A known control just answered, so Zoom is responsive and this element is not.
+                guard shown.isEmpty else { continue }
                 scan.append(next)
                 return nil
             case .none:
@@ -1309,7 +1359,7 @@ struct ZoomAudio {
             throw RecorderError.message("Разрешите Zoom Audio Recorder доступ к микрофону в Системных настройках.")
         }
         guard runningZoom() != nil else {
-            throw RecorderError.message("Откройте Zoom и войдите в созвон")
+            throw RecorderError.message(openZoomHint)
         }
     }
 
@@ -1433,7 +1483,7 @@ struct ZoomAudio {
             throw RecorderError.message("\(screenAccessHint) Системная ошибка: \(error.localizedDescription)")
         }
         guard let zoom = captureApplication(in: content, pid: app.processIdentifier) else {
-            throw RecorderError.message("Откройте Zoom и войдите в созвон")
+            throw RecorderError.message(openZoomHint)
         }
         recorderLog.notice("Recording target: \(zoom.bundleIdentifier, privacy: .public), pid \(zoom.processID)")
         let watcher = ZoomMuteWatcher(pid: app.processIdentifier, bundleURL: app.bundleURL) { state in
