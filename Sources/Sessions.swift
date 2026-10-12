@@ -48,8 +48,8 @@ struct ExportResult {
 /// Mixes `tracks` into stereo AAC at the bit rate they were recorded with, on a background
 /// thread, then calls `done` with whether it worked. A packet the decoder rejects, as a
 /// power loss can leave behind, costs a quarter second of silence, not the recording.
-private func encodeMix(of composition: AVComposition, tracks: [AVAssetTrack], mix: AVAudioMix, to output: URL,
-                       progress: @escaping (Double) -> Void, done: @escaping (Bool) -> Void) {
+private func encodeMix(of composition: AVComposition, tracks: [AVAssetTrack], mix: AVAudioMix, metadata: [AVMetadataItem],
+                       to output: URL, progress: @escaping (Double) -> Void, done: @escaping (Bool) -> Void) {
     DispatchQueue.global(qos: .userInitiated).async {
         let rate = CMTimeScale(AudioTrack.rate)
         let format = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: AudioTrack.rate, channels: 2, interleaved: true)!
@@ -60,6 +60,7 @@ private func encodeMix(of composition: AVComposition, tracks: [AVAssetTrack], mi
                 AVNumberOfChannelsKey: 2, AVEncoderBitRateKey: 128_000], sourceFormatHint: format.formatDescription)
             input.expectsMediaDataInRealTime = false
             writer.add(input)
+            writer.metadata = metadata
             guard writer.startWriting() else { throw writer.error ?? RecorderError.message("Не удалось подготовить сведение") }
             writer.startSession(atSourceTime: .zero)
             defer { if writer.status == .writing { writer.cancelWriting() } }
@@ -129,9 +130,10 @@ private func encodeMix(of composition: AVComposition, tracks: [AVAssetTrack], mi
 
 /// Mixes the recorded parts into one ordinary M4A file and verifies it. Each track's
 /// parts are laid out on one composition track at their offsets. Parts cut short by a
-/// crash are used up to their last readable fragment.
+/// crash are used up to their last readable fragment. `description` goes into the file's
+/// description tag.
 @discardableResult
-func exportRecording(zoom: [TrackPart], mic: [TrackPart], to output: URL,
+func exportRecording(zoom: [TrackPart], mic: [TrackPart], to output: URL, description: String? = nil,
                      progress: @escaping (Double) -> Void = { _ in }) async throws -> ExportResult {
     let composition = AVMutableComposition()
     // Assets stay referenced until the export ends: a track does not keep its asset alive.
@@ -171,13 +173,22 @@ func exportRecording(zoom: [TrackPart], mic: [TrackPart], to output: URL,
         volume.setVolume(0.7, at: .zero)
         return volume
     }
+    let metadata = description.map { text -> [AVMetadataItem] in
+        // "desc", unlike the identifier for "©des", is what ffprobe shows as `description`.
+        let item = AVMutableMetadataItem()
+        item.keySpace = .iTunes
+        item.key = "desc" as NSString
+        item.value = text as NSString
+        return [item]
+    } ?? []
     try? FileManager.default.removeItem(at: output)
     // Apple's M4A preset copies a single track unchanged and plays through damaged packets,
     // but encodes a mix of two at twice their bit rate: a mix goes to an encoder at theirs.
     var encoded = false
     if let mix {
         encoded = await withCheckedContinuation { finished in
-            encodeMix(of: composition, tracks: tracks, mix: mix, to: output, progress: progress) { finished.resume(returning: $0) }
+            encodeMix(of: composition, tracks: tracks, mix: mix, metadata: metadata, to: output,
+                      progress: progress) { finished.resume(returning: $0) }
         }
     }
     if !encoded {
@@ -186,6 +197,7 @@ func exportRecording(zoom: [TrackPart], mic: [TrackPart], to output: URL,
             throw RecorderError.message("Не удалось подготовить сведение")
         }
         exporter.audioMix = mix
+        exporter.metadata = metadata
         let monitor = Task {
             for await state in exporter.states(updateInterval: 0.25) {
                 if case let .exporting(current) = state { progress(current.fractionCompleted) }
@@ -358,7 +370,7 @@ final class RecordingSession {
         let rawParts = tracks.contains("raw") ? AudioTrack.parts(named: "raw", in: folder) : []
         // Without any Zoom audio or voice, the safety copy is the recording itself.
         let main = try await exported("final", zoom: zoomParts, mic: micParts.isEmpty && zoomParts.isEmpty ? rawParts : micParts,
-                                      progress: progress)
+                                      description: SpeakerLog.timeline(in: folder), progress: progress)
         // A failed safety copy keeps the session for a retry rather than losing the microphone.
         let cachedSafety = Self.size(folder.appendingPathComponent("microphone.m4a")) > 0
         let safety = !cachedSafety && (rawParts.isEmpty || (zoomParts.isEmpty && micParts.isEmpty)) ? nil
@@ -401,12 +413,12 @@ final class RecordingSession {
     }
 
     /// The mixed file in the session folder, exported once and reused on a retry.
-    private func exported(_ name: String, zoom: [TrackPart], mic: [TrackPart],
+    private func exported(_ name: String, zoom: [TrackPart], mic: [TrackPart], description: String? = nil,
                           progress: @escaping (Double) -> Void = { _ in }) async throws -> (file: URL, duration: Double) {
         let file = folder.appendingPathComponent("\(name).m4a")
         if let duration = try? await verifyRecording(file) { return (file, duration) }
         let partial = folder.appendingPathComponent("\(name).partial.m4a")
-        let result = try await exportRecording(zoom: zoom, mic: mic, to: partial, progress: progress)
+        let result = try await exportRecording(zoom: zoom, mic: mic, to: partial, description: description, progress: progress)
         syncToStorage(partial)
         try? FileManager.default.removeItem(at: file)
         try FileManager.default.moveItem(at: partial, to: file)
