@@ -47,9 +47,15 @@ final class EchoCanceller {
     /// Microphone audio waits up to 0.5 s for Zoom's audio of the same moment, within the
     /// time it is held for Zoom's mute state anyway.
     static let patience: Int64 = 24_000
-    /// Microphone positions this close to continuing the previous audio do: a 44.1 kHz
-    /// microphone converted to 48 kHz slips by a frame now and then.
-    static let slip: Int64 = 16
+    /// Microphone audio within 5 ms of continuing the previous audio does: timestamps jitter,
+    /// and a 44.1 kHz microphone converted to 48 kHz slips by a frame now and then. The
+    /// smoothed shift follows any real drift.
+    static let slip: Int64 = 240
+    /// Blocks this close to following on keep the reference history built for them.
+    static let jitter: Int64 = 16
+    /// How fast a smoothed shift follows timestamps, per buffer: a device clock's drift of
+    /// tens of ppm is followed, jitter of a few milliseconds is averaged out.
+    static let follow = 0.002
     private static let size = 2 * block
     private static let history = 1 << 18
     private let forward = vDSP_DFT_zop_CreateSetup(nil, vDSP_Length(size), .FORWARD)!
@@ -57,6 +63,9 @@ final class EchoCanceller {
     /// Zoom's audio in mono, at timeline position modulo the ring's length.
     private var reference = [Float](repeating: 0, count: history)
     private var referenceEnd: Int64?
+    /// Zoom's audio as one continuous run: where it began, how much of it is written, and how
+    /// far its timestamps have drifted from that, smoothed.
+    private var referenceRun: (start: Int64, written: Int64, shift: Double)?
     /// Spectra of the reference windows behind the latest block, the newest at `head`.
     private let windows = (0..<partitions).map { _ in Spectrum(size) }
     private var head = 0
@@ -104,6 +113,18 @@ final class EchoCanceller {
         guard let samples = buffer.floatChannelData?[0] else { return }
         let frames = Int(buffer.frameLength)
         let channels = Int(buffer.format.channelCount)
+        // Timestamps jitter by a frame or so while a device clock drifts slowly: each buffer
+        // follows on from the previous, moved only by the smoothed drift, as the microphone's do.
+        var position = position
+        // A whole buffer missing is a real gap, not jitter: tolerance stays below half a buffer.
+        if var run = referenceRun, abs(position - (run.start + run.written + Int64(run.shift.rounded()))) <= min(480, Int64(frames) / 2) {
+            run.shift += Self.follow * (Double(position - (run.start + run.written)) - run.shift)
+            position = run.start + run.written + Int64(run.shift.rounded())
+            run.written += Int64(frames)
+            referenceRun = run
+        } else {
+            referenceRun = (position, Int64(frames), 0)
+        }
         // A gap since the last audio is silence, not whatever the ring held before.
         if let end = referenceEnd, position > end {
             for gap in end..<min(position, end + Int64(Self.history)) { reference[Self.index(gap)] = 0 }
@@ -124,9 +145,9 @@ final class EchoCanceller {
         // Audio that does not continue the run, give or take a slipped frame, starts a new one.
         let slip = position - (pendingStart + Int64(pending.count) + slips)
         var done: [(buffer: AVAudioPCMBuffer, position: Int64)] = []
-        if abs(slip) <= Self.slip {
+        if abs(slip) <= min(Self.slip, Int64(buffer.frameLength) / 2) {
             slips += slip
-            shift += 0.02 * (Double(slips) - shift)
+            shift += Self.follow * (Double(slips) - shift)
         } else {
             done = drain()
             pendingStart = position
@@ -227,7 +248,7 @@ final class EchoCanceller {
                         count: Int, adapt: Bool) {
         let block = Int64(Self.block)
         let blockLength = vDSP_Length(Self.block)
-        if lastBlock.map({ abs(start - block - $0) > Self.slip }) ?? true {
+        if lastBlock.map({ abs(start - block - $0) > Self.jitter }) ?? true {
             // Not right after the previous block: rebuild the history at these positions.
             for partition in stride(from: Self.partitions - 1, through: 1, by: -1) { push(endingAt: start + block - Int64(partition) * block) }
         }

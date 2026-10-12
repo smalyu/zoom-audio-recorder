@@ -48,8 +48,9 @@ struct ExportResult {
 /// Mixes `tracks` into stereo AAC at the bit rate they were recorded with, on a background
 /// thread, then calls `done` with whether it worked. A packet the decoder rejects, as a
 /// power loss can leave behind, costs a quarter second of silence, not the recording.
-private func encodeMix(of composition: AVComposition, tracks: [AVAssetTrack], mix: AVAudioMix, metadata: [AVMetadataItem],
-                       to output: URL, progress: @escaping (Double) -> Void, done: @escaping (Bool) -> Void) {
+private func encodeMix(of composition: AVComposition, range: CMTimeRange, tracks: [AVAssetTrack], mix: AVAudioMix,
+                       metadata: [AVMetadataItem], to output: URL, progress: @escaping (Double) -> Void,
+                       done: @escaping (Bool) -> Void) {
     DispatchQueue.global(qos: .userInitiated).async {
         let rate = CMTimeScale(AudioTrack.rate)
         let format = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: AudioTrack.rate, channels: 2, interleaved: true)!
@@ -64,7 +65,8 @@ private func encodeMix(of composition: AVComposition, tracks: [AVAssetTrack], mi
             guard writer.startWriting() else { throw writer.error ?? RecorderError.message("Не удалось подготовить сведение") }
             writer.startSession(atSourceTime: .zero)
             defer { if writer.status == .writing { writer.cancelWriting() } }
-            let end = CMTimeConvertScale(composition.duration, timescale: rate, method: .roundHalfAwayFromZero).value
+            let first = CMTimeConvertScale(range.start, timescale: rate, method: .roundHalfAwayFromZero).value
+            let end = CMTimeConvertScale(range.duration, timescale: rate, method: .roundHalfAwayFromZero).value
             var written: Int64 = 0
             var retried = false
             func write(_ buffer: AVAudioPCMBuffer) throws {
@@ -81,7 +83,7 @@ private func encodeMix(of composition: AVComposition, tracks: [AVAssetTrack], mi
             }
             while written < end {
                 let reader = try AVAssetReader(asset: composition)
-                reader.timeRange = CMTimeRange(start: CMTime(value: written, timescale: rate), end: composition.duration)
+                reader.timeRange = CMTimeRange(start: CMTime(value: first + written, timescale: rate), end: range.end)
                 let mixed = AVAssetReaderAudioMixOutput(audioTracks: tracks, audioSettings: format.settings)
                 mixed.audioMix = mix
                 reader.add(mixed)
@@ -97,7 +99,7 @@ private func encodeMix(of composition: AVComposition, tracks: [AVAssetTrack], mi
                     }
                     // Time the mix leaves out stays on the timeline as silence.
                     let start = CMSampleBufferGetPresentationTimeStamp(sample)
-                    try silence(until: CMTimeConvertScale(start, timescale: rate, method: .roundHalfAwayFromZero).value)
+                    try silence(until: CMTimeConvertScale(start, timescale: rate, method: .roundHalfAwayFromZero).value - first)
                     try write(buffer)
                     progress(Double(written) / Double(max(end, 1)))
                 }
@@ -128,12 +130,86 @@ private func encodeMix(of composition: AVComposition, tracks: [AVAssetTrack], mi
     }
 }
 
+/// Where the recording has sound: from a second before the first sound to a second after
+/// the last, so the wait before a meeting and the silence after it are left out. Found by
+/// reading from each end, not the whole recording; the whole range when unsure.
+private func findSoundRange(of composition: AVComposition, tracks: [AVAssetTrack], mix: AVAudioMix?,
+                            done: @escaping (CMTimeRange) -> Void) {
+    DispatchQueue.global(qos: .userInitiated).async { done(soundRange(of: composition, tracks: tracks, mix: mix)) }
+}
+
+private func soundRange(of composition: AVComposition, tracks: [AVAssetTrack], mix: AVAudioMix?) -> CMTimeRange {
+    let whole = CMTimeRange(start: .zero, duration: composition.duration)
+    let rate = 16_000.0
+    let format = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: rate, channels: 1, interleaved: true)!
+    /// Seconds into `range` of each loud 0.1 s window, in order; nil if it cannot be read.
+    func loud(in range: CMTimeRange, stopAtFirst: Bool) -> [Double]? {
+        guard let reader = try? AVAssetReader(asset: composition) else { return nil }
+        reader.timeRange = range
+        let output = AVAssetReaderAudioMixOutput(audioTracks: tracks, audioSettings: format.settings)
+        output.audioMix = mix
+        reader.add(output)
+        guard reader.startReading() else { return nil }
+        var found: [Double] = []
+        var window: (sum: Float, count: Int, start: Double) = (0, 0, 0)
+        /// Judges the window so far: above -46 dBFS is quiet speech, not the room behind an open microphone.
+        func close() {
+            if window.count > 0, (window.sum / Float(window.count)).squareRoot() > 0.005 { found.append(window.start) }
+            window = (0, 0, 0)
+        }
+        var next: Double?
+        while let sample = output.copyNextSampleBuffer() {
+            let frames = CMSampleBufferGetNumSamples(sample)
+            guard frames > 0, let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(frames)) else { continue }
+            buffer.frameLength = AVAudioFrameCount(frames)
+            guard CMSampleBufferCopyPCMDataIntoAudioBufferList(sample, at: 0, frameCount: Int32(frames),
+                                                               into: buffer.mutableAudioBufferList) == noErr else { return nil }
+            let time = (CMSampleBufferGetPresentationTimeStamp(sample) - range.start).seconds
+            // The mix leaves out time with no audio at all: a window does not reach across it.
+            if let next, abs(time - next) > 1 / rate { close() }
+            next = time + Double(frames) / rate
+            for index in 0..<frames {
+                if window.count == 0 { window.start = time + Double(index) / rate }
+                let value = buffer.floatChannelData![0][index]
+                window.sum += value * value
+                window.count += 1
+                guard window.count == Int(rate / 10) else { continue }
+                close()
+                if stopAtFirst, !found.isEmpty {
+                    reader.cancelReading()
+                    return found
+                }
+            }
+        }
+        close()
+        return reader.status == .completed || reader.status == .cancelled ? found : nil
+    }
+    guard let first = loud(in: whole, stopAtFirst: true)?.first else { return whole }
+    let start = max(0, first - 1)
+    var last: Double?
+    var stretch = 60.0
+    var to = whole.duration.seconds
+    // Back from the end, a stretch at a time, until the last sound.
+    while last == nil, to > first {
+        let from = max(first, to - stretch)
+        guard let sounds = loud(in: CMTimeRange(start: CMTime(seconds: from, preferredTimescale: 48_000),
+                                                end: CMTime(seconds: to, preferredTimescale: 48_000)), stopAtFirst: false) else { return whole }
+        last = sounds.last.map { from + $0 + 0.1 }
+        to = from
+        stretch *= 2
+    }
+    let end = min(whole.duration.seconds, (last ?? first + 0.1) + 1)
+    return CMTimeRange(start: CMTime(seconds: start, preferredTimescale: 48_000), end: CMTime(seconds: end, preferredTimescale: 48_000))
+}
+
 /// Mixes the recorded parts into one ordinary M4A file and verifies it. Each track's
 /// parts are laid out on one composition track at their offsets. Parts cut short by a
-/// crash are used up to their last readable fragment. `description` goes into the file's
-/// description tag.
+/// crash are used up to their last readable fragment. With `trimmed`, the silence before the
+/// first sound and after the last is left out; `description`, given where the file starts and
+/// ends in the recording, goes into the file's description tag.
 @discardableResult
-func exportRecording(zoom: [TrackPart], mic: [TrackPart], to output: URL, description: String? = nil,
+func exportRecording(zoom: [TrackPart], mic: [TrackPart], to output: URL, trimmed: Bool = true,
+                     description: (_ start: Double, _ end: Double) -> String? = { _, _ in nil },
                      progress: @escaping (Double) -> Void = { _ in }) async throws -> ExportResult {
     let composition = AVMutableComposition()
     // Assets stay referenced until the export ends: a track does not keep its asset alive.
@@ -173,7 +249,10 @@ func exportRecording(zoom: [TrackPart], mic: [TrackPart], to output: URL, descri
         volume.setVolume(0.7, at: .zero)
         return volume
     }
-    let metadata = description.map { text -> [AVMetadataItem] in
+    let range = trimmed ? await withCheckedContinuation { found in
+        findSoundRange(of: composition, tracks: tracks, mix: mix) { found.resume(returning: $0) }
+    } : CMTimeRange(start: .zero, duration: composition.duration)
+    let metadata = description(range.start.seconds, range.end.seconds).map { text -> [AVMetadataItem] in
         // "desc", unlike the identifier for "©des", is what ffprobe shows as `description`.
         let item = AVMutableMetadataItem()
         item.keySpace = .iTunes
@@ -187,7 +266,7 @@ func exportRecording(zoom: [TrackPart], mic: [TrackPart], to output: URL, descri
     var encoded = false
     if let mix {
         encoded = await withCheckedContinuation { finished in
-            encodeMix(of: composition, tracks: tracks, mix: mix, metadata: metadata, to: output,
+            encodeMix(of: composition, range: range, tracks: tracks, mix: mix, metadata: metadata, to: output,
                       progress: progress) { finished.resume(returning: $0) }
         }
     }
@@ -198,17 +277,28 @@ func exportRecording(zoom: [TrackPart], mic: [TrackPart], to output: URL, descri
         }
         exporter.audioMix = mix
         exporter.metadata = metadata
+        exporter.timeRange = range
         let monitor = Task {
             for await state in exporter.states(updateInterval: 0.25) {
                 if case let .exporting(current) = state { progress(current.fractionCompleted) }
             }
         }
         defer { monitor.cancel() }
-        try await exporter.export(to: output, as: .m4a)
+        do {
+            try await exporter.export(to: output, as: .m4a)
+        } catch where !metadata.isEmpty {
+            // The speaker timeline is never worth the recording: save without it.
+            recorderLog.error("Export with the speaker timeline failed, saving without it: \(error.localizedDescription, privacy: .public)")
+            try? FileManager.default.removeItem(at: output)
+            guard let plain = AVAssetExportSession(asset: composition, presetName: AVAssetExportPresetAppleM4A) else { throw error }
+            plain.audioMix = mix
+            plain.timeRange = range
+            try await plain.export(to: output, as: .m4a)
+        }
     }
     withExtendedLifetime(assets) {}
     let duration = try await verifyRecording(output)
-    guard duration > expected - 1 else {
+    guard duration > min(expected, range.end.seconds) - range.start.seconds - 1 else {
         throw RecorderError.message("Сохранённый файл короче записи")
     }
     return ExportResult(duration: duration, unreadable: unreadable)
@@ -348,6 +438,23 @@ final class RecordingSession {
         return marked("safety") || (recovering && !marked("finished") && !marked("control") && !hasVoice)
     }
 
+    /// After a crash, microphone audio still held for Zoom's mute state never reached the
+    /// recording. Usually that is a second; when it is more, as when Zoom was busy at the
+    /// crash, the whole microphone is delivered too.
+    private func microphoneCutShort() async -> Bool {
+        guard hasVoice, !FileManager.default.fileExists(atPath: folder.appendingPathComponent("finished").path) else { return false }
+        func end(_ name: String) async -> Double {
+            var latest = 0.0
+            for part in AudioTrack.parts(named: name, in: folder) {
+                if let duration = try? await verifyRecording(part.url) {
+                    latest = max(latest, Double(part.start) / AudioTrack.rate + duration)
+                }
+            }
+            return latest
+        }
+        return await end("raw") - end("mic") > 3
+    }
+
     var hasAudio: Bool {
         !AudioTrack.parts(named: "zoom", in: folder).isEmpty || hasVoice || needsSafetyCopy(recovering: true)
             || Self.size(folder.appendingPathComponent("final.m4a")) > 0
@@ -362,7 +469,9 @@ final class RecordingSession {
     /// deleted, and the next launch tries again.
     func deliver(fallback: URL, recovering: Bool = false,
                  progress: @escaping (Double) -> Void = { _ in }) async throws -> Delivery {
-        let tracks = ["zoom"] + (hasVoice ? ["mic"] : []) + (needsSafetyCopy(recovering: recovering) ? ["raw"] : [])
+        var wholeMicrophone = needsSafetyCopy(recovering: recovering)
+        if !wholeMicrophone, recovering { wholeMicrophone = await microphoneCutShort() }
+        let tracks = ["zoom"] + (hasVoice ? ["mic"] : []) + (wholeMicrophone ? ["raw"] : [])
         // Unreadable parts go aside first, so they never decide which tracks are mixed.
         let incomplete = try await keepUnreadableParts(of: tracks)
         let zoomParts = AudioTrack.parts(named: "zoom", in: folder)
@@ -370,11 +479,11 @@ final class RecordingSession {
         let rawParts = tracks.contains("raw") ? AudioTrack.parts(named: "raw", in: folder) : []
         // Without any Zoom audio or voice, the safety copy is the recording itself.
         let main = try await exported("final", zoom: zoomParts, mic: micParts.isEmpty && zoomParts.isEmpty ? rawParts : micParts,
-                                      description: SpeakerLog.timeline(in: folder), progress: progress)
+                                      description: { SpeakerLog.timeline(in: self.folder, from: $0, to: $1) }, progress: progress)
         // A failed safety copy keeps the session for a retry rather than losing the microphone.
         let cachedSafety = Self.size(folder.appendingPathComponent("microphone.m4a")) > 0
         let safety = !cachedSafety && (rawParts.isEmpty || (zoomParts.isEmpty && micParts.isEmpty)) ? nil
-            : try await exported("microphone", zoom: [], mic: rawParts)
+            : try await exported("microphone", zoom: [], mic: rawParts, trimmed: false)
         let preferred = URL(fileURLWithPath: manifest.destination, isDirectory: true)
         var failure: Error?
         // A network share that went away must not hold up saving to the fallback folder.
@@ -413,12 +522,14 @@ final class RecordingSession {
     }
 
     /// The mixed file in the session folder, exported once and reused on a retry.
-    private func exported(_ name: String, zoom: [TrackPart], mic: [TrackPart], description: String? = nil,
+    private func exported(_ name: String, zoom: [TrackPart], mic: [TrackPart], trimmed: Bool = true,
+                          description: @escaping (Double, Double) -> String? = { _, _ in nil },
                           progress: @escaping (Double) -> Void = { _ in }) async throws -> (file: URL, duration: Double) {
         let file = folder.appendingPathComponent("\(name).m4a")
         if let duration = try? await verifyRecording(file) { return (file, duration) }
         let partial = folder.appendingPathComponent("\(name).partial.m4a")
-        let result = try await exportRecording(zoom: zoom, mic: mic, to: partial, description: description, progress: progress)
+        let result = try await exportRecording(zoom: zoom, mic: mic, to: partial, trimmed: trimmed, description: description,
+                                               progress: progress)
         syncToStorage(partial)
         try? FileManager.default.removeItem(at: file)
         try FileManager.default.moveItem(at: partial, to: file)

@@ -76,8 +76,15 @@ func checkSpeakerTimeline(_ folder: URL) async throws {
             }
             described.markVoice()
         }
-        let saved = try await described.deliver(fallback: destination).url
-        try check(try await description(saved) == text, "saved file lost the timeline (voice: \(withVoice))")
+        let saved = try await described.deliver(fallback: destination)
+        // The timeline ends where the file does: two seconds of Zoom alone leave out the change at 2.5 s.
+        let stored = try await description(saved.url) ?? ""
+        let json = try JSONSerialization.jsonObject(with: Data(stored.utf8)) as? [String: [[Any]]] ?? [:]
+        let names = (json["speakers"] ?? []).map { $0[1] as? String ?? "" }
+        let span = (json["me"] ?? []).first as? [Double] ?? []
+        try check(names == (saved.duration > 2.5 ? ["Анна", "Борис Петров"] : ["Анна"])
+                  && span.count == 2 && abs(span[0] - 1) < 0.15 && abs(span[1] - min(2.1, saved.duration)) < 0.15,
+                  "saved file lost the timeline (voice: \(withVoice), \(saved.duration) s): \(stored)")
     }
     let plain = try await makeSession(root: root, destination: destination, name: "Plain.m4a")
     try check(try await description(try await plain.deliver(fallback: destination).url) == nil, "a description without a timeline")
@@ -132,5 +139,76 @@ func checkSpeakerLog(_ folder: URL) throws {
     log.speaker(nil, at: 120)
     let text = SpeakerLog.timeline(in: folder) ?? ""
     try check(text == #"{"me":[],"speakers":[[1,"Анна"],[100,null]]}"#, "timeline: \(text)")
-    print("PASS: speaker log sorted by time, keeps the window gone until the end")
+    // A power cut inside a letter of a name, and a number no recording reaches, lose only their lines.
+    let handle = try FileHandle(forWritingTo: log.url)
+    try handle.seekToEnd()
+    try handle.write(contentsOf: Data("[\"zoom\", 1e300, \"Вера\"]\n".utf8) + Data("[\"zoom\", 130, \"Ве".utf8).dropLast())
+    try handle.close()
+    try check(SpeakerLog.timeline(in: folder) == text, "a damaged log changed the timeline: \(SpeakerLog.timeline(in: folder) ?? "nil")")
+    print("PASS: speaker log sorted by time, keeps the window gone until the end, survives damaged lines")
+}
+
+/// A crash that cut the recorded microphone short by seconds delivers the whole microphone
+/// too; the second or so held for Zoom's mute state does not.
+func checkCutShort(_ folder: URL) async throws {
+    let root = folder.appendingPathComponent("sessions")
+    let destination = folder.appendingPathComponent("meetings")
+    for (name, rawSeconds, expected) in [("Cut.m4a", 7, true), ("Held.m4a", 3, false)] {
+        let session = try await makeSession(root: root, destination: destination, name: name)
+        for (track, seconds) in [("mic", 2), ("raw", rawSeconds)] {
+            let writer = AudioTrack(name: track, directory: session.folder, channels: 1, realtime: false)
+            let pcm = PCMNormalizer(channels: 1)
+            for index in 0..<(seconds * 10) {
+                writer.append(try pcm.convert(try sample(frequency: 880, start: Int64(index * 4800))), at: Int64(index * 4800))
+            }
+            await writer.finish()
+        }
+        session.markVoice()
+        let delivered = try await session.deliver(fallback: destination, recovering: true)
+        try check((delivered.microphone != nil) == expected, "\(name): whole microphone delivered: \(delivered.microphone != nil)")
+    }
+    print("PASS: a crash that cut the microphone short delivers it whole")
+}
+
+/// The silence before the first sound and after the last is left out of the saved file,
+/// and the speaker timeline moves with it; the safety copy keeps everything.
+func checkTrim(_ folder: URL) async throws {
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    // Nine seconds, a participant only from 3 to 5 s, the microphone silent throughout.
+    func track(_ name: String, channels: Int, tone: Range<Int>) async throws -> TrackPart {
+        let writer = AudioTrack(name: name, directory: folder, channels: AVAudioChannelCount(channels), realtime: false)
+        let pcm = PCMNormalizer(channels: AVAudioChannelCount(channels))
+        for index in 0..<90 {
+            let buffer = try sample(frequency: tone.contains(index) ? 440 : 0, start: Int64(index * 4800), channels: channels,
+                                    float: true, interleaved: false)
+            writer.append(try pcm.convert(buffer), at: Int64(index * 4800))
+        }
+        await writer.finish()
+        return AudioTrack.parts(named: name, in: folder)[0]
+    }
+    let zoom = try await track("zoom", channels: 2, tone: 30..<50)
+    let mic = try await track("mic", channels: 1, tone: 0..<0)
+    for (name, parts) in [("single", [TrackPart]()), ("mixed", [mic])] {
+        let output = folder.appendingPathComponent("\(name).m4a")
+        var start = -1.0
+        let length = try await exportRecording(zoom: [zoom], mic: parts, to: output, description: { from, _ in start = from; return nil }).duration
+        try check(abs(length - 4) < 0.15 && abs(start - 2) < 0.05, "\(name): trimmed to \(length) s from \(start) s, expected 4 s from 2 s")
+        let decoded = try decode(output)
+        try check(tone(decoded, at: 1.5, frequency: 440) > 0.05 && tone(decoded, at: 2.8, frequency: 440) > 0.05,
+                  "\(name): the sound moved or was cut")
+    }
+    let whole = try await exportRecording(zoom: [zoom], mic: [], to: folder.appendingPathComponent("whole.m4a"), trimmed: false).duration
+    try check(abs(whole - 9) < 0.15, "untrimmed export is \(whole) s")
+    let log = SpeakerLog(directory: folder)
+    log.speaker("Анна", at: 0.5)
+    log.speaker("Борис", at: 3.2)
+    log.voice(3.5..<4.0)
+    log.voice(1.0..<1.5)
+    let moved = SpeakerLog.timeline(in: folder, from: 2) ?? ""
+    try check(moved == #"{"me":[[1.5,2]],"speakers":[[0,"Анна"],[1.2,"Борис"]]}"#, "timeline from 2 s: \(moved)")
+    let cut = SpeakerLog.timeline(in: folder, from: 2, to: 3.6) ?? ""
+    try check(cut == #"{"me":[[1.5,1.6]],"speakers":[[0,"Анна"],[1.2,"Борис"]]}"#, "timeline from 2 to 3.6 s: \(cut)")
+    let early = SpeakerLog.timeline(in: folder, from: 0, to: 3) ?? ""
+    try check(early == #"{"me":[[1,1.5]],"speakers":[[0.5,"Анна"]]}"#, "timeline up to 3 s: \(early)")
+    print("PASS: silence before the first and after the last sound left out, the timeline moved with it")
 }

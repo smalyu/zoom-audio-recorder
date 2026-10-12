@@ -316,15 +316,24 @@ func checkUnconfirmedVoice(_ folder: URL) async throws {
 
 /// Whether speech the mute detector could not judge asks for the whole microphone.
 func checkSafetyCopy(_ folder: URL) async throws {
-    // (name, control missing at time t, seconds of speech, expected, live requests);
-    // the control counts as seen once it has been visible.
-    let cases: [(String, (Double) -> Bool, Int, Bool, Int)] = [
-        ("vanished mid-meeting", { (2.0..<7.0).contains($0) }, 10, true, 1),
-        ("before joining", { $0 < 6.0 }, 10, false, 0),
-        ("listen only", { _ in false }, 12, false, 0),
-        ("never found", { _ in true }, 12, true, 0),
+    // (name, control missing at time t, participants heard at time t, user talking at time t,
+    // seconds recorded, expected, live requests); the control counts as seen once visible.
+    let always = { (_: Double) in true }
+    let cases: [(String, (Double) -> Bool, (Double) -> Bool, (Double) -> Bool, Int, Bool, Int)] = [
+        ("vanished mid-meeting", { (2.0..<7.0).contains($0) }, { _ in false }, always, 10, true, 1),
+        ("before joining", { $0 < 6.0 }, { _ in false }, always, 10, false, 0),
+        ("listen only", { _ in false }, { _ in false }, always, 12, false, 0),
+        ("never found", always, always, always, 12, true, 0),
+        // Gone until Stop while the others still talk, as during a screen share: the meeting went on.
+        ("gone while the meeting goes on", { $0 >= 3.0 }, always, always, 10, true, 1),
+        // The others heard at the start of a share, then only the user presenting.
+        ("presenting", { $0 >= 3.0 }, { (3.0..<7.0).contains($0) }, { $0 >= 8.0 }, 30, true, 1),
+        // Gone until Stop and silence from Zoom: the user left the meeting and kept talking.
+        ("left the meeting", { $0 >= 3.0 }, { $0 < 3.0 }, always, 10, false, 0),
+        // Talk long after the others were last heard is not the meeting's.
+        ("talked long after", { $0 >= 3.0 }, { (3.0..<7.0).contains($0) }, { $0 >= 45.0 }, 60, false, 0),
     ]
-    for (name, missing, seconds, expected, requests) in cases {
+    for (name, missing, heard, talking, seconds, expected, requests) in cases {
         let directory = folder.appendingPathComponent(name)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let capture = Capture(directory: directory, realtime: false)
@@ -342,16 +351,19 @@ func checkSafetyCopy(_ folder: URL) async throws {
         for index in 0..<(seconds * 10) {
             clock = Double(index + 1) * 0.1
             polls.advance(to: clock)
-            capture.receive(try sample(frequency: 880, start: Int64(48_000_000 + index * 4800)), of: .microphone)
+            capture.receive(try sample(frequency: heard(clock) ? 440 : 0, start: Int64(48_000_000 + index * 4800),
+                                       channels: 2, float: true, interleaved: false), of: .audio)
+            capture.receive(try sample(frequency: talking(clock) ? 880 : 0, start: Int64(48_000_000 + index * 4800)), of: .microphone)
         }
         capture.releaseVoice(flushing: true)
+        await capture.zoom.finish()
         await capture.mic.finish()
         await capture.raw.finish()
         try check(!capture.hadVoice, "\(name): voice kept while muted")
         try check(capture.needsSafetyCopy == expected, "\(name): safety copy \(capture.needsSafetyCopy), expected \(expected)")
         try check(asked == requests, "\(name): live requests \(asked), expected \(requests)")
     }
-    print("PASS: the whole microphone is kept only when the mute detector failed")
+    print("PASS: the whole microphone is kept only when the mute detector failed, also when it never came back mid-meeting")
 }
 
 /// Delivery stalls for 2.5 s and the backlog arrives at once: nothing is lost or moved.
@@ -893,6 +905,8 @@ func checkBoundedOperations() async throws {
         try await checkSpeakerTimeline(folder.appendingPathComponent("speakers"))
         try checkSpeakerLog(folder.appendingPathComponent("speaker-log"))
         try await checkCaptureEcho(folder.appendingPathComponent("capture-echo"))
+        try await checkCutShort(folder.appendingPathComponent("cut-short"))
+        try await checkTrim(folder.appendingPathComponent("trim"))
         try await checkLateStart(folder.appendingPathComponent("late-start"))
         try await checkDrift(folder.appendingPathComponent("drift"))
         try await checkOffsets(folder.appendingPathComponent("offsets"))

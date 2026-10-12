@@ -12,6 +12,16 @@ build_arch=$(uname -m)
 xcrun swiftc -target "$build_arch-apple-macos15.0" -module-cache-path "$PWD/build.noindex/packaging/cache" \
   scripts/InstallerArtwork.swift -o build.noindex/packaging/artwork
 build.noindex/packaging/artwork "$PWD/build.noindex/installer/.background/installer.png"
+identity=$(security find-identity -v -p codesigning | sed -n 's/.*"\(Developer ID Application: .*\)"$/\1/p' | head -1)
+if [[ -n "$identity" ]]; then
+  # Notarized and stapled on its own first, the app opens without a network check even
+  # once copied out of the installer.
+  # Credentials: xcrun notarytool store-credentials zoom-audio-recorder --apple-id … --team-id …
+  ditto -c -k --keepParent "build.noindex/Zoom Audio Recorder.app" build.noindex/packaging/app.zip
+  xcrun notarytool submit build.noindex/packaging/app.zip --keychain-profile zoom-audio-recorder --wait
+  xcrun stapler staple "build.noindex/Zoom Audio Recorder.app"
+fi
+rm -rf "build.noindex/installer/Zoom Audio Recorder.app"
 ditto "build.noindex/Zoom Audio Recorder.app" "build.noindex/installer/Zoom Audio Recorder.app"
 [[ -L build.noindex/installer/Applications ]] || ln -s /Applications build.noindex/installer/Applications
 cp "build.noindex/Zoom Audio Recorder.app/Contents/Resources/AppIcon.icns" build.noindex/installer/.VolumeIcon.icns
@@ -28,10 +38,8 @@ trap - EXIT
 mkdir -p "${destination:h}"
 hdiutil convert -ov build.noindex/installer-rw.dmg -format UDZO -imagekey zlib-level=9 -o "$destination"
 hdiutil verify "$destination"
-identity=$(security find-identity -v -p codesigning | sed -n 's/.*"\(Developer ID Application: .*\)"$/\1/p' | head -1)
 if [[ -n "$identity" ]]; then
-  # Notarized and stapled, the installer and the app open without a trip to Privacy & Security.
-  # Credentials: xcrun notarytool store-credentials zoom-audio-recorder --apple-id … --team-id …
+  # The installer too: notarized and stapled, it opens without a trip to Privacy & Security.
   codesign --force --timestamp --sign "$identity" "$destination"
   xcrun notarytool submit "$destination" --keychain-profile zoom-audio-recorder --wait
   xcrun stapler staple "$destination"

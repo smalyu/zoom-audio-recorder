@@ -738,6 +738,12 @@ private final class ZoomMuteWatcher {
     private var scan: [(element: AXUIElement, depth: Int, inToolbar: Bool, root: Int)] = []
     private var scanBudget = 0
     private static let scanSlice = 0.008
+    /// Zoom's meeting window, where its controls appear while the pointer is over it.
+    private var meetingWindow: AXUIElement?
+    private var lastLook = -Double.infinity
+    /// The window's children that are not the button, not asked again for ten seconds.
+    private var notButtons: [AXUIElement] = []
+    private var notButtonsSince = -Double.infinity
 
     init(pid: pid_t, bundleURL: URL?, onChange: @escaping (ZoomMuteState) -> Void) {
         application = AXUIElementCreateApplication(pid)
@@ -853,6 +859,19 @@ private final class ZoomMuteWatcher {
         let time = Self.now()
         var missingMenu = !controls.contains(where: \.isMenu)
         var missingButton = !controls.contains { !$0.isMenu }
+        // The meeting controls show once the pointer is over the window, and a click on the
+        // microphone soon follows, while the menu command can take a second to change: the
+        // window's own children are looked through twice a second, a light check, besides
+        // the full search below.
+        if missingButton, scan.isEmpty, time - lastLook >= 0.5 {
+            lastLook = time
+            if let button = meetingButton() {
+                controls.append(Control(element: button.element, inToolbar: false, isMenu: false))
+                shown[.label] = button.label
+                if let tip = button.tip { shown[.tip] = tip }
+                missingButton = false
+            }
+        }
         // Look for a missing control at once when the last one vanished, a second after the
         // last search while none is found, and otherwise every ten seconds: a search loads
         // Zoom's main thread.
@@ -905,6 +924,39 @@ private final class ZoomMuteWatcher {
         }
         if !scan.isEmpty { lastScan = time }
         return indicators.update(shown, at: time)
+    }
+
+    /// The microphone button among the meeting window's children, where Zoom puts its
+    /// meeting controls while they are shown.
+    private func meetingButton() -> (element: AXUIElement, label: ZoomMuteState, tip: ZoomMuteState?)? {
+        if meetingWindow == nil {
+            meetingWindow = (attribute(kAXWindowsAttribute as CFString, of: application) as? [AXUIElement])?
+                .first { attribute(kAXIdentifierAttribute as CFString, of: $0) as? String == "zm.meeting.window.main" }
+        }
+        guard let window = meetingWindow else { return nil }
+        guard let children = attribute(kAXChildrenAttribute as CFString, of: window) as? [AXUIElement] else {
+            meetingWindow = nil
+            return nil
+        }
+        if Self.now() - notButtonsSince > 10 {
+            notButtons = []
+            notButtonsSince = Self.now()
+        }
+        var checked: [AXUIElement] = []
+        for child in children {
+            if notButtons.contains(where: { CFEqual($0, child) }) {
+                checked.append(child)
+                continue
+            }
+            switch reading(of: child, inToolbar: false) {
+            case let .found(label, tip): return (child, label, tip)
+            // A busy Zoom is not waited for, one child after another: look again next time.
+            case .busy: return nil
+            case .none: checked.append(child)
+            }
+        }
+        notButtons = checked
+        return nil
     }
 
     /// Reads one control in a single round trip: its label, and a button's tooltip.
@@ -1069,6 +1121,9 @@ final class ZoomSpeakerWatcher {
     private var lastSearch = -Double.infinity
     /// Names by video description, which changes only with the microphone or camera state.
     private var names: [String: String] = [:]
+    /// The meeting window's children at the last full read, with the videos among them.
+    private var known: [(element: AXUIElement, tile: ZoomTile?)] = []
+    private var lastFullRead = -Double.infinity
     /// Descriptions no child label matched, by when that was tried: phone dial-ins have none.
     private var unnamed: [String: Double] = [:]
     private var previous: [ZoomTile]?
@@ -1138,20 +1193,41 @@ final class ZoomSpeakerWatcher {
         guard let window else { return [] }
         var value: CFTypeRef?
         if AXUIElementCopyAttributeValue(window, kAXChildrenAttribute as CFString, &value) == .cannotComplete { return nil }
+        let children = value as? [AXUIElement] ?? []
+        // In gallery view a new speaker only changes the children's order: within a second of a
+        // full read, the same children are put in their new order without asking Zoom about
+        // each. Speaker view, where the large video may show someone else, is always read.
+        let areas = known.compactMap { $0.tile?.area }
+        let gallery = areas.count > 1 && Set(areas).count == 1
+        if gallery, Self.now() - lastFullRead < 1, children.count == known.count {
+            let reordered = children.map { child in known.first { CFEqual($0.element, child) } }
+            if reordered.allSatisfy({ $0 != nil }) {
+                let tiles = reordered.compactMap { $0?.tile }
+                if !tiles.isEmpty { return tiles }
+            }
+        }
         var tiles: [ZoomTile] = []
-        for child in value as? [AXUIElement] ?? [] {
+        var read: [(element: AXUIElement, tile: ZoomTile?)] = []
+        for child in children {
             var values: CFArray?
             let error = AXUIElementCopyMultipleAttributeValues(child, Self.attributes, AXCopyMultipleAttributeOptions(rawValue: 0), &values)
             // A video left unread may be the speaker's: the whole look counts as no answer.
             if error == .cannotComplete { return nil }
             guard error == .success, let array = values as? [AnyObject], array.count == 3,
-                  array[0] as? String == "AXTabGroup", let description = array[1] as? String else { continue }
+                  array[0] as? String == "AXTabGroup", let description = array[1] as? String else {
+                read.append((child, nil))
+                continue
+            }
             var size = CGSize.zero
             if CFGetTypeID(array[2]) == AXValueGetTypeID() {
                 AXValueGetValue(unsafeBitCast(array[2], to: AXValue.self), .cgSize, &size)
             }
-            tiles.append(ZoomTile(name: name(of: child, described: description), area: size.width * size.height))
+            let tile = ZoomTile(name: name(of: child, described: description), area: size.width * size.height)
+            tiles.append(tile)
+            read.append((child, tile))
         }
+        known = read
+        lastFullRead = Self.now()
         // A closed window, or a new one after a meeting ends: look for it again.
         if tiles.isEmpty { self.window = nil }
         return tiles
@@ -1322,28 +1398,38 @@ final class SpeakerLog {
     }
 
     /// The timeline for the recording's description tag, as JSON:
-    /// {"me": [[start, end], ...], "speakers": [[seconds, name or null], ...]}.
+    /// {"me": [[start, end], ...], "speakers": [[seconds, name or null], ...]}, in seconds
+    /// from `start`, where the saved file begins in the recording, up to `end`, where it ends.
     /// Nil when Zoom never showed a speaker and the user never spoke.
-    static func timeline(in directory: URL) -> String? {
-        guard let text = try? String(contentsOf: SpeakerLog(directory: directory).url, encoding: .utf8) else { return nil }
+    static func timeline(in directory: URL, from start: Double = 0, to end: Double = .infinity) -> String? {
+        // Decoded leniently: a power cut can end the file inside a letter of a name.
+        guard let data = try? Data(contentsOf: SpeakerLog(directory: directory).url) else { return nil }
+        let text = String(decoding: data, as: UTF8.self)
         var changes: [(time: Double, name: String?)] = []
         var me: [[Decimal]] = []
         for line in text.split(separator: "\n") {
             // A crash can cut the last line short.
+            // A damaged line, including a number no recording could reach, is skipped.
+            let plausible = { (value: Any) -> Double? in (value as? Double).flatMap { abs($0) < 1e7 ? $0 : nil } }
             guard let entry = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [Any], entry.count == 3,
-                  let time = entry[1] as? Double else { continue }
-            if entry[0] as? String == "me", let end = entry[2] as? Double {
-                me.append([seconds(time), seconds(end)])
-            } else if entry[0] as? String == "zoom" {
+                  let time = plausible(entry[1]) else { continue }
+            if entry[0] as? String == "me", let until = plausible(entry[2]) {
+                if until > start, time < end { me.append([seconds(max(0, time - start)), seconds(min(until, end) - start)]) }
+            } else if entry[0] as? String == "zoom", time < end {
                 changes.append((time, entry[2] as? String))
             }
         }
-        // A poll that ends after the next connection's first one can land out of order.
-        var speakers: [[Any]] = []
+        // A poll that ends after the next connection's first one can land out of order. Whoever
+        // Zoom showed when the file begins is its first speaker.
+        var shown: [(time: Double, name: String?)] = []
         let ordered = changes.enumerated().sorted { ($0.element.time, $0.offset) < ($1.element.time, $1.offset) }.map(\.element)
-        for change in ordered where speakers.last.map({ $0[1] as? String != change.name }) ?? true {
-            speakers.append([seconds(change.time), change.name ?? NSNull()])
+        for change in ordered {
+            let time = max(0, change.time - start)
+            if shown.last?.time == time { shown.removeLast() }
+            if let last = shown.last, last.name == change.name { continue }
+            shown.append((time, change.name))
         }
+        let speakers = shown.map { [seconds($0.time), $0.name ?? NSNull()] as [Any] }
         guard speakers.contains(where: { $0[1] is String }) || !me.isEmpty,
               let data = try? JSONSerialization.data(withJSONObject: ["speakers": speakers, "me": me],
                                                      options: [.sortedKeys, .withoutEscapingSlashes]) else { return nil }
@@ -1444,6 +1530,12 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
     private var speechSeconds = 0.0
     private var speechRun = 0.0
     private var missingSpeech = 0.0
+    /// When participants were heard, and for how long, in the last 30 s while Zoom's
+    /// microphone control was gone: a meeting going on without it, as during a screen share.
+    private var heardWhileMissing: [(time: Double, seconds: Double)] = []
+    /// Speech silenced while the control was gone and the meeting went on: a whole microphone
+    /// is saved for it even if the control never comes back, but not for talk after a meeting.
+    private var silencedInMeeting = 0.0
     private var uncertainSeconds = 0.0
     private(set) var uncertainVoice = false
     private(set) var controlSeen = false
@@ -1453,6 +1545,8 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
     private(set) var hadVoice = false
     /// Whether Zoom audio has arrived since the current stream started.
     private(set) var receivingZoom = false
+    /// Host time of the latest microphone audio on the current stream; nil before any.
+    private(set) var lastMicrophone: Double?
 
     init(directory: URL, realtime: Bool = true) {
         zoom = AudioTrack(name: "zoom", directory: directory, channels: 2, realtime: realtime)
@@ -1463,7 +1557,9 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
 
     /// Speech that may be the user's voice did not reach the recording: Zoom's control
     /// vanished mid-meeting while they talked, or was never found at all.
-    var needsSafetyCopy: Bool { uncertainVoice || (!controlSeen && speechSeconds > 10) }
+    var needsSafetyCopy: Bool {
+        uncertainVoice || (!controlSeen && speechSeconds > 10) || silencedInMeeting > 3
+    }
 
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer,
                 of type: SCStreamOutputType) {
@@ -1492,6 +1588,12 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
             receivingZoom = true
             do {
                 let buffer = try zoomPCM.convert(sample)
+                if !control().missing {
+                    heardWhileMissing.removeAll()
+                } else if buffer.level > Self.speechLevel {
+                    heardWhileMissing.append((now().seconds, Double(buffer.frameLength) / AudioTrack.rate))
+                    forgetOldHearing()
+                }
                 echo.addReference(buffer, at: position)
                 voiceSpans.addZoom(buffer, at: position)
                 zoom.append(buffer, at: position)
@@ -1499,6 +1601,7 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
                 echo.ready().forEach { hold($0.buffer, at: $0.position) }
             } catch { report("Звук Zoom: \(error.localizedDescription)") }
         case .microphone:
+            lastMicrophone = now().seconds
             receiveVoice(sample, at: position)
         default:
             return
@@ -1554,17 +1657,31 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
         if !status.missing {
             uncertainSeconds += missingSpeech
             missingSpeech = 0
+            silencedInMeeting = 0
         }
+        forgetOldHearing()
         speechRun = speech ? speechRun + length : 0
         guard speechRun >= Self.speechRun else { return }
         // A run just long enough counts in full.
         let counted = speechRun - length < Self.speechRun ? speechRun : length
         speechSeconds += counted
-        if !kept, status.missing, controlSeen { missingSpeech += counted }
+        if !kept, status.missing, controlSeen {
+            missingSpeech += counted
+            if heardWhileMissing.reduce(0, { $0 + $1.seconds }) > 3 { silencedInMeeting += counted }
+        }
+        // Marked at once, so a crash later in the meeting still delivers the whole microphone.
+        if silencedInMeeting > 3, !uncertainVoice {
+            uncertainVoice = true
+            onUncertainVoice()
+        }
         if uncertainSeconds > 3, !uncertainVoice {
             uncertainVoice = true
             onUncertainVoice()
         }
+    }
+
+    private func forgetOldHearing() {
+        while let first = heardWhileMissing.first, now().seconds - first.time > 30 { heardWhileMissing.removeFirst() }
     }
 
     /// Silences every frame outside `ranges`; true when some voice remains.
@@ -1616,6 +1733,7 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
         streamError = nil
         lastProblem = nil
         receivingZoom = false
+        lastMicrophone = nil
         current = stream
         if stream == nil {
             muteTimeline = { _ in MuteTimeline() }
@@ -1776,6 +1894,7 @@ struct ZoomAudio {
         var zoomQuit = false
         var connectedAt = Date()
         var zoomAudio = true
+        var lastStall = Date.distantPast
 
         func disconnect() async {
             if let stream { await waitAtMost(5) { try? await stream.stopCapture() } }
@@ -1841,7 +1960,16 @@ struct ZoomAudio {
                 events(.zoomAudio(receiving))
             }
             let broken = capture.queue.sync { capture.takeStreamError() } != nil
-            if broken || zoom?.isTerminated == true {
+            // A stream can stop delivering without an error, as after the Mac sleeps: five
+            // seconds without microphone audio, once it has flowed, reconnect it, at most once a
+            // minute. A stream that never brings any, as with no microphone, is left alone.
+            let silent = capture.queue.sync { capture.lastMicrophone.map { capture.now().seconds - $0 } } ?? 0
+            let stalled = silent > 5 && Date().timeIntervalSince(lastStall) > 60
+            if stalled {
+                lastStall = Date()
+                recorderLog.error("No microphone audio for \(Int(silent)) s; reconnecting")
+            }
+            if broken || stalled || zoom?.isTerminated == true {
                 recorderLog.notice("Capture interrupted; reconnecting")
                 await disconnect()
                 capture.queue.sync { capture.noteSpeaker(nil, at: capture.now().seconds) }

@@ -33,7 +33,7 @@ func checkEchoCanceller() throws {
         for (offset, sample) in samples.enumerated() { result.floatChannelData![0][offset] = sample }
         return result
     }
-    /// `slipping`: the microphone's positions slip by a frame now and then, as a 44.1 kHz one does.
+    /// `slipping`: timestamps jitter, the microphone's by up to 20 frames and Zoom's by a few.
     func run(_ microphone: [Float], slipping: Bool = false) throws -> [Float] {
         let canceller = EchoCanceller()
         var output = [Float](repeating: 0, count: microphone.count)
@@ -54,10 +54,11 @@ func checkEchoCanceller() throws {
         // The microphone in 960-frame buffers; Zoom's audio in 1024-frame ones, a little behind.
         var zoomAt = 0
         for (number, start) in stride(from: 0, to: microphone.count, by: 960).enumerated() {
-            let slip = slipping ? [0, 1, 0, -1, 0, 1, -1][number % 7] : 0
+            let slip = slipping ? [0, 20, 0, -20, 0, 1, -1][number % 7] : 0
             try take(canceller.process(buffer(microphone[start..<min(start + 960, microphone.count)]), at: Int64(start + slip)))
             while zoomAt + 1024 <= start {
-                canceller.addReference(buffer(far[zoomAt..<zoomAt + 1024]), at: Int64(zoomAt))
+                let jitter = slipping ? [0, 3, -3, 1, 0, -2, 2][(zoomAt / 1024) % 7] : 0
+                canceller.addReference(buffer(far[zoomAt..<zoomAt + 1024]), at: Int64(zoomAt + jitter))
                 zoomAt += 1024
                 try take(canceller.ready())
             }
@@ -83,7 +84,7 @@ func checkEchoCanceller() throws {
     // Headphones put on mid-call: the filter forgets the speakers instead of adding them to the voice.
     let unplugged = try run((0..<far.count).map { $0 < 8 * rate ? echo[$0] : near[$0] })
     try check(db(near, zip(unplugged, near).map(-), 12..<16) > 40, "the voice changed after the echo stopped")
-    // A microphone whose positions slip by a frame keeps cancelling.
+    // Jittering timestamps of the microphone and of Zoom keep it cancelling.
     let slipped = try run(echo, slipping: true)
     try check(db(echo, slipped, 6..<12) > 15, "with slipping positions echo removed by only \(db(echo, slipped, 6..<12)) dB")
     // A broken sample neither stops the filter nor spreads.

@@ -4,6 +4,10 @@ cd "${0:A:h}/.."
 cache_dir="$(mktemp -d)"
 trap 'rm -rf "$cache_dir"' EXIT
 app="$PWD/build.noindex/Zoom Audio Recorder.app"
+# Built from scratch: nothing of an earlier build (a stapled ticket, a stale resource)
+# stays in the bundle, and the bundle gets a new date, on which macOS keys its icon
+# cache; an update with the old date kept showing an earlier version's icon.
+rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp Resources/Info.plist "$app/Contents/Info.plist"
 for arch in arm64 x86_64; do
@@ -33,7 +37,4 @@ if ! xcrun actool --compile "$app/Contents/Resources" --platform macosx \
   exit 1
 fi
 zsh scripts/sign.sh "$app"
-# A new date on the bundle itself: macOS keys its icon cache on it, and an update with the
-# old date would keep showing whatever icon an earlier version had.
-touch "$app"
 echo "Готово: $app"
