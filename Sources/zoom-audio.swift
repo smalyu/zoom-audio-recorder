@@ -1437,6 +1437,8 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
     private var expected: [SCStreamOutputType: Int64] = [:]
     private var voice: [(buffer: AVAudioPCMBuffer, position: Int64, captured: Double, arrival: Double, speech: Bool)] = []
     private var voiceSpans = VoiceSpans()
+    private let echo = EchoCanceller()
+    private var recentLevels: [(energy: Float, frames: Int)] = []
     /// A speaker Zoom showed before the first audio placed the timeline.
     private var pendingSpeaker: (name: String?, time: Double)?
     private var speechSeconds = 0.0
@@ -1490,8 +1492,11 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
             receivingZoom = true
             do {
                 let buffer = try zoomPCM.convert(sample)
+                echo.addReference(buffer, at: position)
                 voiceSpans.addZoom(buffer, at: position)
                 zoom.append(buffer, at: position)
+                // Microphone audio that waited for this moment of Zoom's audio.
+                echo.ready().forEach { hold($0.buffer, at: $0.position) }
             } catch { report("Звук Zoom: \(error.localizedDescription)") }
         case .microphone:
             receiveVoice(sample, at: position)
@@ -1517,6 +1522,7 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
     /// Writes held microphone audio in order, each buffer once the readings around it
     /// are in. Frames outside the user's voice are silenced first.
     func releaseVoice(flushing: Bool = false) {
+        if flushing { echo.drain().forEach { hold($0.buffer, at: $0.position) } }
         guard let first = voice.first else { return }
         let now = now().seconds
         let timeline = muteTimeline(first.captured - 1)
@@ -1627,10 +1633,20 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
             buffer = quiet
         }
         if let copy = buffer.dropping(frames: 0) { raw.append(copy, at: position) }
+        echo.process(buffer, at: position).forEach { hold($0.buffer, at: $0.position) }
+        releaseVoice()
+    }
+
+    /// Holds echo-free microphone audio until the mute readings around it are in.
+    private func hold(_ buffer: AVAudioPCMBuffer, at position: Int64) {
         // Decided by when the audio was captured, never by when it arrived.
         let captured = (origin?.host.seconds ?? now().seconds) + Double(position) / AudioTrack.rate
-        voice.append((buffer, position, captured, now().seconds, buffer.level > Self.speechLevel))
-        releaseVoice()
+        // Speech is judged over the last 0.1 s: a 10 ms block can fall between two sounds of a word.
+        let frames = Int(buffer.frameLength)
+        recentLevels.append((buffer.level * buffer.level * Float(frames), frames))
+        while recentLevels.count > 1, recentLevels.dropFirst().reduce(0, { $0 + $1.frames }) >= 4800 { recentLevels.removeFirst() }
+        let energy = recentLevels.reduce(0) { $0 + $1.energy } / Float(max(recentLevels.reduce(0) { $0 + $1.frames }, 1))
+        voice.append((buffer, position, captured, now().seconds, energy.squareRoot() > Self.speechLevel))
     }
 
     /// Timeline position in 48 kHz frames. Sample clocks are trusted while they run

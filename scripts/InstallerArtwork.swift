@@ -31,8 +31,6 @@ arrow.lineCapStyle = .round
 arrow.lineJoinStyle = .round
 NSColor(calibratedRed: 0.22, green: 0.48, blue: 0.95, alpha: 1).setStroke()
 arrow.stroke()
-text("Если macOS не открывает приложение: «Системные настройки» →\n«Конфиденциальность и безопасность» → «Все равно открыть».",
-     top: 332, size: 11, weight: .regular, color: .init(calibratedWhite: 0.45, alpha: 1))
 image.unlockFocus()
 let bitmap = NSBitmapImageRep(data: image.tiffRepresentation!)!
 try bitmap.representation(using: .png, properties: [:])!.write(to: URL(fileURLWithPath: CommandLine.arguments[1]))

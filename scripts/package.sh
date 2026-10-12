@@ -28,4 +28,13 @@ trap - EXIT
 mkdir -p "${destination:h}"
 hdiutil convert -ov build.noindex/installer-rw.dmg -format UDZO -imagekey zlib-level=9 -o "$destination"
 hdiutil verify "$destination"
+identity=$(security find-identity -v -p codesigning | sed -n 's/.*"\(Developer ID Application: .*\)"$/\1/p' | head -1)
+if [[ -n "$identity" ]]; then
+  # Notarized and stapled, the installer and the app open without a trip to Privacy & Security.
+  # Credentials: xcrun notarytool store-credentials zoom-audio-recorder --apple-id … --team-id …
+  codesign --force --timestamp --sign "$identity" "$destination"
+  xcrun notarytool submit "$destination" --keychain-profile zoom-audio-recorder --wait
+  xcrun stapler staple "$destination"
+  spctl --assess --type open --context context:primary-signature --verbose "$destination"
+fi
 echo "Установщик: $destination"

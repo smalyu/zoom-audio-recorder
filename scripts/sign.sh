@@ -2,8 +2,11 @@
 set -euo pipefail
 cd "${0:A:h}/.."
 app="$1"
-if [[ -n "${SIGNING_IDENTITY:-}" ]]; then
-  codesign --force --sign "$SIGNING_IDENTITY" --options runtime \
+# A Developer ID in the keychain signs builds that can be notarized; without one, a
+# private local identity keeps macOS permissions across rebuilds.
+identity="${SIGNING_IDENTITY:-$(security find-identity -v -p codesigning | sed -n 's/.*"\(Developer ID Application: .*\)"$/\1/p' | head -1)}"
+if [[ -n "$identity" ]]; then
+  codesign --force --timestamp --sign "$identity" --options runtime \
     --entitlements Resources/Entitlements.plist "$app"
 else
   keychain=$(python3 scripts/prepare_local_signing.py)
