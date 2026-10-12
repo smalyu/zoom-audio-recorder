@@ -33,4 +33,7 @@ if ! xcrun actool --compile "$app/Contents/Resources" --platform macosx \
   exit 1
 fi
 zsh scripts/sign.sh "$app"
+# A new date on the bundle itself: macOS keys its icon cache on it, and an update with the
+# old date would keep showing whatever icon an earlier version had.
+touch "$app"
 echo "Готово: $app"
