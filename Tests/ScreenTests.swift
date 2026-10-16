@@ -72,53 +72,70 @@ func checkMeetingWindow() throws {
     try check(!meetingOnly.sharing && meetingOnly.display == nil, "a meeting without a share taken for one: \(meetingOnly)")
     // The user switching desktops with Zoom's meeting window on one of them, again and again: the window is
     // recorded on any desktop, by its place while Accessibility names it and as the window remembered while
-    // it does not; a window of Zoom's kept off the screen at the same place is not taken for it; every
+    // it does not; another window of Zoom's at the same place, in sight or not, is not taken for it; every
     // pause says why.
     let screen = [(id: CGDirectDisplayID(1), frame: displays[0])]
     let place = CGRect(x: 100, y: 80, width: 1000, height: 700)
+    let named = ZoomMeetingWindow.Lookup.window(place, title: "Zoom Meeting")
     let meetingWindow = ZoomWindow(id: 100, title: "Zoom Meeting", layer: 0, frame: place, onScreen: true)
     let elsewhere = ZoomWindow(id: 100, title: "Zoom Meeting", layer: 0, frame: place, onScreen: false)
+    let homeWindow = ZoomWindow(id: 102, title: "Zoom Workplace", layer: 0, frame: place, onScreen: true)
     let ghost = ZoomWindow(id: 101, title: "", layer: 0, frame: place, onScreen: false)
     let fullScreen = ZoomWindow(id: 100, title: "Zoom Meeting", layer: 0, frame: displays[0], onScreen: true)
     let fullScreenElsewhere = ZoomWindow(id: 100, title: "Zoom Meeting", layer: 0, frame: displays[0], onScreen: false)
     typealias Step = (windows: [ZoomWindow], lookup: ZoomMeetingWindow.Lookup, hidden: Bool,
                       target: ScreenCapture.Target?, pause: ScreenCapture.Pause?)
     let steps: [Step] = [
-        ([ghost, meetingWindow], .window(place), false, .window(100), nil),
+        ([homeWindow, ghost, meetingWindow], named, false, .window(100), nil),
         ([ghost, elsewhere], .missing, false, .window(100), nil),
         ([ghost, meetingWindow], .missing, false, .window(100), nil),
-        ([ghost, elsewhere], .window(place), false, .window(100), nil),
-        ([ghost, meetingWindow], .window(place), false, .window(100), nil),
-        ([fullScreen], .window(displays[0]), false, .window(100), nil),
+        ([ghost, elsewhere], named, false, .window(100), nil),
+        ([ghost, meetingWindow], named, false, .window(100), nil),
+        ([fullScreen], .window(displays[0], title: "Zoom Meeting"), false, .window(100), nil),
         ([fullScreenElsewhere], .missing, false, .window(100), nil),
         ([fullScreen], .missing, false, .window(100), nil),
-        ([meetingWindow], .window(place), false, .window(100), nil),
+        ([meetingWindow], named, false, .window(100), nil),
         ([elsewhere], .minimized, false, nil, .minimized),
-        ([elsewhere], .window(place), true, nil, .hidden),
-        ([meetingWindow], .window(place), false, .window(100), nil),
+        // Minimized and left out by Accessibility: still minimized, until it is in sight again.
+        ([elsewhere], .missing, false, nil, .minimized),
+        ([meetingWindow], .missing, false, .window(100), nil),
+        ([elsewhere], named, true, nil, .hidden),
+        ([meetingWindow], named, false, .window(100), nil),
         ([ghost], .missing, false, nil, .noMeeting),
     ]
     var recording: ScreenCapture.Target?
     var remembered: CGWindowID?
+    var pause: ScreenCapture.Pause?
     for (index, step) in steps.enumerated() {
         let choice = ScreenCapture.decide(windows: step.windows, displays: screen, meeting: { step.lookup }, paused: { false },
-                                          recording: recording, remembered: remembered, hidden: step.hidden)
+                                          recording: recording, remembered: remembered, lastPause: pause, hidden: step.hidden)
         try check(choice.target == step.target && choice.pause == step.pause && !choice.sharing,
                   "desktop step \(index): \(String(describing: choice.target)), \(String(describing: choice.pause))")
         recording = choice.target
         remembered = choice.remembered
+        pause = choice.pause
     }
-    // A share starting, pausing, resuming, shrinking to one window and ending.
+    // Recording begun with the meeting window on another desktop, should Zoom name it there: the window
+    // so named, not another at the same place; none so named, nothing.
+    let begun = ScreenCapture.decide(windows: [ghost, elsewhere], displays: screen, meeting: { named }, paused: { false },
+                                     recording: nil, remembered: nil)
+    try check(begun.target == .window(100) && begun.remembered == 100, "another window taken for the meeting: \(begun)")
+    let unnamed = ScreenCapture.decide(windows: [ghost], displays: screen, meeting: { named }, paused: { false },
+                                       recording: nil, remembered: nil)
+    try check(unnamed.target == nil && unnamed.pause == .noMeeting, "a ghost taken for the meeting: \(unnamed)")
+    // A share starting, going on from another desktop, pausing, resuming, shrinking to one window and ending.
     let shareBar = ZoomWindow(id: 7, title: "zoom share toolbar window", layer: 97, frame: CGRect(x: 400, y: 0, width: 600, height: 60),
                               onScreen: true)
     let border = ZoomWindow(id: 8, title: "", layer: 96, frame: displays[0], onScreen: true)
+    let shareBarOff = ZoomWindow(id: 7, title: "zoom share toolbar window", layer: 97, frame: shareBar.frame, onScreen: false)
     let shares: [(windows: [ZoomWindow], paused: Bool, target: ScreenCapture.Target?, pause: ScreenCapture.Pause?)] = [
         ([meetingWindow], false, .window(100), nil), ([shareBar, border], false, .display(1), nil),
+        ([shareBarOff, elsewhere], false, .display(1), nil), ([shareBar, border], false, .display(1), nil),
         ([shareBar, border], true, nil, .sharePaused), ([shareBar, border], false, .display(1), nil),
         ([shareBar], false, nil, .sharingWindow), ([meetingWindow], false, .window(100), nil),
     ]
     for (index, step) in shares.enumerated() {
-        let choice = ScreenCapture.decide(windows: step.windows, displays: screen, meeting: { .window(place) },
+        let choice = ScreenCapture.decide(windows: step.windows, displays: screen, meeting: { named },
                                           paused: { step.paused }, recording: recording, remembered: remembered)
         try check(choice.target == step.target && choice.pause == step.pause,
                   "share step \(index): \(String(describing: choice.target)), \(String(describing: choice.pause))")

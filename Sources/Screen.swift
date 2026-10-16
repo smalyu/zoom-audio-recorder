@@ -233,8 +233,9 @@ struct ZoomWindow: Equatable {
 enum ZoomMeetingWindow {
     /// What Accessibility says about the meeting window.
     enum Lookup: Equatable {
-        /// Its frame in global screen coordinates, top left origin, as in the window list.
-        case window(CGRect)
+        /// Its frame in global screen coordinates, top left origin, and its title, as in the
+        /// window list.
+        case window(CGRect, title: String)
         case minimized
         /// No meeting window, no answer from a busy Zoom, or a window on another desktop, which
         /// Accessibility leaves out.
@@ -265,11 +266,11 @@ enum ZoomMeetingWindow {
         var extent = CGSize.zero
         AXValueGetValue(unsafeBitCast(position, to: AXValue.self), .cgPoint, &origin)
         AXValueGetValue(unsafeBitCast(size, to: AXValue.self), .cgSize, &extent)
-        return .window(CGRect(origin: origin, size: extent))
+        return .window(CGRect(origin: origin, size: extent), title: attribute(kAXTitleAttribute, of: window) as? String ?? "")
     }
 
     static func frame(pid: pid_t) -> CGRect? {
-        if case let .window(frame) = lookup(pid: pid) { return frame }
+        if case let .window(frame, _) = lookup(pid: pid) { return frame }
         return nil
     }
 
@@ -510,10 +511,11 @@ final class ScreenCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
     /// paused, or Zoom's meeting window, on whichever desktop it is. A shared window is not recorded:
     /// which one it is cannot be known. `windows` are all of Zoom's windows; `paused` is asked only
     /// while the user shares; `remembered` is the meeting window last found, which stands in while
-    /// Accessibility says nothing certain, as about a window on another desktop.
+    /// Accessibility says nothing certain, as about a window on another desktop; `lastPause` is the
+    /// answer given last time.
     static func decide(windows: [ZoomWindow], displays: [(id: CGDirectDisplayID, frame: CGRect)],
                        meeting: () -> ZoomMeetingWindow.Lookup, paused: () -> Bool, recording: Target?,
-                       remembered: CGWindowID?, hidden: Bool = false)
+                       remembered: CGWindowID?, lastPause: Pause? = nil, hidden: Bool = false)
         -> (target: Target?, pause: Pause?, sharing: Bool, remembered: CGWindowID?) {
         let shown = windows.filter(\.onScreen)
         let share = ZoomMeetingWindow.share(windows: shown.map { ($0.title, $0.layer, $0.frame) }, displays: displays.map(\.frame))
@@ -522,18 +524,26 @@ final class ScreenCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
             guard !paused() else { return (nil, .sharePaused, true, remembered) }
             return (.display(displays[index].id), nil, true, remembered)
         }
+        // Zoom's share windows kept off the screen, as while the user is on another desktop of
+        // the display they share, keep that display recorded.
+        if case .display? = recording, windows.contains(where: { ZoomMeetingWindow.shareWindows.contains($0.title.lowercased()) }) {
+            guard !paused() else { return (nil, .sharePaused, true, remembered) }
+            return (recording, nil, true, remembered)
+        }
         // A hidden Zoom's windows are still listed, but show nothing.
         if hidden { return (nil, .hidden, false, remembered) }
         let candidates = windows.filter { $0.layer == 0 }
         let present = { (id: CGWindowID) in candidates.contains { $0.id == id } }
+        let shownNow = { (id: CGWindowID) in candidates.contains { $0.id == id && $0.onScreen } }
         switch meeting() {
-        case let .window(frame):
-            // The window at that place: one in sight first, then the one remembered, so that a
-            // window of Zoom's kept off the screen at the same place is not taken for it.
+        case let .window(frame, title):
+            // The window at that place: one in sight, so named first, then the one remembered, then
+            // one so named, so that another window of Zoom's kept at the same place is not taken for it.
             let match = { (among: (ZoomWindow) -> Bool) -> CGWindowID? in
                 ZoomMeetingWindow.match(frame, in: candidates.filter(among).map { ($0.id, $0.frame) })
             }
-            if let id = match(\.onScreen) ?? match({ $0.id == remembered }) ?? match({ _ in true }) {
+            if let id = match({ $0.onScreen && $0.title == title }) ?? match(\.onScreen) ?? match({ $0.id == remembered })
+                ?? match({ $0.title == title }) {
                 return (.window(id), nil, false, id)
             }
         case .minimized:
@@ -542,19 +552,21 @@ final class ScreenCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
             // No answer, as from a busy Zoom or about a window on another desktop: the window
             // recorded goes on while it exists.
             if case let .window(id)? = recording, present(id) { return (recording, nil, false, remembered) }
+            // A minimized window may be left out as well: it stays minimized until it is in sight.
+            if lastPause == .minimized, let remembered, !shownNow(remembered) { return (nil, .minimized, false, remembered) }
         }
         // Accessibility says nothing certain: the meeting window last found is recorded while it exists.
         if let remembered, present(remembered) { return (.window(remembered), nil, false, remembered) }
         return (nil, .noMeeting, false, remembered)
     }
 
-    private func choose(pid: pid_t, recording: Target?, remembered: CGWindowID?)
+    private func choose(pid: pid_t, recording: Target?, remembered: CGWindowID?, lastPause: Pause?)
         -> (target: Target?, pause: Pause?, windows: [ZoomWindow], sharing: Bool, remembered: CGWindowID?) {
         let windows = ZoomMeetingWindow.windows(pid: pid)
         let lookup = ZoomMeetingWindow.lookup(pid: pid)
         let choice = Self.decide(windows: windows, displays: ZoomMeetingWindow.displays(), meeting: { lookup },
                                  paused: { ZoomMeetingWindow.sharePaused(pid: pid) }, recording: recording, remembered: remembered,
-                                 hidden: NSRunningApplication(processIdentifier: pid)?.isHidden == true)
+                                 lastPause: lastPause, hidden: NSRunningApplication(processIdentifier: pid)?.isHidden == true)
         return (choice.target, choice.pause, windows, choice.sharing, choice.remembered)
     }
 
@@ -659,7 +671,7 @@ final class ScreenCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
                     nextLook = Date().addingTimeInterval(1)
                     // No Zoom, no picture: a display is never recorded without Zoom sharing it.
                     let pid = ZoomAudio.runningZoom()?.processIdentifier
-                    let choice = pid.map { choose(pid: $0, recording: target, remembered: remembered) }
+                    let choice = pid.map { choose(pid: $0, recording: target, remembered: remembered, lastPause: pause) }
                         ?? (target: nil, pause: .noMeeting, windows: [], sharing: false, remembered: nil)
                     pause = choice.pause
                     remembered = choice.remembered
