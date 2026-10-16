@@ -424,8 +424,9 @@ final class ScreenCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
     private let reshaped = Locked<CGSize?>(nil)
     /// Host time of the stream's last delivery of any kind.
     private let lastDelivery = Locked(0.0)
-    /// Recording the screen was on at some point.
+    /// Recording the screen was on at some point, and whether low disk space kept it from recording.
     private(set) var wanted = false
+    private(set) var noSpace = false
 
     init(directory: URL, origin: @escaping () -> Double?) {
         self.directory = directory
@@ -458,9 +459,9 @@ final class ScreenCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
             }
             if CMSampleBufferGetImageBuffer(sample) != nil { track.append(sample, at: position) }
         case .idle:
-            // Nothing changed: the picture goes on. Placed by its own capture time, in order with the frames.
-            shows()
-            track.hold(at: position)
+            // Nothing changed: the picture goes on, or the lack of one does. Placed by its own
+            // capture time, in order with the frames.
+            if hiddenAt == nil { track.hold(at: position) } else { checkHidden(at: position) }
         case .blank, .suspended, .stopped:
             if hiddenAt == nil { hiddenAt = position }
             checkHidden(at: position)
@@ -505,6 +506,9 @@ final class ScreenCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
         case sharingWindow
         case sharePaused
         case noMeeting
+        /// There is something to record, but nothing is being written: the window shows nothing,
+        /// the stream could not be started yet, or the encoder failed.
+        case noPicture
     }
 
     /// What to record now, if anything, or why not: the display the user shares, unless the share is
@@ -605,10 +609,11 @@ final class ScreenCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
         var described: String?
         var weighed: (part: URL, bytes: Int, at: Date)?
         var heavy = 0
-        func end() async {
+        /// Stops the stream; its part ends at `time`, where the picture stopped.
+        func end(at time: Double = Self.now()) async {
             // Detached first: nothing more is written once the picture is not wanted, however long
             // the stream takes to stop.
-            let position = position(at: Self.now())
+            let position = position(at: time)
             queue.sync {
                 current = nil
                 hiddenAt = nil
@@ -639,14 +644,18 @@ final class ScreenCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
                     .volumeAvailableCapacityForImportantUsage ?? .max
                 lowSpace = free < Self.minimumSpace
             }
+            if wanted.current {
+                self.wanted = true
+                if lowSpace { noSpace = true }
+            }
             if !wanted.current || lowSpace {
                 if stream != nil { await end() }
                 nextLook = .distantPast
             } else {
-                self.wanted = true
-                // A stream that went quiet while its picture is visible, as after the Mac sleeps, starts
-                // again; one that stays quiet is given longer each time.
-                if stream != nil, !hidden.current {
+                // A stream that went quiet, as after the Mac sleeps, starts again, whether its window
+                // showed something or nothing when it did: one that stays quiet, as a window showing
+                // nothing does, is given longer each time.
+                if stream != nil {
                     let quiet = Self.now() - lastDelivery.current
                     if quiet > silence {
                         recorderLog.error("Screen stream went quiet; restarting")
@@ -657,7 +666,9 @@ final class ScreenCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
                     }
                 }
                 if broken.current {
-                    await end()
+                    // The picture stopped with the last delivery, not now: the last frame must not
+                    // stand in for the time since.
+                    await end(at: lastDelivery.current)
                     nextLook = .distantPast
                 }
                 if let running = stream, let size = reshaped.current {
@@ -679,12 +690,20 @@ final class ScreenCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
                     if let state, state != described { recorderLog.notice("No picture to record. \(state, privacy: .public)") }
                     described = state
                     if choice.target != target, let pid {
-                        if case .window? = choice.target, case .window? = target, let running = stream,
-                           let next = await filter(for: choice.target!, pid: pid, stop: stop),
+                        var next: (filter: SCContentFilter, size: CGSize, cursor: Bool)?
+                        if case .window? = choice.target, case .window? = target, stream != nil {
+                            next = await filter(for: choice.target!, pid: pid, stop: stop)
+                        }
+                        if let next, let running = stream,
                            (try? await bounded(stop, timeout: 10, { try await running.updateContentFilter(next.filter) })) != nil {
                             // Another meeting window: the same stream and part go on with it.
                             target = choice.target
                             recorderLog.notice("Recording another Zoom meeting window")
+                        } else if next == nil, case .window? = choice.target, case .window? = target, stream != nil, !stop.isRequested {
+                            // ScreenCaptureKit does not list the other window yet: the one recorded goes
+                            // on, and the other is looked at again a little later.
+                            nextLook = Date().addingTimeInterval(startDelay)
+                            startDelay = min(startDelay * 2, 60)
                         } else {
                             if stream != nil { await end() }
                             if let next = choice.target, !stop.isRequested {
@@ -713,11 +732,13 @@ final class ScreenCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
                     let rate = Double(bytes - last.bytes) * 8 / Date().timeIntervalSince(last.at)
                     heavy = rate > ScreenTrack.heavy ? heavy + 1 : 0
                     weighed = (part, bytes, Date())
-                    if heavy >= 2, let position = position(at: Self.now()) {
+                    if heavy >= 2 {
                         recorderLog.notice("The recorded picture is heavy; capping its bit rate")
                         queue.async {
+                            // Placed on the queue, after the frames already delivered: the next part
+                            // never starts before this one ends.
                             self.track.capped = true
-                            self.track.close(at: position)
+                            self.track.close(at: self.position(at: Self.now()))
                         }
                     }
                 } else if weighed?.part != part {
@@ -725,11 +746,11 @@ final class ScreenCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
                     heavy = 0
                 }
             }
-            // Recorded means written: frames before the timeline starts, a failing encoder or a hidden
-            // window write nothing. Low disk space has a warning of its own.
+            // Recorded means written: frames before the timeline starts, a failing encoder or a window
+            // showing nothing write nothing. Low disk space has a warning of its own.
             if !wanted.current || lowSpace || queue.sync(execute: { track.currentPart != nil }) { writingAt = Self.now() }
             if !stop.isRequested {
-                let value: Pause? = Self.now() - writingAt < 3 ? nil : pause ?? .noMeeting
+                let value: Pause? = Self.now() - writingAt < 3 ? nil : pause ?? (target == nil ? .noMeeting : .noPicture)
                 if value != reported { found(value) }
                 reported = value
             }

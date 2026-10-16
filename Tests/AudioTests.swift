@@ -148,16 +148,29 @@ func checkDevices() throws {
 struct MutePolls {
     var unmuted: (Double) -> Bool
     var busy: (Double) -> Bool = { _ in false }
+    /// No control at all: the reading says so, and the microphone counts as off.
+    var missing: (Double) -> Bool = { _ in false }
     var timeline = MuteTimeline()
     private var next = 0
-    init(unmuted: @escaping (Double) -> Bool, busy: @escaping (Double) -> Bool = { _ in false }) {
+    private var busySince: Double?
+    init(unmuted: @escaping (Double) -> Bool, busy: @escaping (Double) -> Bool = { _ in false },
+         missing: @escaping (Double) -> Bool = { _ in false }) {
         self.unmuted = unmuted
         self.busy = busy
+        self.missing = missing
     }
     mutating func advance(to clock: Double) {
         while Double(next) * 0.02 + 0.005 <= clock + 1e-9 {
             let poll = Double(next) * 0.02
-            if !busy(poll) { timeline.readings.append((1000 + poll, unmuted(poll))) }
+            if busy(poll) {
+                busySince = busySince ?? poll
+            } else {
+                // A search for a control that vanished gives no readings while it runs, and ends
+                // with one that says the control was gone from the moment it vanished.
+                if let since = busySince, missing(since) { timeline.readings.append((1000 + since, false, true)) }
+                busySince = nil
+                timeline.readings.append((1000 + poll, unmuted(poll) && !missing(poll), missing(poll)))
+            }
             next += 1
         }
     }
@@ -165,7 +178,7 @@ struct MutePolls {
 
 func checkTimeline() throws {
     let on = { (start: Double, end: Double) -> MuteTimeline in
-        MuteTimeline(readings: stride(from: 0.0, to: 4, by: 0.02).map { ($0, $0 >= start && $0 < end) })
+        MuteTimeline(readings: stride(from: 0.0, to: 4, by: 0.02).map { ($0, $0 >= start && $0 < end, false) })
     }
     let edges = on(1.0, 2.0).voice(from: 0, to: 3.4)!
     // Zoom shows an unmute a little after the click: the first word comes before its reading.
@@ -175,15 +188,20 @@ func checkTimeline() throws {
     try check(on(1.0, 2.0).voice(from: 3.0, to: 3.5) == nil, "decided before an unmute could still be shown")
     try check(MuteTimeline().voice(from: 0, to: 1, final: true) == [], "no readings must mean silence")
     // Zoom busy between two "on" readings: its state could not change, the voice holds.
-    let busy = MuteTimeline(readings: [(0.98, true), (3.0, true)])
+    let busy = MuteTimeline(readings: [(0.98, true, false), (3.0, true, false)])
     try check(busy.voice(from: 1, to: 2.4) == [1..<2.4], "a busy Zoom silenced the voice")
     // A gap means Zoom was busy, so a change belongs to the later reading: speech runs on
     // up to a mute reading, and an unmute starts `lead` before its reading.
-    let muting = MuteTimeline(readings: [(1.0, true), (2.0, false)]).voice(from: 1, to: 1.45)!
+    let muting = MuteTimeline(readings: [(1.0, true, false), (2.0, false, false)]).voice(from: 1, to: 1.45)!
     try check(muting == [1..<1.45], "speech before a delayed mute reading was lost: \(muting)")
-    let unmuting = MuteTimeline(readings: [(1.0, false), (2.0, true)]).voice(from: 1, to: 2, final: true)!
+    let unmuting = MuteTimeline(readings: [(1.0, false, false), (2.0, true, false)]).voice(from: 1, to: 2, final: true)!
     try check(unmuting.count == 1 && unmuting[0].lowerBound >= 2.0 - MuteTimeline.lead - MuteTimeline.pad - 1e-9,
               "muted audio long before a delayed unmute was kept: \(unmuting)")
+    // A reading without any control holds until the next reading.
+    let gone = MuteTimeline(readings: [(1.0, false, true), (2.0, true, false)])
+    try check(gone.controlMissing(from: 0.5, to: 1.5) && gone.controlMissing(from: 1.9, to: 2.5) && !gone.controlMissing(from: 2.0, to: 3)
+              && !gone.controlMissing(from: 0, to: 0.9) && MuteTimeline(readings: [(1.0, false, true)]).controlMissing(from: 5, to: 6),
+              "the control's absence was placed wrongly")
     print("PASS: mute timeline keeps edges and the first word, stays silent inside, holds across a busy Zoom")
 }
 
@@ -197,7 +215,8 @@ func checkCapture(_ folder: URL) async throws {
     var polls = MutePolls { (1.0..<1.8).contains($0) || $0 >= 3.0 }
     capture.muteTimeline = { _ in polls.timeline }
     var voice = 0
-    capture.onVoice = { voice += 1 }
+    // The first mark fails, as on a full disk: it is tried again with the next audio, then no more.
+    capture.onVoice = { voice += 1; return voice >= 2 }
     for index in 0..<45 {
         let start = Int64(48_000_000 + index * 4800)
         clock = Double(index + 1) * 0.1
@@ -222,7 +241,7 @@ func checkCapture(_ folder: URL) async throws {
     await capture.mic.finish()
     await capture.raw.finish()
     try check(capture.zoom.failures == 0 && capture.mic.failures == 0, "writer failed: \(String(describing: capture.zoom.failure ?? capture.mic.failure))")
-    try check(capture.hadVoice && voice == 1, "voice not reported once")
+    try check(capture.hadVoice && voice == 2, "voice marked \(voice) times, expected a failed mark to be tried once more")
     try check(!capture.needsSafetyCopy, "a working detector asked for the safety copy")
     let raw = try decode(AudioTrack.parts(named: "raw", in: folder)[0].url)
     try check(tone(raw, at: 2.0, frequency: 880) > 0.09, "safety copy lacks the muted part")
@@ -338,7 +357,7 @@ func checkSafetyCopy(_ folder: URL) async throws {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let capture = Capture(directory: directory, realtime: false)
         var clock = 0.0
-        var polls = MutePolls { _ in false }
+        var polls = MutePolls(unmuted: { _ in false }, missing: missing)
         capture.now = { CMTime(seconds: 1000 + clock, preferredTimescale: 48_000) }
         capture.muteTimeline = { _ in polls.timeline }
         var seen = false
@@ -347,7 +366,7 @@ func checkSafetyCopy(_ folder: URL) async throws {
             return (seen, missing(clock))
         }
         var asked = 0
-        capture.onUncertainVoice = { asked += 1 }
+        capture.onUncertainVoice = { asked += 1; return true }
         for index in 0..<(seconds * 10) {
             clock = Double(index + 1) * 0.1
             polls.advance(to: clock)
@@ -364,6 +383,40 @@ func checkSafetyCopy(_ folder: URL) async throws {
         try check(asked == requests, "\(name): live requests \(asked), expected \(requests)")
     }
     print("PASS: the whole microphone is kept only when the mute detector failed, also when it never came back mid-meeting")
+}
+
+/// Zoom's control gone for a second or two at a time, as while Zoom rebuilds its window, while
+/// the user talks unmuted: the search for it gives no readings until the control is back, so
+/// each absence silences a little speech that is decided only then. Together they ask for the
+/// whole microphone all the same.
+func checkBriefAbsences(_ folder: URL) async throws {
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    let capture = Capture(directory: folder, realtime: false)
+    var clock = 0.0
+    let missing = { (time: Double) in (2.0..<3.5).contains(time.truncatingRemainder(dividingBy: 10)) }
+    var polls = MutePolls(unmuted: { _ in true }, busy: missing, missing: missing)
+    capture.now = { CMTime(seconds: 1000 + clock, preferredTimescale: 48_000) }
+    capture.muteTimeline = { _ in polls.timeline }
+    capture.control = { (true, missing(clock)) }
+    var asked = 0
+    capture.onUncertainVoice = { asked += 1; return true }
+    for index in 0..<400 {
+        clock = Double(index + 1) * 0.1
+        polls.advance(to: clock)
+        capture.receive(try sample(frequency: 0, start: Int64(48_000_000 + index * 4800), channels: 2, float: true, interleaved: false),
+                        of: .audio)
+        capture.receive(try sample(frequency: 880, start: Int64(48_000_000 + index * 4800)), of: .microphone)
+    }
+    capture.releaseVoice(flushing: true)
+    await capture.zoom.finish()
+    await capture.mic.finish()
+    await capture.raw.finish()
+    try check(capture.hadVoice, "the voice between the absences was lost")
+    let decoded = try decode(AudioTrack.parts(named: "mic", in: folder)[0].url)
+    try check(tone(decoded, at: 2.3, frequency: 880) < 0.003 && tone(decoded, at: 5.0, frequency: 880) > 0.09,
+              "speech during an absence kept, or speech between absences lost")
+    try check(capture.needsSafetyCopy && asked == 1, "four seconds of speech silenced in brief absences did not ask for the whole microphone")
+    print("PASS: speech silenced in brief absences of Zoom's control counts toward the whole microphone")
 }
 
 /// Delivery stalls for 2.5 s and the backlog arrives at once: nothing is lost or moved.
@@ -789,6 +842,17 @@ func checkInterruptedSaves(_ folder: URL) async throws {
     let renamed = try await unrenamed.deliver(fallback: fallback)
     try check(renamed.url.lastPathComponent == "Unrenamed.m4a" && !renamed.usedFallback,
               "a save cut short before its rename was not finished: \(renamed.url.lastPathComponent)")
+    // Every part damaged: they go aside, and the save says so rather than that no sound came.
+    let wrecked = try RecordingSession.create(destination: destination, name: "Wrecked.m4a", root: root)
+    let wreck = wrecked.folder.appendingPathComponent("zoom-1-0.m4a")
+    try Data(repeating: 0x45, count: 70_000).write(to: wreck)
+    do {
+        _ = try await wrecked.deliver(fallback: fallback)
+        throw TestError.failed("a recording with every part damaged was saved")
+    } catch let RecorderError.damaged(kept) {
+        try check(FileManager.default.fileExists(atPath: kept.appendingPathComponent(wreck.lastPathComponent).path), "the damaged part was lost")
+    }
+    wrecked.remove()
     print("PASS: early crash leaves nothing behind, unreadable Zoom part, normal-stop safety decision, no duplicate after an interrupted save")
 }
 
@@ -901,6 +965,7 @@ func checkBoundedOperations() async throws {
         try await checkExportSize(folder.appendingPathComponent("export-size"))
         try await checkUnconfirmedVoice(folder.appendingPathComponent("unconfirmed"))
         try await checkSafetyCopy(folder.appendingPathComponent("safety"))
+        try await checkBriefAbsences(folder.appendingPathComponent("absences"))
         try await checkLateDelivery(folder.appendingPathComponent("late"))
         try await checkMuteEdges(folder.appendingPathComponent("edges"))
         try await checkSpeakerTimeline(folder.appendingPathComponent("speakers"))

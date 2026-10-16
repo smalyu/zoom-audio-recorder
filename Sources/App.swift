@@ -57,7 +57,7 @@ final class RecorderModel: ObservableObject {
     @Published var attention = false
     @Published var quitting = false
     /// Logout, restart or shutdown: close the tracks and leave saving to the next launch.
-    private var systemQuit = false
+    @Published private(set) var systemQuit = false
     /// Recordings started so far: an outcome on screen is told apart from a newer equal one.
     private var recordings = 0
     /// Cancel pressed while connecting: nothing is saved.
@@ -80,6 +80,7 @@ final class RecorderModel: ObservableObject {
         case .hidden?: return "Zoom скрыт — видео на паузе"
         case .sharingWindow?: return "Вы показываете окно — видео на паузе"
         case .sharePaused?: return "Показ экрана на паузе — видео тоже"
+        case .noPicture?: return "Видео на паузе"
         case .noMeeting?, nil: return "Окно встречи Zoom не видно — видео на паузе"
         }
     }
@@ -207,10 +208,15 @@ final class RecorderModel: ObservableObject {
         }
     }
 
+    /// The first time, the system's own prompt asks; it is shown only once, so afterwards the
+    /// settings pane is opened instead.
     func request(_ access: Access) {
+        let asked = "asked.\(access)"
+        let first = !UserDefaults.standard.bool(forKey: asked)
+        UserDefaults.standard.set(true, forKey: asked)
         switch access {
         case .screen:
-            if !CGRequestScreenCaptureAccess() { openSettings("Privacy_ScreenCapture") }
+            if !CGRequestScreenCaptureAccess(), !first { openSettings("Privacy_ScreenCapture") }
         case .microphone:
             if AVCaptureDevice.authorizationStatus(for: .audio) == .notDetermined {
                 Task {
@@ -220,7 +226,7 @@ final class RecorderModel: ObservableObject {
             } else { openSettings("Privacy_Microphone") }
         case .zoom:
             _ = AXIsProcessTrustedWithOptions(["AXTrustedCheckOptionPrompt": true] as CFDictionary)
-            openSettings("Privacy_Accessibility")
+            if !first { openSettings("Privacy_Accessibility") }
         }
         refresh()
     }
@@ -301,7 +307,12 @@ final class RecorderModel: ObservableObject {
                 session?.remove()
             } catch {
                 tracksClosed = true
-                if let session, session.hasAudio, error as? RecorderError != .noAudio {
+                if case let RecorderError.damaged(kept) = error {
+                    // Every part was damaged: what could be kept is aside, the session itself is empty.
+                    session?.remove()
+                    outcome = Outcome(kind: .failed, title: "Не удалось записать", detail: error.localizedDescription,
+                                      unreadableFolder: kept)
+                } else if let session, session.hasAudio, error as? RecorderError != .noAudio {
                     // Captured audio stays on disk; the next launch saves it again.
                     outcome = Outcome(kind: .attention, title: "Запись не потеряна",
                                       detail: Self.unsavedDetail(error), file: session.folder)
@@ -331,7 +342,12 @@ final class RecorderModel: ObservableObject {
 
     /// The menu bar warns until the window has been seen, and while a recording waits to be saved.
     private func raiseAttention() {
-        if unsaved || !NSApplication.shared.isActive { attention = true }
+        if unsaved || !NSApplication.shared.isActive || !Self.windowShown { attention = true }
+    }
+
+    /// Whether the recorder window is on the screen, rather than closed or minimized.
+    static var windowShown: Bool {
+        NSApplication.shared.windows.contains { $0.isVisible && !$0.isMiniaturized && $0.title == "Zoom Audio Recorder" }
     }
 
     private static func outcome(for delivery: RecordingSession.Delivery, summary: RecordingSummary? = nil,
@@ -351,19 +367,24 @@ final class RecorderModel: ObservableObject {
             if !summary.hasVoice && delivery.microphone == nil && summary.hasZoom { details.append("Микрофон оставался выключен или не определялся") }
         }
         let screenMissed = summary?.screenWanted == true && delivery.video == nil && !delivery.videoFailed
-        if screenMissed { details.append("Окно встречи Zoom не найдено — видео нет") }
+        if screenMissed {
+            details.append(summary?.screenNoSpace == true ? "Мало места — видео не записано" : "Окно встречи Zoom не найдено — видео нет")
+        }
         if delivery.videoFailed {
-            details.append(delivery.videoNoSpace ? "Мало места — видео не сохранено" : "Видео не сохранено — исходные файлы сохранены")
+            details.append(delivery.videoNoSpace ? "Мало места — видео не сохранено"
+                           : delivery.videoPending ? "Видео не сохранено — попробую при следующем запуске"
+                           : "Видео не сохранено — исходные файлы сохранены")
         }
         if delivery.microphone != nil { details.append("Кнопка mute не определялась — микрофон сохранён отдельно") }
         if delivery.incomplete { details.append("Часть записи повреждена — исходные файлы сохранены") }
+        if delivery.videoIncomplete { details.append("Часть видео повреждена — исходные файлы сохранены") }
         if delivery.usedFallback {
             details.insert("Папка «\(preferred.lastPathComponent)» недоступна", at: 0)
             return Outcome(kind: .attention, title: "Сохранено в «\(delivery.url.deletingLastPathComponent().lastPathComponent)»",
                            detail: details.joined(separator: "\n"), file: delivery.url,
                            microphone: delivery.microphone, unreadableFolder: delivery.unreadableFolder, video: delivery.video)
         }
-        return Outcome(kind: delivery.incomplete || delivery.microphone != nil || summary?.hasZoom == false
+        return Outcome(kind: delivery.incomplete || delivery.videoIncomplete || delivery.microphone != nil || summary?.hasZoom == false
                        || (summary?.interruptions ?? 0) > 0 || delivery.videoFailed || screenMissed ? .attention : .saved, title: "Сохранено",
                        detail: details.joined(separator: "\n"), file: delivery.url,
                        microphone: delivery.microphone, unreadableFolder: delivery.unreadableFolder, video: delivery.video)
@@ -415,6 +436,15 @@ final class RecorderModel: ObservableObject {
             defer { ProcessInfo.processInfo.endActivity(activity) }
             // Warnings that could not be shown yet, shown once the screen is free.
             var withheld: Outcome?
+            @MainActor func show(_ result: Outcome) {
+                // Warnings already on screen stay, and so does a newer recording's result.
+                if !busy, outcome == nil || (recordings == started && outcome == shown && outcome?.kind != .attention) {
+                    outcome = result
+                } else {
+                    withheld = withheld ?? result
+                }
+                raiseAttention()
+            }
             for session in RecordingSession.interrupted(fallback: Self.defaultFolder) {
                 // A crash in the first second leaves nothing playable to save.
                 guard session.hasAudio else {
@@ -427,22 +457,22 @@ final class RecorderModel: ObservableObject {
                     recoveredVideos[delivery.url] = delivery.video
                     if outcome?.file == session.folder { outcome = nil }
                     if unrecovered == session.folder { unrecovered = nil }
-                    if delivery.incomplete || delivery.microphone != nil || delivery.usedFallback || delivery.videoFailed {
-                        let result = Self.outcome(for: delivery,
-                            preferred: URL(fileURLWithPath: session.manifest.destination, isDirectory: true))
-                        // Warnings already on screen stay, and so does a newer recording's result.
-                        if !busy, outcome == nil || (recordings == started && outcome == shown && outcome?.kind != .attention) {
-                            outcome = result
-                        } else {
-                            withheld = withheld ?? result
-                        }
-                        raiseAttention()
+                    if delivery.incomplete || delivery.videoIncomplete || delivery.microphone != nil || delivery.usedFallback
+                        || delivery.videoFailed {
+                        show(Self.outcome(for: delivery, preferred: URL(fileURLWithPath: session.manifest.destination, isDirectory: true)))
                     }
                 } catch RecorderError.noAudio {
-                    // Nothing playable was recorded; unreadable parts were kept aside.
+                    // Nothing playable was recorded.
                     session.remove()
                     if outcome?.file == session.folder { outcome = nil }
                     if unrecovered == session.folder { unrecovered = nil }
+                } catch let RecorderError.damaged(kept) {
+                    // Every part was damaged and kept aside; the session itself is empty.
+                    session.remove()
+                    if unrecovered == session.folder { unrecovered = nil }
+                    if outcome?.file == session.folder { outcome = nil }
+                    show(Outcome(kind: .failed, title: "Не удалось сохранить", detail: RecorderError.damaged(kept: kept).localizedDescription,
+                                 unreadableFolder: kept))
                 } catch {
                     recorderLog.error("Recovery failed: \(error.localizedDescription, privacy: .public)")
                     // The result already on screen for this recording shows the new error.
@@ -824,6 +854,9 @@ struct RecorderView: View {
             if !model.ready && !model.busy {
                 if let outcome = model.outcome { OutcomeView(model: model, outcome: outcome) }
                 PermissionsView(model: model)
+                if model.recovering {
+                    Caption(model.quitting ? "Сохраняю перед выходом…" : "Восстанавливаю прерванную запись…")
+                }
             } else {
                 switch model.phase {
                 case .idle: IdleView(model: model)
@@ -844,9 +877,14 @@ struct RecorderView: View {
                 model.refresh()
                 model.checkFolder()
             }
-            // Seen now; only a recording still waiting to be saved keeps the warning.
-            if !model.unsaved { model.attention = false }
+            seen()
         }
+        .onAppear(perform: seen)
+    }
+
+    /// Seen now; only a recording still waiting to be saved keeps the warning.
+    private func seen() {
+        if !model.unsaved { model.attention = false }
     }
 }
 
@@ -1048,7 +1086,8 @@ struct SavingView: View {
                 .font(.system(size: 40, weight: .light))
                 .monospacedDigit()
                 .foregroundStyle(.secondary)
-            Text(model.quitting ? "Сохраняю перед выходом…" : "Сохраняю…").font(.callout)
+            // A logout or shutdown only closes the recording; the next launch saves it.
+            Text(model.systemQuit ? "Завершаю запись…" : model.quitting ? "Сохраняю перед выходом…" : "Сохраняю…").font(.callout)
             if let progress = model.progress {
                 ProgressView(value: progress).frame(width: wideButton)
             } else {

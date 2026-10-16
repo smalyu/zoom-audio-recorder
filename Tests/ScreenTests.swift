@@ -263,7 +263,8 @@ func checkScreenDelivery(_ folder: URL) async throws {
     let part = damaged.folder.appendingPathComponent("screen-1-0.mp4")
     try Data((0..<4096).map { UInt8(truncatingIfNeeded: $0 &* 31) }).write(to: part)
     let damagedDelivery = try await damaged.deliver(fallback: destination)
-    try check(damagedDelivery.video == nil && damagedDelivery.incomplete, "a damaged screen part was not kept aside")
+    try check(damagedDelivery.video == nil && damagedDelivery.videoIncomplete && !damagedDelivery.incomplete,
+              "a damaged screen part was not kept aside, or was reported as damaged sound")
     try check(manager.fileExists(atPath: damagedDelivery.unreadableFolder!.appendingPathComponent(part.lastPathComponent).path),
               "the damaged screen part was lost")
 

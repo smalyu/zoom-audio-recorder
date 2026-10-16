@@ -16,11 +16,14 @@ enum RecorderError: Error, LocalizedError, Equatable {
     case message(String)
     case noAudio
     case noSpaceForVideo
+    /// Every part of the sound was damaged; the parts were kept in this folder.
+    case damaged(kept: URL)
     var errorDescription: String? {
         switch self {
         case let .message(value): return value
         case .noAudio: return "Звук не получен. Войдите в созвон Zoom и проверьте индикатор микрофона."
         case .noSpaceForVideo: return "Мало места для видео"
+        case .damaged: return "Запись повреждена — исходные файлы сохранены"
         }
     }
 }
@@ -729,7 +732,7 @@ private final class ZoomMuteWatcher {
     private let pid: pid_t
     private let queue = DispatchQueue(label: "zoom-audio.mute")
     private let lock = NSLock()
-    private var history: [(time: Double, unmuted: Bool)] = []
+    private var history: [MuteTimeline.Reading] = []
     private var lastScan = -Double.infinity
     private var lastReported: ZoomMuteState?
     private var controlSeen = false
@@ -817,9 +820,11 @@ private final class ZoomMuteWatcher {
         }
     }
 
+    /// Returns after any poll in flight, so nothing is reported after it.
     func stop() {
         timer?.cancel()
         timer = nil
+        queue.sync {}
     }
 
     private func refresh() {
@@ -841,7 +846,7 @@ private final class ZoomMuteWatcher {
     private func record(_ next: ZoomMuteState, at time: Double) {
         vanished = nil
         lock.lock()
-        history.append((time, next == .unmuted))
+        history.append((time, next == .unmuted, next == .unavailable))
         if history.count > 6_000 { history.removeFirst(3_000) }
         let changed = next != lastReported
         lastReported = next
@@ -1475,15 +1480,26 @@ struct MuteTimeline {
     static let lead = 0.5
     /// Slack between the microphone's clock and Zoom's label.
     static let pad = 0.03
-    /// When each poll began, and whether it saw Zoom's microphone on.
-    var readings: [(time: Double, unmuted: Bool)] = []
+    /// When a poll began, whether it saw Zoom's microphone on, and whether it saw no control at all.
+    typealias Reading = (time: Double, unmuted: Bool, missing: Bool)
+    var readings: [Reading] = []
+
+    /// Whether Zoom's control was missing at some point in [start, end): a reading holds until the next.
+    func controlMissing(from start: Double, to end: Double) -> Bool {
+        var previous: Reading?
+        for reading in readings {
+            if let previous, previous.missing, previous.time < end, reading.time > start { return true }
+            previous = reading
+        }
+        return previous.map { $0.missing && $0.time < end } ?? false
+    }
 
     /// The voice parts of [start, end), or nil while the readings that decide them are
     /// not in yet. `final` decides now and carries the last reading forward.
     func voice(from start: Double, to end: Double, final: Bool = false) -> [Range<Double>]? {
         if !final, (readings.last?.time ?? -.infinity) < end + Self.lead + Self.pad { return nil }
         var spans: [Range<Double>] = []
-        var previous: (time: Double, unmuted: Bool)?
+        var previous: Reading?
         for reading in readings {
             if reading.unmuted {
                 let from = previous.flatMap { $0.unmuted ? $0.time : nil } ?? reading.time - Self.lead
@@ -1532,11 +1548,14 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
     var muteTimeline: (Double) -> MuteTimeline = { _ in MuteTimeline() }
     /// Whether Zoom's microphone control has been found, and whether it is missing now.
     var control: () -> (seen: Bool, missing: Bool) = { (false, false) }
-    /// Speech was silenced while Zoom's control was missing in the middle of a meeting.
-    var onUncertainVoice: () -> Void = {}
+    /// Speech was silenced while Zoom's control was missing in the middle of a meeting. Each of
+    /// these marks the session folder, and says whether it could: a mark that failed, as on a
+    /// full disk, is tried again with the next audio.
+    var onUncertainVoice: () -> Bool = { true }
     /// Zoom's microphone control was found for the first time.
-    var onControlSeen: () -> Void = {}
-    var onVoice: () -> Void = {}
+    var onControlSeen: () -> Bool = { true }
+    var onVoice: () -> Bool = { true }
+    private var marked = (voice: false, uncertain: false, control: false)
     var onProblem: (String) -> Void = { _ in }
     weak var wake: StopRequest?
     var current: SCStream?
@@ -1577,6 +1596,8 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
     private(set) var receivingZoom = false
     /// Host time of the latest microphone audio on the current stream; nil before any.
     private(set) var lastMicrophone: Double?
+    /// Whether any stream has brought microphone audio: a later one that brings none has stalled.
+    private(set) var hadMicrophone = false
 
     init(directory: URL, realtime: Bool = true) {
         zoom = AudioTrack(name: "zoom", directory: directory, channels: 2, realtime: realtime)
@@ -1632,6 +1653,7 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
             } catch { report("Звук Zoom: \(error.localizedDescription)") }
         case .microphone:
             lastMicrophone = now().seconds
+            hadMicrophone = true
             receiveVoice(sample, at: position)
         default:
             return
@@ -1665,25 +1687,23 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
             guard let ranges = timeline.voice(from: entry.captured, to: entry.captured + length, final: late) else { break }
             voice.removeFirst()
             let kept = keep(ranges, of: entry.buffer, capturedAt: entry.captured)
-            if kept, !hadVoice {
-                hadVoice = true
-                onVoice()
-            }
-            track(speech: entry.speech, kept: kept, length: length)
+            hadVoice = hadVoice || kept
+            if hadVoice, !marked.voice { marked.voice = onVoice() }
+            // Judged by the readings that decided the audio, not by whether the control is back now.
+            track(speech: entry.speech, kept: kept, length: length,
+                  missing: timeline.controlMissing(from: entry.captured, to: entry.captured + length))
             voiceSpans.addMicrophone(entry.buffer, at: entry.position).forEach(speakers.voice)
             mic.append(entry.buffer, at: entry.position)
         }
     }
 
-    /// Counts sustained speech the mute decision silenced. Speech while the control was
-    /// missing counts only once the control returns, so recording before joining or
+    /// Counts sustained speech the mute decision silenced while the control was `missing`.
+    /// Such speech counts only once the control returns, so recording before joining or
     /// after leaving a meeting does not ask for the safety copy.
-    private func track(speech: Bool, kept: Bool, length: Double) {
+    private func track(speech: Bool, kept: Bool, length: Double, missing: Bool) {
         let status = control()
-        if status.seen, !controlSeen {
-            controlSeen = true
-            onControlSeen()
-        }
+        controlSeen = controlSeen || status.seen
+        if controlSeen, !marked.control { marked.control = onControlSeen() }
         if !status.missing {
             uncertainSeconds += missingSpeech
             missingSpeech = 0
@@ -1691,23 +1711,18 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
         }
         forgetOldHearing()
         speechRun = speech ? speechRun + length : 0
-        guard speechRun >= Self.speechRun else { return }
-        // A run just long enough counts in full.
-        let counted = speechRun - length < Self.speechRun ? speechRun : length
-        speechSeconds += counted
-        if !kept, status.missing, controlSeen {
-            missingSpeech += counted
-            if heardWhileMissing.reduce(0, { $0 + $1.seconds }) > 3 { silencedInMeeting += counted }
+        if speechRun >= Self.speechRun {
+            // A run just long enough counts in full.
+            let counted = speechRun - length < Self.speechRun ? speechRun : length
+            speechSeconds += counted
+            if !kept, missing || status.missing, controlSeen {
+                missingSpeech += counted
+                if heardWhileMissing.reduce(0, { $0 + $1.seconds }) > 3 { silencedInMeeting += counted }
+            }
         }
         // Marked at once, so a crash later in the meeting still delivers the whole microphone.
-        if silencedInMeeting > 3, !uncertainVoice {
-            uncertainVoice = true
-            onUncertainVoice()
-        }
-        if uncertainSeconds > 3, !uncertainVoice {
-            uncertainVoice = true
-            onUncertainVoice()
-        }
+        uncertainVoice = uncertainVoice || silencedInMeeting > 3 || uncertainSeconds > 3
+        if uncertainVoice, !marked.uncertain { marked.uncertain = onUncertainVoice() }
     }
 
     private func forgetOldHearing() {
@@ -1871,8 +1886,9 @@ struct RecordingSummary {
     let zoomQuit: Bool
     /// Deliver the whole microphone too: mute detection may have failed.
     let needsSafetyCopy: Bool
-    /// Recording the screen was on at some point.
+    /// Recording the screen was on at some point, and low disk space kept it from recording.
     var screenWanted = false
+    var screenNoSpace = false
 }
 
 struct ZoomAudio {
@@ -1909,8 +1925,8 @@ struct ZoomAudio {
     /// Zoom's meeting window is recorded too whenever `screen` is on.
     static func record(into directory: URL, stop: StopRequest, screen wanted: Locked<Bool> = Locked(false),
                        events: @escaping (RecorderEvent) -> Void,
-                       onVoice: @escaping () -> Void, onUncertainVoice: @escaping () -> Void,
-                       onControlSeen: @escaping () -> Void) async throws -> RecordingSummary {
+                       onVoice: @escaping () -> Bool, onUncertainVoice: @escaping () -> Bool,
+                       onControlSeen: @escaping () -> Bool) async throws -> RecordingSummary {
         let capture = Capture(directory: directory)
         capture.wake = stop
         capture.onVoice = onVoice
@@ -2004,8 +2020,10 @@ struct ZoomAudio {
             let broken = capture.queue.sync { capture.takeStreamError() } != nil
             // A stream can stop delivering without an error, as after the Mac sleeps: five
             // seconds without microphone audio, once it has flowed, reconnect it, at most once a
-            // minute. A stream that never brings any, as with no microphone, is left alone.
-            let silent = capture.queue.sync { capture.lastMicrophone.map { capture.now().seconds - $0 } } ?? 0
+            // minute. A stream that never brings any, as with no microphone, is left alone, unless
+            // an earlier one did: then this one has stalled from its start.
+            let silent = capture.queue.sync { capture.lastMicrophone.map { capture.now().seconds - $0 } }
+                ?? (capture.queue.sync { capture.hadMicrophone } ? Date().timeIntervalSince(connectedAt) : 0)
             let stalled = silent > 5 && Date().timeIntervalSince(lastStall) > 60
             if stalled {
                 lastStall = Date()
@@ -2033,7 +2051,7 @@ struct ZoomAudio {
         let needsSafetyCopy = capture.queue.sync { capture.needsSafetyCopy }
         return RecordingSummary(started: started, hasAudio: hasZoom || capture.hadVoice || needsSafetyCopy, hasZoom: hasZoom,
                                 hasVoice: capture.hadVoice, interruptions: interruptions, zoomQuit: zoomQuit,
-                                needsSafetyCopy: needsSafetyCopy, screenWanted: screen.wanted)
+                                needsSafetyCopy: needsSafetyCopy, screenWanted: screen.wanted, screenNoSpace: screen.noSpace)
     }
 
     private static func connect(to app: NSRunningApplication, capture: Capture, stop: StopRequest, reconnecting: Bool,
