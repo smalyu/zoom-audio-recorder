@@ -485,33 +485,41 @@ final class ScreenCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
     }
 
     /// What a stream records: Zoom's meeting window, or the display the user shares in the meeting.
-    private enum Target: Equatable {
+    enum Target: Equatable {
         case window(CGWindowID)
         case display(CGDirectDisplayID)
     }
 
     /// What to record now, if anything: the display the user shares, unless the share is paused, or
     /// Zoom's meeting window while it is on the screen. A shared window is not recorded: which one
-    /// it is cannot be known.
-    private func choose(pid: pid_t, recording: Target?) -> (target: Target?, windows: [ZoomWindow], sharing: Bool) {
-        let windows = ZoomMeetingWindow.onScreen(pid: pid)
-        let displays = ZoomMeetingWindow.displays()
+    /// it is cannot be known. `windows` are Zoom's windows on the screen; `paused` is asked only
+    /// while the user shares.
+    static func decide(windows: [ZoomWindow], displays: [(id: CGDirectDisplayID, frame: CGRect)],
+                       meeting: () -> ZoomMeetingWindow.Lookup, paused: () -> Bool, recording: Target?) -> (target: Target?, sharing: Bool) {
         let share = ZoomMeetingWindow.share(windows: windows.map { ($0.title, $0.layer, $0.frame) }, displays: displays.map(\.frame))
         if share.sharing {
-            guard let index = share.display, !ZoomMeetingWindow.sharePaused(pid: pid) else { return (nil, windows, true) }
-            return (.display(displays[index].id), windows, true)
+            guard let index = share.display, !paused() else { return (nil, true) }
+            return (.display(displays[index].id), true)
         }
-        switch ZoomMeetingWindow.lookup(pid: pid) {
+        switch meeting() {
         case let .window(frame):
+            // Only a window on the screen: Zoom on another desktop, in full screen or not, is not shown.
             let id = ZoomMeetingWindow.match(frame, in: windows.filter { $0.layer == 0 }.map { ($0.id, $0.frame) })
-            return (id.map(Target.window), windows, false)
+            return (id.map(Target.window), false)
         case .minimized:
-            return (nil, windows, false)
+            return (nil, false)
         case .missing:
             // No answer, as from a busy Zoom: the window recorded goes on while it is on the screen.
-            if case let .window(id)? = recording, windows.contains(where: { $0.id == id }) { return (recording, windows, false) }
-            return (nil, windows, false)
+            if case let .window(id)? = recording, windows.contains(where: { $0.id == id }) { return (recording, false) }
+            return (nil, false)
         }
+    }
+
+    private func choose(pid: pid_t, recording: Target?) -> (target: Target?, windows: [ZoomWindow], sharing: Bool) {
+        let windows = ZoomMeetingWindow.onScreen(pid: pid)
+        let choice = Self.decide(windows: windows, displays: ZoomMeetingWindow.displays(), meeting: { ZoomMeetingWindow.lookup(pid: pid) },
+                                 paused: { ZoomMeetingWindow.sharePaused(pid: pid) }, recording: recording)
+        return (choice.target, windows, choice.sharing)
     }
 
     /// The filter, shape and pointer setting for `target`, from ScreenCaptureKit's own list.
@@ -606,10 +614,11 @@ final class ScreenCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
                     reshaped.current = nil
                     await fit(running, to: size)
                 }
-                // While the user's display is recorded, whether they still share it is checked every second.
-                let display = { if case .display = target { return true } else { return false } }()
-                if Date() >= nextLook || display {
-                    if Date() >= nextLook { nextLook = Date().addingTimeInterval(5) }
+                // What to record is looked at every second, so switching to and from Zoom, or a share
+                // starting and ending, moves the picture at once; the checks are cheap, and
+                // ScreenCaptureKit is asked only to start or switch a stream.
+                if Date() >= nextLook {
+                    nextLook = Date().addingTimeInterval(1)
                     // No Zoom, no picture: a display is never recorded without Zoom sharing it.
                     let pid = ZoomAudio.runningZoom()?.processIdentifier
                     let choice = pid.map { choose(pid: $0, recording: target) } ?? (target: nil, windows: [], sharing: false)

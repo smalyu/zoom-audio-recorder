@@ -70,6 +70,31 @@ func checkMeetingWindow() throws {
     let meetingOnly = ZoomMeetingWindow.share(windows: [("Zoom Meeting", 0, displays[0]), ("zoom floating video window", 26, displays[1])],
                                               displays: displays)
     try check(!meetingOnly.sharing && meetingOnly.display == nil, "a meeting without a share taken for one: \(meetingOnly)")
+    // Zoom in full screen, the user switching away to another desktop and back, again and again: the
+    // meeting window is recorded only while it is on the screen, and the same window comes back.
+    let screen = [(id: CGDirectDisplayID(1), frame: displays[0])]
+    let fullScreen = ZoomWindow(id: 100, title: "Zoom Meeting", layer: 0, frame: displays[0])
+    var recording: ScreenCapture.Target?
+    for (step, (onScreen, meeting)) in [([fullScreen], ZoomMeetingWindow.Lookup.window(displays[0])), ([], .missing),
+                                        ([fullScreen], .window(displays[0])), ([], .window(displays[0])),
+                                        ([fullScreen], .missing), ([fullScreen], .window(displays[0]))].enumerated() {
+        let choice = ScreenCapture.decide(windows: onScreen, displays: screen, meeting: { meeting }, paused: { false }, recording: recording)
+        let expected: ScreenCapture.Target? = onScreen.isEmpty || (step == 4 && recording == nil) ? nil : .window(100)
+        try check(choice.target == expected && !choice.sharing, "step \(step): \(String(describing: choice.target)), expected \(String(describing: expected))")
+        recording = choice.target
+    }
+    // A share starting, pausing, resuming and ending.
+    let shareBar = ZoomWindow(id: 7, title: "zoom share toolbar window", layer: 97, frame: CGRect(x: 400, y: 0, width: 600, height: 60))
+    let border = ZoomWindow(id: 8, title: "", layer: 96, frame: displays[0])
+    for (step, (onScreen, paused, expected)) in [([fullScreen], false, ScreenCapture.Target.window(100)),
+                                                 ([shareBar, border], false, .display(1)), ([shareBar, border], true, nil),
+                                                 ([shareBar, border], false, .display(1)), ([shareBar], false, nil),
+                                                 ([fullScreen], false, .window(100))].enumerated() {
+        let choice = ScreenCapture.decide(windows: onScreen, displays: screen, meeting: { .window(displays[0]) }, paused: { paused },
+                                          recording: recording)
+        try check(choice.target == expected, "share step \(step): \(String(describing: choice.target)), expected \(String(describing: expected))")
+        recording = choice.target
+    }
     // A window of another shape goes in the middle of the picture, as large as fits.
     for (size, expected) in [(CGSize(width: 700, height: 700), CGRect(x: 420, y: 0, width: 1080, height: 1080)),
                              (CGSize(width: 1600, height: 900), CGRect(x: 0, y: 0, width: 1920, height: 1080)),
