@@ -230,8 +230,9 @@ struct ZoomWindow: Equatable {
 enum ZoomMeetingWindow {
     /// What Accessibility says about the meeting window.
     enum Lookup: Equatable {
-        /// Its frame in global screen coordinates, top left origin, as in the window list.
-        case window(CGRect)
+        /// Its frame in global screen coordinates, top left origin, as in the window list, and
+        /// whether it is in full screen, on a desktop of its own.
+        case window(CGRect, fullScreen: Bool)
         case minimized
         /// No meeting window, or no answer from a busy Zoom.
         case missing
@@ -261,12 +262,17 @@ enum ZoomMeetingWindow {
         var extent = CGSize.zero
         AXValueGetValue(unsafeBitCast(position, to: AXValue.self), .cgPoint, &origin)
         AXValueGetValue(unsafeBitCast(size, to: AXValue.self), .cgSize, &extent)
-        return .window(CGRect(origin: origin, size: extent))
+        return .window(CGRect(origin: origin, size: extent), fullScreen: attribute("AXFullScreen", of: window) as? Bool == true)
     }
 
     static func frame(pid: pid_t) -> CGRect? {
-        if case let .window(frame) = lookup(pid: pid) { return frame }
+        if case let .window(frame, _) = lookup(pid: pid) { return frame }
         return nil
+    }
+
+    /// Whether a window still exists, on the screen or not.
+    static func exists(_ id: CGWindowID) -> Bool {
+        !((CGWindowListCopyWindowInfo([.optionIncludingWindow], id) as? [[String: Any]]) ?? []).isEmpty
     }
 
     /// Zoom's windows on the screen, on the current desktop; a hidden, minimized or other-desktop
@@ -490,36 +496,74 @@ final class ScreenCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
         case display(CGDirectDisplayID)
     }
 
-    /// What to record now, if anything: the display the user shares, unless the share is paused, or
-    /// Zoom's meeting window while it is on the screen. A shared window is not recorded: which one
-    /// it is cannot be known. `windows` are Zoom's windows on the screen; `paused` is asked only
-    /// while the user shares.
-    static func decide(windows: [ZoomWindow], displays: [(id: CGDirectDisplayID, frame: CGRect)],
-                       meeting: () -> ZoomMeetingWindow.Lookup, paused: () -> Bool, recording: Target?) -> (target: Target?, sharing: Bool) {
-        let share = ZoomMeetingWindow.share(windows: windows.map { ($0.title, $0.layer, $0.frame) }, displays: displays.map(\.frame))
-        if share.sharing {
-            guard let index = share.display, !paused() else { return (nil, true) }
-            return (.display(displays[index].id), true)
-        }
-        switch meeting() {
-        case let .window(frame):
-            // Only a window on the screen: Zoom on another desktop, in full screen or not, is not shown.
-            let id = ZoomMeetingWindow.match(frame, in: windows.filter { $0.layer == 0 }.map { ($0.id, $0.frame) })
-            return (id.map(Target.window), false)
-        case .minimized:
-            return (nil, false)
-        case .missing:
-            // No answer, as from a busy Zoom: the window recorded goes on while it is on the screen.
-            if case let .window(id)? = recording, windows.contains(where: { $0.id == id }) { return (recording, false) }
-            return (nil, false)
-        }
+    /// Why nothing is recorded, for the user to see.
+    enum Pause: Equatable {
+        /// macOS does not show, or update, a window on another desktop.
+        case otherDesktop
+        case fullScreenElsewhere
+        case minimized
+        case hidden
+        case sharingWindow
+        case sharePaused
+        case noMeeting
     }
 
-    private func choose(pid: pid_t, recording: Target?) -> (target: Target?, windows: [ZoomWindow], sharing: Bool) {
+    /// The meeting window last recorded, and whether it was in full screen: coming back to its
+    /// desktop resumes it at once, before Zoom answers about it.
+    struct Remembered: Equatable {
+        var window: CGWindowID
+        var fullScreen: Bool
+    }
+
+    /// What to record now, if anything, or why not: the display the user shares, unless the share is
+    /// paused, or Zoom's meeting window while it is on the screen. A shared window is not recorded:
+    /// which one it is cannot be known. `windows` are Zoom's windows on the screen; `paused` is
+    /// asked only while the user shares.
+    static func decide(windows: [ZoomWindow], displays: [(id: CGDirectDisplayID, frame: CGRect)],
+                       meeting: () -> ZoomMeetingWindow.Lookup, paused: () -> Bool, recording: Target?,
+                       remembered: Remembered?, hidden: Bool = false, exists: (CGWindowID) -> Bool = ZoomMeetingWindow.exists)
+        -> (target: Target?, pause: Pause?, sharing: Bool, remembered: Remembered?) {
+        let share = ZoomMeetingWindow.share(windows: windows.map { ($0.title, $0.layer, $0.frame) }, displays: displays.map(\.frame))
+        if share.sharing {
+            guard let index = share.display else { return (nil, .sharingWindow, true, remembered) }
+            guard !paused() else { return (nil, .sharePaused, true, remembered) }
+            return (.display(displays[index].id), nil, true, remembered)
+        }
+        let onScreen = { (id: CGWindowID) in windows.contains { $0.id == id && $0.layer == 0 } }
+        // Where the window is now, and whether it is in full screen, if Accessibility says.
+        var fullScreen = remembered?.fullScreen ?? false
+        let lookup = meeting()
+        switch lookup {
+        case let .window(frame, full):
+            fullScreen = full
+            if let id = ZoomMeetingWindow.match(frame, in: windows.filter { $0.layer == 0 }.map { ($0.id, $0.frame) }) {
+                return (.window(id), nil, false, Remembered(window: id, fullScreen: full))
+            }
+        case .minimized:
+            return (nil, .minimized, false, remembered)
+        case .missing:
+            // No answer, as from a busy Zoom: the window recorded goes on while it is on the screen.
+            if case let .window(id)? = recording, onScreen(id) { return (recording, nil, false, remembered) }
+        }
+        // Accessibility says nothing certain: the remembered window, back on the screen, is recorded at once.
+        if let window = remembered?.window, onScreen(window) { return (.window(window), nil, false, remembered) }
+        if hidden { return (nil, .hidden, false, remembered) }
+        // Only a window on the screen is recorded: Zoom on another desktop, in full screen or not, is not shown.
+        if let window = remembered?.window, exists(window) {
+            return (nil, fullScreen ? .fullScreenElsewhere : .otherDesktop, false, remembered)
+        }
+        if case .window = lookup { return (nil, fullScreen ? .fullScreenElsewhere : .otherDesktop, false, remembered) }
+        return (nil, .noMeeting, false, remembered)
+    }
+
+    private func choose(pid: pid_t, recording: Target?, remembered: Remembered?)
+        -> (target: Target?, pause: Pause?, windows: [ZoomWindow], sharing: Bool, remembered: Remembered?) {
         let windows = ZoomMeetingWindow.onScreen(pid: pid)
-        let choice = Self.decide(windows: windows, displays: ZoomMeetingWindow.displays(), meeting: { ZoomMeetingWindow.lookup(pid: pid) },
-                                 paused: { ZoomMeetingWindow.sharePaused(pid: pid) }, recording: recording)
-        return (choice.target, windows, choice.sharing)
+        let lookup = ZoomMeetingWindow.lookup(pid: pid)
+        let choice = Self.decide(windows: windows, displays: ZoomMeetingWindow.displays(), meeting: { lookup },
+                                 paused: { ZoomMeetingWindow.sharePaused(pid: pid) }, recording: recording, remembered: remembered,
+                                 hidden: NSRunningApplication(processIdentifier: pid)?.isHidden == true)
+        return (choice.target, choice.pause, windows, choice.sharing, choice.remembered)
     }
 
     /// The filter, shape and pointer setting for `target`, from ScreenCaptureKit's own list.
@@ -540,7 +584,7 @@ final class ScreenCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
 
     /// Records whenever `wanted` is on, until `stop`, then closes the track. `found` tells whether a
     /// picture is being written while it is wanted.
-    func run(wanted: Locked<Bool>, stop: StopRequest, found: @escaping (Bool) -> Void) async {
+    func run(wanted: Locked<Bool>, stop: StopRequest, found: @escaping (Pause?) -> Void) async {
         var stream: SCStream?
         var target: Target?
         var nextLook = Date.distantPast
@@ -550,7 +594,9 @@ final class ScreenCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
         var lastSync = Date()
         var lastSpaceCheck = Date.distantPast
         var lowSpace = false
-        var reported: Bool?
+        var reported: Pause??
+        var pause: Pause?
+        var remembered: Remembered?
         var writingAt = Self.now()
         var described: String?
         var weighed: (part: URL, bytes: Int, at: Date)?
@@ -621,7 +667,10 @@ final class ScreenCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
                     nextLook = Date().addingTimeInterval(1)
                     // No Zoom, no picture: a display is never recorded without Zoom sharing it.
                     let pid = ZoomAudio.runningZoom()?.processIdentifier
-                    let choice = pid.map { choose(pid: $0, recording: target) } ?? (target: nil, windows: [], sharing: false)
+                    let choice = pid.map { choose(pid: $0, recording: target, remembered: remembered) }
+                        ?? (target: nil, pause: .noMeeting, windows: [], sharing: false, remembered: nil)
+                    pause = choice.pause
+                    remembered = choice.remembered
                     let state = choice.target == nil ? ZoomMeetingWindow.describe(choice.windows, sharing: choice.sharing) : nil
                     if let state, state != described { recorderLog.notice("No picture to record. \(state, privacy: .public)") }
                     described = state
@@ -676,7 +725,7 @@ final class ScreenCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
             // window write nothing. Low disk space has a warning of its own.
             if !wanted.current || lowSpace || queue.sync(execute: { track.currentPart != nil }) { writingAt = Self.now() }
             if !stop.isRequested {
-                let value = Self.now() - writingAt < 3
+                let value: Pause? = Self.now() - writingAt < 3 ? nil : pause ?? .noMeeting
                 if value != reported { found(value) }
                 reported = value
             }

@@ -42,7 +42,7 @@ final class RecorderModel: ObservableObject {
             UserDefaults.standard.set(recordScreen, forKey: "recordScreen")
         }
     }
-    @Published var screenFound = true
+    @Published var screenPause: ScreenCapture.Pause?
     private let screen = Locked(false)
     @Published var elapsed = 0
     @Published var progress: Double?
@@ -69,9 +69,24 @@ final class RecorderModel: ObservableObject {
     var quitConfirmed = false
 
     var ready: Bool { screenAllowed && microphoneAllowed && zoomAllowed }
-    /// The screen is wanted but nothing is being written; not shown before Zoom's meeting controls are.
-    var screenPaused: Bool { connected && recordScreen && !screenFound && microphone != .unavailable }
-    static let screenPausedText = "Окно встречи Zoom не видно — видео на паузе"
+    /// The screen is wanted but nothing is being written, and why; not before a meeting has started.
+    var screenPaused: Bool {
+        guard connected, recordScreen, let screenPause else { return false }
+        return screenPause != .noMeeting || microphone != .unavailable
+    }
+    var screenPausedText: String {
+        switch screenPause {
+        case .otherDesktop?: return "Zoom на другом рабочем столе — видео на паузе"
+        case .fullScreenElsewhere?: return "Zoom во весь экран на другом столе — видео на паузе"
+        case .minimized?: return "Zoom свёрнут — видео на паузе"
+        case .hidden?: return "Zoom скрыт — видео на паузе"
+        case .sharingWindow?: return "Вы показываете окно — видео на паузе"
+        case .sharePaused?: return "Показ экрана на паузе — видео тоже"
+        case .noMeeting?, nil: return "Окно встречи Zoom не видно — видео на паузе"
+        }
+    }
+    /// How to keep the picture when working on other desktops.
+    static let everyDesktopHint = "Чтобы видео не прерывалось на других рабочих столах, закрепите Zoom на всех: правый клик по Zoom в Dock → Параметры → Все рабочие столы. Во весь экран не открывайте."
     var busy: Bool { phase != .idle }
     var time: String { Self.clock(elapsed) }
     var micText: String {
@@ -229,7 +244,7 @@ final class RecorderModel: ObservableObject {
         outcome = nil
         problem = nil
         zoomAudio = true
-        screenFound = true
+        screenPause = nil
         microphone = .unavailable
         connected = true
         progress = nil
@@ -378,8 +393,8 @@ final class RecorderModel: ObservableObject {
             lowDiskSpace = low
         case let .zoomAudio(receiving):
             zoomAudio = receiving
-        case let .screen(found):
-            screenFound = found
+        case let .screen(pause):
+            screenPause = pause
         }
     }
 
@@ -600,7 +615,7 @@ final class RecorderDelegate: NSObject, NSApplicationDelegate {
         case "preparing": model.phase = .preparing
         case "screen":
             model.phase = .recording; model.microphone = .unmuted; model.elapsed = 754
-            model.recordScreen = true; model.screenFound = false
+            model.recordScreen = true; model.screenPause = .otherDesktop
         case "saved", "closed":
             model.outcome = .init(kind: .saved, title: "Сохранено", detail: "47:12 · 38,2 МБ", file: file)
             model.zoomRunning = state != "closed"
@@ -718,8 +733,10 @@ struct MenuBarLabel: View {
     var body: some View {
         switch model.phase {
         case .recording:
-            Text("\(Image(systemName: model.micIcon)) \(model.time)").monospacedDigit()
-                .accessibilityLabel("Идёт запись, \(model.time). \(model.micText)")
+            // Seen on every desktop: a paused picture shows at once.
+            Text("\(Image(systemName: model.micIcon)) \(model.time)\(model.screenPaused ? Text(" \(Image(systemName: "video.slash"))") : Text(""))")
+                .monospacedDigit()
+                .accessibilityLabel("Идёт запись, \(model.time). \(model.micText)" + (model.screenPaused ? ". \(model.screenPausedText)" : ""))
         case .preparing:
             Image(systemName: "record.circle").accessibilityLabel("Подключаюсь к Zoom…")
         case .saving:
@@ -747,7 +764,7 @@ struct RecorderMenu: View {
         case .recording:
             Text(model.connected ? "Запись · \(model.time)" : "Запись · \(model.time) · нет связи с Zoom")
             Text(model.micText)
-            if model.screenPaused { Text(RecorderModel.screenPausedText) }
+            if model.screenPaused { Text(model.screenPausedText) }
         case .preparing: Text("Подключаюсь к Zoom…")
         case .saving: Text("Сохраняю…")
         case .idle:
@@ -1020,7 +1037,9 @@ struct RecordingView: View {
             .controlSize(.large)
             .padding(.top, 6)
             ScreenToggle(model: model)
-            if model.screenPaused { Caption(RecorderModel.screenPausedText) }
+            if model.screenPaused {
+                Caption(model.screenPausedText).help(RecorderModel.everyDesktopHint)
+            }
         }
     }
 }

@@ -70,30 +70,55 @@ func checkMeetingWindow() throws {
     let meetingOnly = ZoomMeetingWindow.share(windows: [("Zoom Meeting", 0, displays[0]), ("zoom floating video window", 26, displays[1])],
                                               displays: displays)
     try check(!meetingOnly.sharing && meetingOnly.display == nil, "a meeting without a share taken for one: \(meetingOnly)")
-    // Zoom in full screen, the user switching away to another desktop and back, again and again: the
-    // meeting window is recorded only while it is on the screen, and the same window comes back.
+    // The user switching desktops with Zoom's meeting window on one of them, again and again: the window is
+    // recorded only while it is on the screen, comes back at once, even before Zoom answers, and every
+    // pause says why.
     let screen = [(id: CGDirectDisplayID(1), frame: displays[0])]
+    let place = CGRect(x: 100, y: 80, width: 1000, height: 700)
+    let meetingWindow = ZoomWindow(id: 100, title: "Zoom Meeting", layer: 0, frame: place)
     let fullScreen = ZoomWindow(id: 100, title: "Zoom Meeting", layer: 0, frame: displays[0])
+    typealias Step = (windows: [ZoomWindow], lookup: ZoomMeetingWindow.Lookup, hidden: Bool, exists: Bool,
+                      target: ScreenCapture.Target?, pause: ScreenCapture.Pause?)
+    let steps: [Step] = [
+        ([meetingWindow], .window(place, fullScreen: false), false, true, .window(100), nil),
+        ([], .missing, false, true, nil, .otherDesktop),
+        ([meetingWindow], .missing, false, true, .window(100), nil),
+        ([], .window(place, fullScreen: false), false, true, nil, .otherDesktop),
+        ([meetingWindow], .window(place, fullScreen: false), false, true, .window(100), nil),
+        ([fullScreen], .window(displays[0], fullScreen: true), false, true, .window(100), nil),
+        ([], .missing, false, true, nil, .fullScreenElsewhere),
+        ([fullScreen], .missing, false, true, .window(100), nil),
+        ([meetingWindow], .window(place, fullScreen: false), false, true, .window(100), nil),
+        ([], .minimized, false, true, nil, .minimized),
+        ([], .window(place, fullScreen: false), true, true, nil, .hidden),
+        ([meetingWindow], .window(place, fullScreen: false), false, true, .window(100), nil),
+        ([], .missing, false, false, nil, .noMeeting),
+    ]
     var recording: ScreenCapture.Target?
-    for (step, (onScreen, meeting)) in [([fullScreen], ZoomMeetingWindow.Lookup.window(displays[0])), ([], .missing),
-                                        ([fullScreen], .window(displays[0])), ([], .window(displays[0])),
-                                        ([fullScreen], .missing), ([fullScreen], .window(displays[0]))].enumerated() {
-        let choice = ScreenCapture.decide(windows: onScreen, displays: screen, meeting: { meeting }, paused: { false }, recording: recording)
-        let expected: ScreenCapture.Target? = onScreen.isEmpty || (step == 4 && recording == nil) ? nil : .window(100)
-        try check(choice.target == expected && !choice.sharing, "step \(step): \(String(describing: choice.target)), expected \(String(describing: expected))")
+    var remembered: ScreenCapture.Remembered?
+    for (index, step) in steps.enumerated() {
+        let choice = ScreenCapture.decide(windows: step.windows, displays: screen, meeting: { step.lookup }, paused: { false },
+                                          recording: recording, remembered: remembered, hidden: step.hidden, exists: { _ in step.exists })
+        try check(choice.target == step.target && choice.pause == step.pause && !choice.sharing,
+                  "desktop step \(index): \(String(describing: choice.target)), \(String(describing: choice.pause))")
         recording = choice.target
+        remembered = choice.remembered
     }
-    // A share starting, pausing, resuming and ending.
+    // A share starting, pausing, resuming, shrinking to one window and ending.
     let shareBar = ZoomWindow(id: 7, title: "zoom share toolbar window", layer: 97, frame: CGRect(x: 400, y: 0, width: 600, height: 60))
     let border = ZoomWindow(id: 8, title: "", layer: 96, frame: displays[0])
-    for (step, (onScreen, paused, expected)) in [([fullScreen], false, ScreenCapture.Target.window(100)),
-                                                 ([shareBar, border], false, .display(1)), ([shareBar, border], true, nil),
-                                                 ([shareBar, border], false, .display(1)), ([shareBar], false, nil),
-                                                 ([fullScreen], false, .window(100))].enumerated() {
-        let choice = ScreenCapture.decide(windows: onScreen, displays: screen, meeting: { .window(displays[0]) }, paused: { paused },
-                                          recording: recording)
-        try check(choice.target == expected, "share step \(step): \(String(describing: choice.target)), expected \(String(describing: expected))")
+    let shares: [(windows: [ZoomWindow], paused: Bool, target: ScreenCapture.Target?, pause: ScreenCapture.Pause?)] = [
+        ([meetingWindow], false, .window(100), nil), ([shareBar, border], false, .display(1), nil),
+        ([shareBar, border], true, nil, .sharePaused), ([shareBar, border], false, .display(1), nil),
+        ([shareBar], false, nil, .sharingWindow), ([meetingWindow], false, .window(100), nil),
+    ]
+    for (index, step) in shares.enumerated() {
+        let choice = ScreenCapture.decide(windows: step.windows, displays: screen, meeting: { .window(place, fullScreen: false) },
+                                          paused: { step.paused }, recording: recording, remembered: remembered)
+        try check(choice.target == step.target && choice.pause == step.pause,
+                  "share step \(index): \(String(describing: choice.target)), \(String(describing: choice.pause))")
         recording = choice.target
+        remembered = choice.remembered
     }
     // A window of another shape goes in the middle of the picture, as large as fits.
     for (size, expected) in [(CGSize(width: 700, height: 700), CGRect(x: 420, y: 0, width: 1080, height: 1080)),

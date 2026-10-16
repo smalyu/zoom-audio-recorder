@@ -1854,8 +1854,8 @@ enum RecorderEvent {
     case lowDiskSpace(Bool)
     /// False when no Zoom audio arrived for a while after connecting.
     case zoomAudio(Bool)
-    /// Whether Zoom's meeting window is being recorded, while recording the screen is on.
-    case screen(Bool)
+    /// Why the picture is not being recorded while recording the screen is on; nil while it is.
+    case screen(ScreenCapture.Pause?)
 }
 
 struct RecordingSummary {
