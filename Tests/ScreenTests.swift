@@ -55,7 +55,30 @@ func checkMeetingWindow() throws {
     let window: (id: CGWindowID, frame: CGRect) = (2, CGRect(x: 100, y: 51, width: 1200, height: 799))
     try check(ZoomMeetingWindow.match(meeting, in: [home, window, toolbar]) == 2, "meeting window not matched")
     try check(ZoomMeetingWindow.match(meeting, in: [home, toolbar]) == nil, "another window taken for the meeting")
-    print("PASS: Zoom's meeting window found by its frame")
+    // The user's own share: Zoom's share windows, and a window of Zoom's exactly over the shared display.
+    let displays = [CGRect(x: 0, y: 0, width: 1512, height: 982), CGRect(x: 1512, y: 0, width: 1920, height: 1080)]
+    let toolbar2 = (title: "zoom share toolbar window", layer: 97, frame: CGRect(x: 1900, y: 0, width: 600, height: 60))
+    let statusbar = (title: "Zoom Share Statusbar Window", layer: 97, frame: CGRect(x: 2200, y: 1000, width: 300, height: 40))
+    let wholeDisplay = ZoomMeetingWindow.share(windows: [toolbar2, statusbar, ("Annotation - Zoom", 96, displays[1])], displays: displays)
+    try check(wholeDisplay.sharing && wholeDisplay.display == 1, "a shared display not found: \(wholeDisplay)")
+    let oneWindow = ZoomMeetingWindow.share(windows: [toolbar2, ("Annotation - Zoom", 96, CGRect(x: 1600, y: 100, width: 800, height: 600))],
+                                            displays: displays)
+    try check(oneWindow.sharing && oneWindow.display == nil, "a shared window taken for a display: \(oneWindow)")
+    let meetingOnly = ZoomMeetingWindow.share(windows: [("Zoom Meeting", 0, displays[0]), ("zoom floating video window", 26, displays[1])],
+                                              displays: displays)
+    try check(!meetingOnly.sharing && meetingOnly.display == nil, "a meeting without a share taken for one: \(meetingOnly)")
+    // A window of another shape goes in the middle of the picture, as large as fits.
+    for (size, expected) in [(CGSize(width: 700, height: 700), CGRect(x: 420, y: 0, width: 1080, height: 1080)),
+                             (CGSize(width: 1600, height: 900), CGRect(x: 0, y: 0, width: 1920, height: 1080)),
+                             (CGSize(width: 1200, height: 400), CGRect(x: 0, y: 220, width: 1920, height: 640)),
+                             (CGSize(width: 333, height: 777), CGRect(x: 729, y: 0, width: 462, height: 1080))] {
+        let placed = ScreenCapture.placement(of: size)
+        try check(placed == expected, "a \(size) window placed at \(placed), expected \(expected)")
+    }
+    try check(!ScreenCapture.differs(CGSize(width: 1000, height: 701), from: CGSize(width: 1000, height: 700))
+              && ScreenCapture.differs(CGSize(width: 1000, height: 600), from: CGSize(width: 1000, height: 700)),
+              "rounding taken for a new window shape, or a new shape missed")
+    print("PASS: Zoom's meeting window found by its frame and placed in the middle of the picture; the user's shared display found")
 }
 
 /// Parts start at their first frame, a still picture is written again every second, and a
@@ -117,6 +140,7 @@ func checkScreenDelivery(_ folder: URL) async throws {
 
     // The screen from 1 to 4 s and from 5.5 to 8.5 s of the recording.
     let recorded = try await session("Screen.m4a")
+    SpeakerLog(directory: recorded.folder).speaker("Анна", at: 3.5)
     let parts = try await screen(recorded, [1..<4, 5.5..<8.5])
     // What each quarter second looks like once encoded, read from the parts themselves.
     var reference: [Int: Double] = [:]
@@ -133,8 +157,16 @@ func checkScreenDelivery(_ folder: URL) async throws {
     try await verifyRecording(delivered.url)
     let length = try await verifyRecording(video)
     try check(abs(length - delivered.duration) < 0.1 && abs(length - 8) < 0.15, "video lasts \(length) s, the sound \(delivered.duration) s")
+    // Time without a picture is black, up to the end of the sound, and the speakers go with the video.
     let pictureRange = try await AVURLAsset(url: video).loadTracks(withMediaType: .video)[0].load(.timeRange)
-    try check(abs(pictureRange.end.seconds - 6.5) < 0.15, "the picture ends at \(pictureRange.end.seconds) s, expected 6.5 s")
+    try check(abs(pictureRange.end.seconds - length) < 0.15, "the picture ends at \(pictureRange.end.seconds) s, the sound at \(length) s")
+    for time in [2.5, 7.0] {
+        let shown = try await brightness(video, at: time)
+        try check(shown < 0.03, "at \(time) s, with no picture, the video shows \(shown), not black")
+    }
+    let tags = try await AVURLAsset(url: video).load(.metadata)
+    let described = try await tags.asyncMap { try await $0.load(.stringValue) ?? "" }
+    try check(described.contains { $0.contains("Анна") }, "the speakers did not go with the video: \(described)")
     for time in [0.1, 1.9, 3.6, 6.3] {
         let shown = try await brightness(video, at: time)
         let nearest = reference.keys.min { abs(reference[$0]! - shown) < abs(reference[$1]! - shown) }!
@@ -211,6 +243,43 @@ func checkScreenDelivery(_ folder: URL) async throws {
     try check(second.url == first.url && second.video?.lastPathComponent == "Retry.mp4", "the retry gave \(second.url.path), \(String(describing: second.video))")
     try check(!manager.fileExists(atPath: destination.appendingPathComponent("Retry 2.m4a").path), "the sound was delivered twice")
     try check(!manager.fileExists(atPath: retry.folder.path), "the session was not retired after the retry")
+
+    // Parts at a fixed bit rate, after the picture turned out heavy, go together with the others.
+    let heavy = try await session("Heavy.m4a")
+    let mixed = ScreenTrack(directory: heavy.folder, width: 320, height: 180, realtime: false)
+    for tenth in 20..<50 { mixed.append(try picture(level: level(at: Double(tenth) / 10)), at: Int64(tenth * 4800)) }
+    mixed.close(at: 240_000)
+    mixed.capped = true
+    for tenth in 50..<90 { mixed.append(try picture(level: level(at: Double(tenth) / 10)), at: Int64(tenth * 4800)) }
+    await mixed.finish(at: nil)
+    let heavyDelivery = try await heavy.deliver(fallback: destination)
+    try check(heavyDelivery.video != nil && !heavyDelivery.videoFailed, "parts of both kinds did not make one video")
+
+    // Without a black part the video is still saved, its gaps empty.
+    let defaultBlack = RecordingSession.blackPart
+    RecordingSession.blackPart = { _, _, _ in throw RecorderError.message("no black") }
+    let plain = try await session("Plain.m4a")
+    _ = try await screen(plain, [3..<5, 7..<8])
+    let plainDelivery = try await plain.deliver(fallback: destination)
+    try check(plainDelivery.video != nil && !plainDelivery.videoFailed, "a video without a black part was not saved")
+
+    // A video step that hangs is given up: the sound is delivered at once, once, and the session retired.
+    let defaultTimeout = RecordingSession.screenTimeout
+    RecordingSession.screenTimeout = { _ in 2 }
+    RecordingSession.blackPart = { _, _, _ in
+        try await Task.sleep(for: .seconds(3600))
+        throw RecorderError.message("unreachable")
+    }
+    let hung = try await session("Hung.m4a")
+    _ = try await screen(hung, [3..<5])
+    let begun = Date()
+    let hungDelivery = try await hung.deliver(fallback: destination)
+    RecordingSession.blackPart = defaultBlack
+    RecordingSession.screenTimeout = defaultTimeout
+    try check(Date().timeIntervalSince(begun) < 15, "a hung video held up saving for \(Date().timeIntervalSince(begun)) s")
+    try check(manager.fileExists(atPath: hungDelivery.url.path) && hungDelivery.videoFailed && hungDelivery.video == nil,
+              "a hung video was not set aside with the sound delivered")
+    try check(!manager.fileExists(atPath: hung.folder.path), "the session of a hung video was kept")
     print("PASS: the saved video lies over the saved sound with its gaps; the sound is delivered first, once, whatever the video does")
 }
 

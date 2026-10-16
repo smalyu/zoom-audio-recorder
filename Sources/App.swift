@@ -48,6 +48,8 @@ final class RecorderModel: ObservableObject {
     @Published var progress: Double?
     @Published var outcome: Outcome?
     @Published var recovered: [URL] = []
+    /// The videos saved with the recovered recordings, by recording, shown with them.
+    private var recoveredVideos: [URL: URL] = [:]
     @Published var unrecovered: URL?
     @Published var recovering = false
     @Published var folder: URL
@@ -67,6 +69,9 @@ final class RecorderModel: ObservableObject {
     var quitConfirmed = false
 
     var ready: Bool { screenAllowed && microphoneAllowed && zoomAllowed }
+    /// The screen is wanted but nothing is being written; not shown before Zoom's meeting controls are.
+    var screenPaused: Bool { connected && recordScreen && !screenFound && microphone != .unavailable }
+    static let screenPausedText = "Окно встречи Zoom не видно — видео на паузе"
     var busy: Bool { phase != .idle }
     var time: String { Self.clock(elapsed) }
     var micText: String {
@@ -94,6 +99,14 @@ final class RecorderModel: ObservableObject {
         }
     }
     var lastFile: URL? { outcome?.file ?? recovered.last }
+    /// The last recording with its video, for Finder.
+    var lastFiles: [URL] {
+        guard let file = lastFile else { return [] }
+        let video = outcome?.file == file ? outcome?.video : recoveredVideos[file]
+        return [file] + (video.map { [$0] } ?? [])
+    }
+    /// The recovered recordings with their videos, for Finder.
+    var recoveredFiles: [URL] { recovered + recovered.compactMap { recoveredVideos[$0] } }
     /// A recording is kept in its working folder because it could not be saved yet.
     var unsaved: Bool {
         unrecovered != nil || (outcome?.kind == .attention && outcome?.file.map { $0.pathExtension != "m4a" } == true)
@@ -313,8 +326,10 @@ final class RecorderModel: ObservableObject {
     private static func outcome(for delivery: RecordingSession.Delivery, summary: RecordingSummary? = nil,
                                 preferred: URL) -> Outcome {
         let size = (try? FileManager.default.attributesOfItem(atPath: delivery.url.path)[.size] as? Int) ?? 0
+        let videoSize = delivery.video.flatMap { try? FileManager.default.attributesOfItem(atPath: $0.path)[.size] as? Int }
         var details = [clock(Int(delivery.duration.rounded())) + " · "
-                       + ByteCountFormatter.string(fromByteCount: Int64(size), countStyle: .file)]
+                       + ByteCountFormatter.string(fromByteCount: Int64(size), countStyle: .file)
+                       + (videoSize.map { " · видео " + ByteCountFormatter.string(fromByteCount: Int64($0), countStyle: .file) } ?? "")]
         if let summary {
             if !summary.hasZoom { details.append("Звук собеседников не получен") }
             if !summary.hasZoom, !summary.hasVoice, summary.needsSafetyCopy {
@@ -326,7 +341,9 @@ final class RecorderModel: ObservableObject {
         }
         let screenMissed = summary?.screenWanted == true && delivery.video == nil && !delivery.videoFailed
         if screenMissed { details.append("Окно встречи Zoom не найдено — видео нет") }
-        if delivery.videoFailed { details.append("Видео не сохранено — исходные файлы сохранены") }
+        if delivery.videoFailed {
+            details.append(delivery.videoNoSpace ? "Мало места — видео не сохранено" : "Видео не сохранено — исходные файлы сохранены")
+        }
         if delivery.microphone != nil { details.append("Кнопка mute не определялась — микрофон сохранён отдельно") }
         if delivery.incomplete { details.append("Часть записи повреждена — исходные файлы сохранены") }
         if delivery.usedFallback {
@@ -396,6 +413,7 @@ final class RecorderModel: ObservableObject {
                 do {
                     let delivery = try await session.deliver(fallback: Self.defaultFolder, recovering: true)
                     recovered.append(delivery.url)
+                    recoveredVideos[delivery.url] = delivery.video
                     if outcome?.file == session.folder { outcome = nil }
                     if unrecovered == session.folder { unrecovered = nil }
                     if delivery.incomplete || delivery.microphone != nil || delivery.usedFallback || delivery.videoFailed {
@@ -436,6 +454,7 @@ final class RecorderModel: ObservableObject {
     /// The recovered files were shown; a recording still waiting to be saved stays visible.
     func dismissRecovered() {
         recovered = []
+        recoveredVideos = [:]
         if !unsaved { attention = false }
     }
 
@@ -603,7 +622,7 @@ final class RecorderDelegate: NSObject, NSApplicationDelegate {
                 detail: "47:12 · 38,2 МБ\nКнопка mute не определялась — микрофон сохранён отдельно",
                 file: file, microphone: file.deletingLastPathComponent().appendingPathComponent("Zoom 2026-10-05 14-30 (микрофон).m4a"))
         case "video":
-            model.outcome = .init(kind: .saved, title: "Сохранено", detail: "47:12 · 38,2 МБ", file: file,
+            model.outcome = .init(kind: .saved, title: "Сохранено", detail: "47:12 · 38,2 МБ · видео 96,4 МБ", file: file,
                                   video: file.deletingPathExtension().appendingPathExtension("mp4"))
             model.recordScreen = true
         case "unrecovered":
@@ -719,7 +738,7 @@ struct RecorderMenu: View {
         if !model.recovered.isEmpty {
             Button(model.recovered.count == 1 ? "Восстановлена запись — показать"
                    : "Восстановлено записей: \(model.recovered.count) — показать") {
-                model.reveal(model.recovered)
+                model.reveal(model.recoveredFiles)
                 model.dismissRecovered()
             }
             Divider()
@@ -728,6 +747,7 @@ struct RecorderMenu: View {
         case .recording:
             Text(model.connected ? "Запись · \(model.time)" : "Запись · \(model.time) · нет связи с Zoom")
             Text(model.micText)
+            if model.screenPaused { Text(RecorderModel.screenPausedText) }
         case .preparing: Text("Подключаюсь к Zoom…")
         case .saving: Text("Сохраняю…")
         case .idle:
@@ -750,7 +770,7 @@ struct RecorderMenu: View {
         if model.phase != .saving { Toggle("Записывать экран", isOn: $model.recordScreen) }
         if let file = model.lastFile, !model.busy {
             Button(file.pathExtension == "m4a" ? "Показать последнюю запись" : "Показать исходную запись") {
-                model.reveal([file])
+                model.reveal(model.lastFiles)
             }
         }
         if model.unsaved {
@@ -943,7 +963,7 @@ struct ScreenToggle: View {
         Toggle("Записывать экран", isOn: $model.recordScreen)
             .toggleStyle(.checkbox)
             .font(.callout)
-            .help("Рядом с аудио сохранится видео окна встречи Zoom")
+            .help("Рядом с аудио сохранится видео того, что показывают на встрече")
     }
 }
 
@@ -1000,9 +1020,7 @@ struct RecordingView: View {
             .controlSize(.large)
             .padding(.top, 6)
             ScreenToggle(model: model)
-            if model.connected && model.recordScreen && !model.screenFound {
-                Caption("Не вижу окно встречи Zoom", warning: true)
-            }
+            if model.screenPaused { Caption(RecorderModel.screenPausedText) }
         }
     }
 }
@@ -1075,7 +1093,7 @@ struct RecoveryBanner: View {
                         .disabled(model.busy || model.recovering || model.quitting)
                 }
                 Button("Показать") {
-                    model.reveal(model.unrecovered.map { [$0] } ?? model.recovered)
+                    model.reveal(model.unrecovered.map { [$0] } ?? model.recoveredFiles)
                 }
             }
             .controlSize(.small)
@@ -1169,7 +1187,7 @@ struct HelpView: View {
         VStack(alignment: .leading, spacing: 10) {
             Text("Войдите в созвон Zoom → «Начать запись» → «Остановить». Файл появится в папке записей.")
             Text("Ваш голос записывается, только когда микрофон включён в Zoom. В Zoom и macOS должен быть выбран один микрофон.")
-            Text("«Записывать экран» сохранит рядом видео окна встречи Zoom. Флажок работает и во время записи.")
+            Text("«Записывать экран» сохранит рядом видео того, что показывают на встрече. Флажок работает и во время записи.")
             Text("Прерванная запись восстанавливается при следующем запуске.")
             Text("Если сохранение не удалось, нажмите «Повторить сохранение». Если кнопка mute не определялась, проверьте отдельную запись микрофона рядом с основным файлом.")
             Text("Предупредите участников о записи.").foregroundStyle(.secondary)

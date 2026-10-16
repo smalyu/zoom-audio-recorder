@@ -309,8 +309,11 @@ func exportRecording(zoom: [TrackPart], mic: [TrackPart], to output: URL, trimme
 
 /// Lays the screen parts over `audio`, a saved recording that starts `start` seconds into the
 /// session, and writes both to an MP4 without encoding anything again, giving up after
-/// `timeout` seconds. Nil when no picture falls within the saved recording.
+/// `timeout` seconds. Time without a picture is black, so the video lasts as long as the
+/// sound: players other than Apple's show the wrong picture over empty time, or move the
+/// picture. Nil when no picture falls within the saved recording.
 func exportScreen(_ parts: [TrackPart], audio: URL, from start: Double, to output: URL, timeout: Double? = nil,
+                  black makeBlack: (Int, Int, URL) async throws -> URL = ScreenTrack.black,
                   progress: @escaping (Double) -> Void = { _ in }) async throws -> Double? {
     let composition = AVMutableComposition()
     let sound = AVURLAsset(url: audio)
@@ -324,38 +327,87 @@ func exportScreen(_ parts: [TrackPart], audio: URL, from start: Double, to outpu
     var assets = [sound]
     let rate = CMTimeScale(AudioTrack.rate)
     let offset = CMTime(seconds: start, preferredTimescale: rate)
-    // The end of the picture so far, on the saved file's timeline.
+    // Where each part lies within the file, never over the part before it.
+    var pieces: [(frames: AVAssetTrack, range: CMTimeRange, at: CMTime)] = []
     var end = CMTime.zero
+    var size = CGSize.zero
     for part in parts {
         let asset = AVURLAsset(url: part.url)
         guard let frames = try? await asset.loadTracks(withMediaType: .video).first,
               let duration = try? await asset.load(.duration), duration.seconds.isFinite, duration.seconds > 0 else { continue }
-        // The part where it lies within the file, never over the part before it.
         let begins = CMTime(value: part.start, timescale: rate) - offset
         let from = max(begins, end)
         let to = min(begins + duration, length)
         guard from < to else { continue }
-        if from > end { video.insertEmptyTimeRange(CMTimeRange(start: end, end: from)) }
-        try video.insertTimeRange(CMTimeRange(start: from - begins, end: to - begins), of: frames, at: from)
+        pieces.append((frames, CMTimeRange(start: from - begins, end: to - begins), from))
         end = to
         assets.append(asset)
+        if size == .zero, let natural = try? await frames.load(.naturalSize) { size = natural }
     }
-    guard end > .zero else { return nil }
-    try? FileManager.default.removeItem(at: output)
-    guard let exporter = AVAssetExportSession(asset: composition, presetName: AVAssetExportPresetPassthrough) else {
-        throw RecorderError.message("Не удалось подготовить видео")
-    }
-    let monitor = Task {
-        for await state in exporter.states(updateInterval: 0.25) {
-            if case let .exporting(current) = state { progress(current.fractionCompleted) }
+    guard !pieces.isEmpty else { return nil }
+    // A ten-second black part, repeated over every stretch without a picture, each copy starting on
+    // its keyframe. Without one the stretches stay empty, which Apple's players show black too.
+    let blackFolder = output.deletingLastPathComponent().appendingPathComponent("black", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: blackFolder) }
+    var black: (track: AVAssetTrack, length: CMTime)?
+    if pieces.first?.at != .zero || pieces.count > 1 || end < length {
+        do {
+            let url = try await makeBlack(size.width > 0 ? Int(size.width) : ScreenTrack.width,
+                                          size.height > 0 ? Int(size.height) : ScreenTrack.height, blackFolder)
+            let asset = AVURLAsset(url: url)
+            if let track = try await asset.loadTracks(withMediaType: .video).first {
+                black = (track, try await track.load(.timeRange).duration)
+                assets.append(asset)
+            }
+        } catch {
+            recorderLog.error("No black picture for the gaps: \(error.localizedDescription, privacy: .public)")
         }
     }
-    defer { monitor.cancel() }
-    do {
-        try await bounded(StopRequest(), timeout: timeout) { try await exporter.export(to: output, as: .mp4) }
-    } catch {
-        exporter.cancelExport()
-        throw error
+    var at = CMTime.zero
+    func fill(until time: CMTime) throws {
+        while at < time {
+            guard let black, black.length > .zero else {
+                video.insertEmptyTimeRange(CMTimeRange(start: at, end: time))
+                at = time
+                return
+            }
+            let stretch = min(black.length, time - at)
+            try video.insertTimeRange(CMTimeRange(start: .zero, duration: stretch), of: black.track, at: at)
+            at = at + stretch
+        }
+    }
+    for piece in pieces {
+        try fill(until: piece.at)
+        try video.insertTimeRange(piece.range, of: piece.frames, at: piece.at)
+        at = piece.at + piece.range.duration
+    }
+    // Without a black part, the picture ends with its last frames.
+    if black != nil {
+        try fill(until: length)
+        end = length
+    }
+    // The speaker timeline goes with the video too; never at the cost of the video.
+    let metadata = (try? await sound.load(.metadata)) ?? []
+    for tags in metadata.isEmpty ? [metadata] : [metadata, []] {
+        try? FileManager.default.removeItem(at: output)
+        guard let exporter = AVAssetExportSession(asset: composition, presetName: AVAssetExportPresetPassthrough) else {
+            throw RecorderError.message("Не удалось подготовить видео")
+        }
+        exporter.metadata = tags
+        let monitor = Task {
+            for await state in exporter.states(updateInterval: 0.25) {
+                if case let .exporting(current) = state { progress(current.fractionCompleted) }
+            }
+        }
+        defer { monitor.cancel() }
+        do {
+            try await bounded(StopRequest(), timeout: timeout) { try await exporter.export(to: output, as: .mp4) }
+            break
+        } catch {
+            exporter.cancelExport()
+            guard !tags.isEmpty, (error as? RecorderError) == nil else { throw error }
+            recorderLog.error("Video with the speaker timeline failed, saving without it: \(error.localizedDescription, privacy: .public)")
+        }
     }
     withExtendedLifetime(assets) {}
     let duration = try await verifyRecording(output)
@@ -390,6 +442,8 @@ final class RecordingSession {
         var video: URL? = nil
         /// The screen was recorded but its video could not be saved; its files were kept aside.
         var videoFailed = false
+        /// Because there was too little disk space for it.
+        var videoNoSpace = false
     }
 
     /// The sound delivered before the video was saved, so an attempt cut short there never
@@ -650,6 +704,7 @@ final class RecordingSession {
         } catch {
             recorderLog.error("Screen not saved: \(error.localizedDescription, privacy: .public)")
             result.videoFailed = true
+            result.videoNoSpace = error as? RecorderError == .noSpaceForVideo
             do {
                 try await keepScreenAside()
                 result.unreadableFolder = unreadableFolder
@@ -665,6 +720,11 @@ final class RecordingSession {
     /// Below this much free space after it, a video is not saved: the sound, even of a
     /// recording going on meanwhile, keeps its room.
     static let videoMargin: Int64 = 1_000_000_000
+    /// How long saving a video may take, by the size of its parts: copying takes seconds a
+    /// gigabyte, and one that hangs is given up. Tests shorten it.
+    nonisolated(unsafe) static var screenTimeout: (Int64) -> Double = { 60 + Double($0) / 20_000_000 }
+    /// Makes the black part for stretches without a picture; tests substitute one that hangs.
+    nonisolated(unsafe) static var blackPart: (Int, Int, URL) async throws -> URL = ScreenTrack.black
 
     /// Exports the screen over the saved sound and puts it next to `audio`; nil when no picture
     /// falls within the sound. An export cut short by a crash or a hang is not tried again.
@@ -680,25 +740,26 @@ final class RecordingSession {
                 throw RecorderError.message("Прошлое сохранение видео прервалось")
             }
             let size = parts.reduce(Int64(0)) { $0 + Int64(Self.size($1.url)) }
-            guard Self.freeSpace(at: folder) > size + Self.videoMargin else { throw RecorderError.message("Мало места для видео") }
+            guard Self.freeSpace(at: folder) > size + Self.videoMargin else { throw RecorderError.noSpaceForVideo }
             guard FileManager.default.createFile(atPath: attempt.path, contents: nil) else {
                 throw RecorderError.message("Не удалось подготовить видео")
             }
             syncToStorage(folder)
             let partial = folder.appendingPathComponent("screen.partial.mp4")
-            // Copying takes seconds a gigabyte; one that hangs is given up.
-            guard let made = try await exportScreen(parts, audio: folder.appendingPathComponent("final.m4a"), from: start,
-                                                    to: partial, timeout: 60 + Double(size) / 20_000_000, progress: progress) else {
-                return nil
-            }
+            let limit = Self.screenTimeout(size)
+            let audio = folder.appendingPathComponent("final.m4a")
+            let black = Self.blackPart
+            // The whole of it, black part and all, is given up after the limit.
+            guard let made = try await bounded(StopRequest(), timeout: limit, {
+                try await exportScreen(parts, audio: audio, from: start, to: partial, timeout: limit, black: black, progress: progress)
+            }) else { return nil }
             syncToStorage(partial)
             try FileManager.default.moveItem(at: partial, to: file)
             duration = made
         }
         let destination = audio.deletingLastPathComponent()
-        guard let duration, Self.freeSpace(at: destination) > Int64(Self.size(file)) + Self.videoMargin else {
-            throw RecorderError.message("Мало места для видео")
-        }
+        guard let duration else { throw RecorderError.message("Не удалось подготовить видео") }
+        guard Self.freeSpace(at: destination) > Int64(Self.size(file)) + Self.videoMargin else { throw RecorderError.noSpaceForVideo }
         return try await place(file, named: audio.deletingPathExtension().lastPathComponent + ".mp4", duration: duration, in: destination)
     }
 

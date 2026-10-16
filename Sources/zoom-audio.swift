@@ -15,10 +15,12 @@ let recorderLog = Logger(subsystem: "local.zoom-audio-recorder", category: "capt
 enum RecorderError: Error, LocalizedError, Equatable {
     case message(String)
     case noAudio
+    case noSpaceForVideo
     var errorDescription: String? {
         switch self {
         case let .message(value): return value
         case .noAudio: return "Звук не получен. Войдите в созвон Zoom и проверьте индикатор микрофона."
+        case .noSpaceForVideo: return "Мало места для видео"
         }
     }
 }
@@ -1060,8 +1062,16 @@ func zoomMicrophoneDiagnostics(observations: Int = 1) async -> [String: Any] {
         } else {
             result["captureApplication"] = "unavailable"
         }
-        result["meetingWindowFrame"] = ZoomMeetingWindow.frame(pid: zoom.processIdentifier).map { "\($0)" } ?? "none"
-        result["meetingWindow"] = ZoomMeetingWindow.find(in: content, pid: zoom.processIdentifier).map { Int($0.windowID) } ?? "none"
+        let pid = zoom.processIdentifier
+        let onScreen = ZoomMeetingWindow.onScreen(pid: pid)
+        let displays = ZoomMeetingWindow.displays()
+        result["meetingWindow"] = String(describing: ZoomMeetingWindow.lookup(pid: pid))
+        result["meetingWindowOnScreen"] = ZoomMeetingWindow.frame(pid: pid)
+            .flatMap { ZoomMeetingWindow.match($0, in: onScreen.filter { $0.layer == 0 }.map { ($0.id, $0.frame) }) }.map { Int($0) } ?? "none"
+        let share = ZoomMeetingWindow.share(windows: onScreen.map { ($0.title, $0.layer, $0.frame) }, displays: displays.map(\.frame))
+        result["sharing"] = share.sharing
+        result["sharedDisplay"] = share.display.map { Int(displays[$0].id) } ?? "none"
+        result["sharePaused"] = share.sharing && ZoomMeetingWindow.sharePaused(pid: pid)
         result["zoomWindows"] = content.windows.filter { $0.owningApplication?.processID == zoom.processIdentifier }
             .map { "\($0.windowID) layer \($0.windowLayer) \($0.isOnScreen ? "on" : "off") \($0.frame) \($0.title ?? "")" }
     }
