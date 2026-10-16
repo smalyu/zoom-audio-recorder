@@ -4,6 +4,7 @@ import ApplicationServices
 import CoreMedia
 import Foundation
 import ScreenCaptureKit
+import VideoToolbox
 
 /// What the meeting shows, written as crash-safe fragmented MP4 parts on the session timeline
 /// like the audio tracks: a part is named after its first frame's position in 48 kHz frames.
@@ -109,13 +110,25 @@ final class ScreenTrack {
         parts.forEach(syncToStorage)
     }
 
+    /// Whether the H.264 encoder takes a quality setting. A setting the encoder does not take raises an
+    /// exception nothing can catch, which would end the app and the recording; software encoders, as
+    /// on Intel Macs, may not take it.
+    static let encodesForQuality: Bool = {
+        var properties: CFDictionary?
+        guard VTCopySupportedPropertyDictionaryForEncoder(width: Int32(width), height: Int32(height), codecType: kCMVideoCodecType_H264,
+                                                          encoderSpecification: nil, encoderIDOut: nil,
+                                                          supportedPropertiesOut: &properties) == noErr,
+              let properties = properties as? [String: Any] else { return false }
+        return properties[kVTCompressionPropertyKey_Quality as String] != nil
+    }()
+
     private func openPart(at position: Int64) -> Bool {
         guard position >= 0, Date() >= retryAt, parts.count < AudioTrack.maxParts else { return false }
         let url = directory.appendingPathComponent("screen-\(parts.count + 1)-\(position).mp4")
         // Encoded for quality, not to a bit rate: text is sharp from a part's first frame and a still
         // picture costs next to nothing, 25 to 220 MB an hour in tests. A keyframe every 10 s: more
         // often costs text its sharpness. A picture that turns out heavy is capped from its next part.
-        let rate: [String: Any] = capped ? [AVVideoAverageBitRateKey: 1_000_000] : [AVVideoQualityKey: 0.6]
+        let rate: [String: Any] = capped || !Self.encodesForQuality ? [AVVideoAverageBitRateKey: 1_000_000] : [AVVideoQualityKey: 0.6]
         do {
             let writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
             writer.movieFragmentInterval = CMTime(value: 2, timescale: 1)
@@ -302,11 +315,12 @@ enum ZoomMeetingWindow {
     static func share(windows: [(title: String, layer: Int, frame: CGRect)], displays: [CGRect]) -> (sharing: Bool, display: Int?) {
         guard windows.contains(where: { shareWindows.contains($0.title.lowercased()) }) else { return (false, nil) }
         let overlays = windows.filter { $0.layer > 0 && !shareWindows.contains($0.title.lowercased()) }.map(\.frame)
-        let display = displays.firstIndex { frame in
-            overlays.contains { abs($0.minX - frame.minX) <= 2 && abs($0.minY - frame.minY) <= 2
-                && abs($0.width - frame.width) <= 2 && abs($0.height - frame.height) <= 2 }
+        let covered = displays.indices.filter { index in
+            overlays.contains { abs($0.minX - displays[index].minX) <= 2 && abs($0.minY - displays[index].minY) <= 2
+                && abs($0.width - displays[index].width) <= 2 && abs($0.height - displays[index].height) <= 2 }
         }
-        return (true, display)
+        // More than one display covered says nothing certain about which one is shared.
+        return (true, covered.count == 1 ? covered[0] : nil)
     }
 
     /// The Resume Share button's label in each of Zoom's languages, read once per Zoom process.
@@ -315,34 +329,42 @@ enum ZoomMeetingWindow {
 
     private static func resumeLabels(pid: pid_t) -> Set<String> {
         if let cached = labelsLock.withLock({ resumeLabels }), cached.pid == pid { return cached.labels }
-        var labels: Set<String> = ["resume share"]
+        var labels: Set<String> = ["resume share", "your screen sharing is paused", "your share is paused"]
         if let url = NSRunningApplication(processIdentifier: pid)?.bundleURL, let bundle = Bundle(url: url) {
             for language in bundle.localizations {
                 guard let path = bundle.path(forResource: "Localizable", ofType: "strings", inDirectory: nil, forLocalization: language),
                       let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
-                      let strings = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: String],
-                      let label = strings["Resume Share"] else { continue }
-                labels.insert(label.lowercased().trimmingCharacters(in: .whitespacesAndNewlines))
+                      let strings = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: String] else { continue }
+                // The button, and the status bar's notice, which shows even with the controls hidden.
+                for key in ["Resume Share", "Your screen sharing is paused", "LN_My_Share_Pause_711934"] {
+                    if let label = strings[key] { labels.insert(label.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)) }
+                }
             }
         }
         labelsLock.withLock { resumeLabels = (pid, labels) }
         return labels
     }
 
-    /// Whether the user paused their share: Zoom's share toolbar then offers to resume it. The
-    /// participants see a frozen picture, so the screen is not recorded meanwhile.
+    private static let texts = [kAXTitleAttribute, kAXDescriptionAttribute, kAXHelpAttribute, kAXValueAttribute] as CFArray
+
+    /// Whether the user paused their share: Zoom's share toolbar then offers to resume it and its
+    /// status bar says so. The participants see a frozen picture, so the screen is not recorded
+    /// meanwhile. A Zoom that does not answer quickly is not waited for.
     static func sharePaused(pid: pid_t) -> Bool {
         let labels = resumeLabels(pid: pid)
+        let deadline = Date().addingTimeInterval(0.3)
         guard let windows = attribute(kAXWindowsAttribute, of: application(pid)) as? [AXUIElement] else { return false }
         var queue = windows.filter { (attribute(kAXTitleAttribute, of: $0) as? String).map { shareWindows.contains($0.lowercased()) } == true }
             .map { ($0, 0) }
         var budget = 300
-        while let (element, depth) = queue.popLast(), budget > 0 {
+        while let (element, depth) = queue.popLast(), budget > 0, Date() < deadline {
             budget -= 1
-            for name in [kAXTitleAttribute, kAXDescriptionAttribute, kAXHelpAttribute] {
-                guard let text = (attribute(name, of: element) as? String)?.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
-                else { continue }
-                if labels.contains(where: { text == $0 || text.hasPrefix($0 + " (") }) { return true }
+            var values: CFArray?
+            let error = AXUIElementCopyMultipleAttributeValues(element, texts, AXCopyMultipleAttributeOptions(rawValue: 0), &values)
+            if error == .cannotComplete { return false }
+            for value in values as? [AnyObject] ?? [] {
+                guard let text = (value as? String)?.lowercased().trimmingCharacters(in: .whitespacesAndNewlines) else { continue }
+                if labels.contains(where: { text == $0 || text.hasPrefix($0 + " (") || text.hasPrefix($0 + ".") }) { return true }
             }
             guard depth < 8 else { continue }
             queue += (attribute(kAXChildrenAttribute, of: element) as? [AXUIElement] ?? []).map { ($0, depth + 1) }
@@ -355,10 +377,12 @@ enum ZoomMeetingWindow {
     static func describe(_ windows: [ZoomWindow], sharing: Bool) -> String {
         let names = windows.map { window -> String in
             let lower = window.title.lowercased()
-            let own = lower.hasPrefix("zoom ") || lower.hasSuffix(" - zoom") || ["", "zoom", "zoom meeting", "zoom workplace"].contains(lower)
+            // Zoom's internal names are in lower case; a meeting's own title is not kept.
+            let own = (window.title == lower && lower.hasPrefix("zoom ")) || window.title == "Annotation - Zoom"
+                || ["", "Zoom", "Zoom Meeting", "Zoom Workplace"].contains(window.title)
             return "\"\(own ? window.title : "…")\" \(window.layer)"
         }
-        return (sharing ? "Sharing, no display. " : "") + "Zoom windows on screen: " + names.joined(separator: "; ")
+        return (sharing ? "Sharing, paused or no single display. " : "") + "Zoom windows on screen: " + names.joined(separator: "; ")
     }
 }
 
@@ -524,15 +548,17 @@ final class ScreenCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
         var weighed: (part: URL, bytes: Int, at: Date)?
         var heavy = 0
         func end() async {
-            if let stream { await waitAtMost(5) { try? await stream.stopCapture() } }
-            stream = nil
-            target = nil
+            // Detached first: nothing more is written once the picture is not wanted, however long
+            // the stream takes to stop.
             let position = position(at: Self.now())
             queue.sync {
                 current = nil
                 hiddenAt = nil
                 track.close(at: position)
             }
+            if let stream { await waitAtMost(5) { try? await stream.stopCapture() } }
+            stream = nil
+            target = nil
             broken.current = false
             hidden.current = false
         }
@@ -723,6 +749,7 @@ final class ScreenCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
                 current = nil
                 track.close(at: position)
             }
+            broken.current = false
             Task { try? await stream.stopCapture() }
             return nil
         }

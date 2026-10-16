@@ -313,6 +313,7 @@ func exportRecording(zoom: [TrackPart], mic: [TrackPart], to output: URL, trimme
 /// sound: players other than Apple's show the wrong picture over empty time, or move the
 /// picture. Nil when no picture falls within the saved recording.
 func exportScreen(_ parts: [TrackPart], audio: URL, from start: Double, to output: URL, timeout: Double? = nil,
+                  cancel: StopRequest = StopRequest(),
                   black makeBlack: (Int, Int, URL) async throws -> URL = ScreenTrack.black,
                   progress: @escaping (Double) -> Void = { _ in }) async throws -> Double? {
     let composition = AVMutableComposition()
@@ -401,11 +402,11 @@ func exportScreen(_ parts: [TrackPart], audio: URL, from start: Double, to outpu
         }
         defer { monitor.cancel() }
         do {
-            try await bounded(StopRequest(), timeout: timeout) { try await exporter.export(to: output, as: .mp4) }
+            try await bounded(cancel, timeout: timeout) { try await exporter.export(to: output, as: .mp4) }
             break
         } catch {
             exporter.cancelExport()
-            guard !tags.isEmpty, (error as? RecorderError) == nil else { throw error }
+            guard !tags.isEmpty, (error as? RecorderError) == nil, !(error is CancellationError), !cancel.isRequested else { throw error }
             recorderLog.error("Video with the speaker timeline failed, saving without it: \(error.localizedDescription, privacy: .public)")
         }
     }
@@ -749,10 +750,19 @@ final class RecordingSession {
             let limit = Self.screenTimeout(size)
             let audio = folder.appendingPathComponent("final.m4a")
             let black = Self.blackPart
-            // The whole of it, black part and all, is given up after the limit.
-            guard let made = try await bounded(StopRequest(), timeout: limit, {
-                try await exportScreen(parts, audio: audio, from: start, to: partial, timeout: limit, black: black, progress: progress)
-            }) else { return nil }
+            // The whole of it, black part and all, is given up after the limit, and cancelled.
+            let cancel = StopRequest()
+            let made: Double?
+            do {
+                made = try await bounded(StopRequest(), timeout: limit, {
+                    try await exportScreen(parts, audio: audio, from: start, to: partial, timeout: limit, cancel: cancel,
+                                           black: black, progress: progress)
+                })
+            } catch {
+                cancel.stop()
+                throw error
+            }
+            guard let made else { return nil }
             syncToStorage(partial)
             try FileManager.default.moveItem(at: partial, to: file)
             duration = made

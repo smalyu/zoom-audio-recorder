@@ -64,6 +64,9 @@ func checkMeetingWindow() throws {
     let oneWindow = ZoomMeetingWindow.share(windows: [toolbar2, ("Annotation - Zoom", 96, CGRect(x: 1600, y: 100, width: 800, height: 600))],
                                             displays: displays)
     try check(oneWindow.sharing && oneWindow.display == nil, "a shared window taken for a display: \(oneWindow)")
+    let both = ZoomMeetingWindow.share(windows: [toolbar2, ("Annotation - Zoom", 96, displays[0]), ("Annotation - Zoom", 96, displays[1])],
+                                       displays: displays)
+    try check(both.sharing && both.display == nil, "one of two covered displays taken for the shared one: \(both)")
     let meetingOnly = ZoomMeetingWindow.share(windows: [("Zoom Meeting", 0, displays[0]), ("zoom floating video window", 26, displays[1])],
                                               displays: displays)
     try check(!meetingOnly.sharing && meetingOnly.display == nil, "a meeting without a share taken for one: \(meetingOnly)")
@@ -78,7 +81,8 @@ func checkMeetingWindow() throws {
     try check(!ScreenCapture.differs(CGSize(width: 1000, height: 701), from: CGSize(width: 1000, height: 700))
               && ScreenCapture.differs(CGSize(width: 1000, height: 600), from: CGSize(width: 1000, height: 700)),
               "rounding taken for a new window shape, or a new shape missed")
-    print("PASS: Zoom's meeting window found by its frame and placed in the middle of the picture; the user's shared display found")
+    print("PASS: Zoom's meeting window found by its frame and placed in the middle of the picture; the user's shared display found"
+          + (ScreenTrack.encodesForQuality ? "" : " (this encoder takes no quality setting: a fixed bit rate is used)"))
 }
 
 /// Parts start at their first frame, a still picture is written again every second, and a
