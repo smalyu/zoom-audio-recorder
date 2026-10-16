@@ -1,14 +1,15 @@
 import AVFoundation
 import Foundation
 
-/// Opens a recording and checks that it plays: exactly one audio track, no video.
+/// Opens a recording and checks that it plays: `audio` audio tracks, and one video track in
+/// an MP4 or none in an M4A.
 @discardableResult
-func verifyRecording(_ url: URL) async throws -> Double {
+func verifyRecording(_ url: URL, audio expected: Int = 1) async throws -> Double {
     let asset = AVURLAsset(url: url)
     let audio = try await asset.loadTracks(withMediaType: .audio)
     let video = try await asset.loadTracks(withMediaType: .video)
     let duration = try await asset.load(.duration).seconds
-    guard audio.count == 1, video.isEmpty, duration.isFinite, duration > 0 else {
+    guard audio.count == expected, video.count == (url.pathExtension == "mp4" ? 1 : 0), duration.isFinite, duration > 0 else {
         throw RecorderError.message("Сохранённый файл не прошёл проверку")
     }
     return duration
@@ -43,6 +44,8 @@ struct ExportResult {
     let duration: Double
     /// Parts AVFoundation could not open.
     let unreadable: [URL]
+    /// Where the file starts in the recording, in seconds.
+    var start = 0.0
 }
 
 /// Mixes `tracks` into stereo AAC at the bit rate they were recorded with, on a background
@@ -301,7 +304,66 @@ func exportRecording(zoom: [TrackPart], mic: [TrackPart], to output: URL, trimme
     guard duration > min(expected, range.end.seconds) - range.start.seconds - 1 else {
         throw RecorderError.message("Сохранённый файл короче записи")
     }
-    return ExportResult(duration: duration, unreadable: unreadable)
+    return ExportResult(duration: duration, unreadable: unreadable, start: range.start.seconds)
+}
+
+/// Lays the screen parts over `audio`, a saved recording that starts `start` seconds into the
+/// session, and writes both to an MP4 without encoding anything again, giving up after
+/// `timeout` seconds. Nil when no picture falls within the saved recording.
+func exportScreen(_ parts: [TrackPart], audio: URL, from start: Double, to output: URL, timeout: Double? = nil,
+                  progress: @escaping (Double) -> Void = { _ in }) async throws -> Double? {
+    let composition = AVMutableComposition()
+    let sound = AVURLAsset(url: audio)
+    guard let source = try await sound.loadTracks(withMediaType: .audio).first,
+          let soundTrack = composition.addMutableTrack(withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid),
+          let video = composition.addMutableTrack(withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid) else {
+        throw RecorderError.message("Не удалось подготовить видео")
+    }
+    let length = try await sound.load(.duration)
+    try soundTrack.insertTimeRange(CMTimeRange(start: .zero, duration: length), of: source, at: .zero)
+    var assets = [sound]
+    let rate = CMTimeScale(AudioTrack.rate)
+    let offset = CMTime(seconds: start, preferredTimescale: rate)
+    // The end of the picture so far, on the saved file's timeline.
+    var end = CMTime.zero
+    for part in parts {
+        let asset = AVURLAsset(url: part.url)
+        guard let frames = try? await asset.loadTracks(withMediaType: .video).first,
+              let duration = try? await asset.load(.duration), duration.seconds.isFinite, duration.seconds > 0 else { continue }
+        // The part where it lies within the file, never over the part before it.
+        let begins = CMTime(value: part.start, timescale: rate) - offset
+        let from = max(begins, end)
+        let to = min(begins + duration, length)
+        guard from < to else { continue }
+        if from > end { video.insertEmptyTimeRange(CMTimeRange(start: end, end: from)) }
+        try video.insertTimeRange(CMTimeRange(start: from - begins, end: to - begins), of: frames, at: from)
+        end = to
+        assets.append(asset)
+    }
+    guard end > .zero else { return nil }
+    try? FileManager.default.removeItem(at: output)
+    guard let exporter = AVAssetExportSession(asset: composition, presetName: AVAssetExportPresetPassthrough) else {
+        throw RecorderError.message("Не удалось подготовить видео")
+    }
+    let monitor = Task {
+        for await state in exporter.states(updateInterval: 0.25) {
+            if case let .exporting(current) = state { progress(current.fractionCompleted) }
+        }
+    }
+    defer { monitor.cancel() }
+    do {
+        try await bounded(StopRequest(), timeout: timeout) { try await exporter.export(to: output, as: .mp4) }
+    } catch {
+        exporter.cancelExport()
+        throw error
+    }
+    withExtendedLifetime(assets) {}
+    let duration = try await verifyRecording(output)
+    let picture = try await AVURLAsset(url: output).loadTracks(withMediaType: .video).first?.load(.timeRange)
+    guard abs(duration - length.seconds) < 1, let picture, abs(picture.end.seconds - end.seconds) < 0.5 else {
+        throw RecorderError.message("Видео не совпадает с записью")
+    }
+    return duration
 }
 
 /// Everything recorded for one meeting. Audio stays in this folder until a verified
@@ -321,9 +383,24 @@ final class RecordingSession {
         let duration: Double
         /// Some parts could not be read; they were kept aside rather than deleted.
         let incomplete: Bool
-        let unreadableFolder: URL?
+        var unreadableFolder: URL?
         /// The whole microphone, saved next to the recording when mute detection may have failed.
         let microphone: URL?
+        /// Zoom's meeting window with the recording's sound, when the screen was recorded.
+        var video: URL? = nil
+        /// The screen was recorded but its video could not be saved; its files were kept aside.
+        var videoFailed = false
+    }
+
+    /// The sound delivered before the video was saved, so an attempt cut short there never
+    /// delivers it again.
+    private struct DeliveredSound: Codable {
+        var url: URL
+        var usedFallback: Bool
+        var duration: Double
+        var incomplete: Bool
+        var microphone: URL?
+        var start: Double?
     }
 
     static let root = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -469,6 +546,10 @@ final class RecordingSession {
     /// deleted, and the next launch tries again.
     func deliver(fallback: URL, recovering: Bool = false,
                  progress: @escaping (Double) -> Void = { _ in }) async throws -> Delivery {
+        if let data = try? Data(contentsOf: folder.appendingPathComponent("delivered.json")),
+           let sound = try? JSONDecoder().decode(DeliveredSound.self, from: data) {
+            return await deliverScreen(after: sound, progress: progress)
+        }
         var wholeMicrophone = needsSafetyCopy(recovering: recovering)
         if !wholeMicrophone, recovering { wholeMicrophone = await microphoneCutShort() }
         let tracks = ["zoom"] + (hasVoice ? ["mic"] : []) + (wholeMicrophone ? ["raw"] : [])
@@ -477,9 +558,13 @@ final class RecordingSession {
         let zoomParts = AudioTrack.parts(named: "zoom", in: folder)
         let micParts = tracks.contains("mic") ? AudioTrack.parts(named: "mic", in: folder) : []
         let rawParts = tracks.contains("raw") ? AudioTrack.parts(named: "raw", in: folder) : []
+        let screen = !ScreenTrack.parts(in: folder).isEmpty
+        // The video is saved after the sound; copying it takes a fraction of the time mixing the sound does.
+        let share = screen ? 0.8 : 1
         // Without any Zoom audio or voice, the safety copy is the recording itself.
         let main = try await exported("final", zoom: zoomParts, mic: micParts.isEmpty && zoomParts.isEmpty ? rawParts : micParts,
-                                      description: { SpeakerLog.timeline(in: self.folder, from: $0, to: $1) }, progress: progress)
+                                      description: { SpeakerLog.timeline(in: self.folder, from: $0, to: $1) },
+                                      progress: { progress($0 * share) })
         // A failed safety copy keeps the session for a retry rather than losing the microphone.
         let cachedSafety = Self.size(folder.appendingPathComponent("microphone.m4a")) > 0
         let safety = !cachedSafety && (rawParts.isEmpty || (zoomParts.isEmpty && micParts.isEmpty)) ? nil
@@ -508,11 +593,18 @@ final class RecordingSession {
                         throw error
                     }
                 }
-                retire()
-                return Delivery(url: url, usedFallback: placed.standardizedFileURL.path != preferred.standardizedFileURL.path,
-                                duration: main.duration,
-                                incomplete: incomplete, unreadableFolder: incomplete ? unreadableFolder : nil,
-                                microphone: microphone)
+                let sound = DeliveredSound(url: url, usedFallback: placed.standardizedFileURL.path != preferred.standardizedFileURL.path,
+                                           duration: main.duration, incomplete: incomplete, microphone: microphone, start: main.start)
+                guard screen else {
+                    retire()
+                    return delivery(of: sound)
+                }
+                // The sound is delivered whatever happens to the video; recorded so, a crash or a hang
+                // while saving the video never delivers it again.
+                let record = folder.appendingPathComponent("delivered.json")
+                try? JSONEncoder().encode(sound).write(to: record, options: .atomic)
+                syncToStorage(record)
+                return await deliverScreen(after: sound) { progress(share + $0 * (1 - share)) }
             } catch {
                 recorderLog.error("Save to \(directory.path, privacy: .public) failed: \(error.localizedDescription, privacy: .public)")
                 failure = error
@@ -521,19 +613,112 @@ final class RecordingSession {
         throw failure ?? RecorderError.message("Не удалось сохранить запись")
     }
 
-    /// The mixed file in the session folder, exported once and reused on a retry.
+    /// The mixed file in the session folder, exported once and reused on a retry, and where it
+    /// starts in the recording, in seconds, if known.
     private func exported(_ name: String, zoom: [TrackPart], mic: [TrackPart], trimmed: Bool = true,
                           description: @escaping (Double, Double) -> String? = { _, _ in nil },
-                          progress: @escaping (Double) -> Void = { _ in }) async throws -> (file: URL, duration: Double) {
+                          progress: @escaping (Double) -> Void = { _ in }) async throws -> (file: URL, duration: Double, start: Double?) {
         let file = folder.appendingPathComponent("\(name).m4a")
-        if let duration = try? await verifyRecording(file) { return (file, duration) }
+        let start = folder.appendingPathComponent("\(name).start")
+        if let duration = try? await verifyRecording(file) {
+            return (file, duration, (try? String(contentsOf: start, encoding: .utf8)).flatMap(Double.init))
+        }
         let partial = folder.appendingPathComponent("\(name).partial.m4a")
         let result = try await exportRecording(zoom: zoom, mic: mic, to: partial, trimmed: trimmed, description: description,
                                                progress: progress)
+        // Kept for laying the screen over the file on a later attempt.
+        try? Data(String(result.start).utf8).write(to: start, options: .atomic)
+        syncToStorage(start)
         syncToStorage(partial)
         try? FileManager.default.removeItem(at: file)
         try FileManager.default.moveItem(at: partial, to: file)
-        return (file, result.duration)
+        return (file, result.duration, result.start)
+    }
+
+    private func delivery(of sound: DeliveredSound) -> Delivery {
+        Delivery(url: sound.url, usedFallback: sound.usedFallback, duration: sound.duration, incomplete: sound.incomplete,
+                 unreadableFolder: sound.incomplete ? unreadableFolder : nil, microphone: sound.microphone)
+    }
+
+    /// After the sound is delivered: saves the video next to it, or keeps its files aside when
+    /// it cannot be saved, then retires the session. Only a failure to keep them aside keeps the
+    /// session, for the next launch to try the video again.
+    private func deliverScreen(after sound: DeliveredSound, progress: @escaping (Double) -> Void = { _ in }) async -> Delivery {
+        var result = delivery(of: sound)
+        do {
+            result.video = try await saveScreen(next: sound.url, start: sound.start, progress: progress)
+        } catch {
+            recorderLog.error("Screen not saved: \(error.localizedDescription, privacy: .public)")
+            result.videoFailed = true
+            do {
+                try await keepScreenAside()
+                result.unreadableFolder = unreadableFolder
+            } catch {
+                recorderLog.error("Screen not kept aside: \(error.localizedDescription, privacy: .public)")
+                return result
+            }
+        }
+        retire()
+        return result
+    }
+
+    /// Below this much free space after it, a video is not saved: the sound, even of a
+    /// recording going on meanwhile, keeps its room.
+    static let videoMargin: Int64 = 1_000_000_000
+
+    /// Exports the screen over the saved sound and puts it next to `audio`; nil when no picture
+    /// falls within the sound. An export cut short by a crash or a hang is not tried again.
+    private func saveScreen(next audio: URL, start: Double?, progress: @escaping (Double) -> Void) async throws -> URL? {
+        let parts = ScreenTrack.parts(in: folder)
+        guard !parts.isEmpty else { return nil }
+        let file = folder.appendingPathComponent("screen.mp4")
+        var duration = try? await verifyRecording(file)
+        if duration == nil {
+            let attempt = folder.appendingPathComponent("screen-attempt")
+            guard let start else { throw RecorderError.message("Неизвестно, где начинается запись") }
+            guard !FileManager.default.fileExists(atPath: attempt.path) else {
+                throw RecorderError.message("Прошлое сохранение видео прервалось")
+            }
+            let size = parts.reduce(Int64(0)) { $0 + Int64(Self.size($1.url)) }
+            guard Self.freeSpace(at: folder) > size + Self.videoMargin else { throw RecorderError.message("Мало места для видео") }
+            guard FileManager.default.createFile(atPath: attempt.path, contents: nil) else {
+                throw RecorderError.message("Не удалось подготовить видео")
+            }
+            syncToStorage(folder)
+            let partial = folder.appendingPathComponent("screen.partial.mp4")
+            // Copying takes seconds a gigabyte; one that hangs is given up.
+            guard let made = try await exportScreen(parts, audio: folder.appendingPathComponent("final.m4a"), from: start,
+                                                    to: partial, timeout: 60 + Double(size) / 20_000_000, progress: progress) else {
+                return nil
+            }
+            syncToStorage(partial)
+            try FileManager.default.moveItem(at: partial, to: file)
+            duration = made
+        }
+        let destination = audio.deletingLastPathComponent()
+        guard let duration, Self.freeSpace(at: destination) > Int64(Self.size(file)) + Self.videoMargin else {
+            throw RecorderError.message("Мало места для видео")
+        }
+        return try await place(file, named: audio.deletingPathExtension().lastPathComponent + ".mp4", duration: duration, in: destination)
+    }
+
+    /// Keeps the screen aside: the saved video if it plays, else the parts it is made from.
+    private func keepScreenAside() async throws {
+        let manager = FileManager.default
+        try manager.createDirectory(at: unreadableFolder, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        try? manager.removeItem(at: folder.appendingPathComponent("screen.partial.mp4"))
+        let video = folder.appendingPathComponent("screen.mp4")
+        let playable = (try? await verifyRecording(video)) != nil
+        for file in playable ? [video] : ScreenTrack.parts(in: folder).map(\.url) + [video] where manager.fileExists(atPath: file.path) {
+            let target = unreadableFolder.appendingPathComponent(file.lastPathComponent)
+            try? manager.removeItem(at: target)
+            try manager.moveItem(at: file, to: target)
+        }
+    }
+
+    static func freeSpace(at url: URL) -> Int64 {
+        let values = try? url.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey, .volumeAvailableCapacityKey])
+        return values?.volumeAvailableCapacityForImportantUsage ?? values?.volumeAvailableCapacity.map(Int64.init) ?? .max
     }
 
     /// Where an exported file was placed, recorded until the session is retired.
@@ -556,9 +741,10 @@ final class RecordingSession {
         }
         try manager.createDirectory(at: directory, withIntermediateDirectories: true)
         let base = (name as NSString).deletingPathExtension
+        let type = file.pathExtension
         // Named after the session, so a copy cut short is replaced by the next attempt.
         let temporary = directory.appendingPathComponent(
-            ".zoom-recording-\(folder.lastPathComponent)-\(file.deletingPathExtension().lastPathComponent).partial.m4a")
+            ".zoom-recording-\(folder.lastPathComponent)-\(file.deletingPathExtension().lastPathComponent).partial.\(type)")
         try? manager.removeItem(at: temporary)
         defer { try? manager.removeItem(at: temporary) }
         try manager.copyItem(at: file, to: temporary)
@@ -593,7 +779,7 @@ final class RecordingSession {
                                   userInfo: [NSFilePathErrorKey: target.path])
                 }
             }
-            target = directory.appendingPathComponent("\(base) \(index).m4a")
+            target = directory.appendingPathComponent("\(base) \(index).\(type)")
             index += 1
         }
     }
@@ -605,8 +791,9 @@ final class RecordingSession {
         let aside = unreadableFolder
         // A previous delivery may have moved parts aside before its destination failed.
         var kept = FileManager.default.fileExists(atPath: aside.path)
-        for part in tracks.flatMap({ AudioTrack.parts(named: $0, in: folder) }) {
-            guard (try? await verifyRecording(part.url)) == nil else { continue }
+        let screen = ScreenTrack.parts(in: folder)
+        for part in tracks.flatMap({ AudioTrack.parts(named: $0, in: folder) }) + screen {
+            guard (try? await verifyRecording(part.url, audio: screen.contains(part) ? 0 : 1)) == nil else { continue }
             if Self.size(part.url) == 0 || Self.beforeFirstFragment(part.url) {
                 try FileManager.default.removeItem(at: part.url)
                 continue

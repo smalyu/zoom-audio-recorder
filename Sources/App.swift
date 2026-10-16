@@ -22,6 +22,7 @@ final class RecorderModel: ObservableObject {
         var file: URL?
         var microphone: URL? = nil
         var unreadableFolder: URL? = nil
+        var video: URL? = nil
     }
 
     @Published var phase: Phase = .idle
@@ -34,6 +35,15 @@ final class RecorderModel: ObservableObject {
     @Published var problem: String?
     @Published var lowDiskSpace = false
     @Published var zoomAudio = true
+    /// Record Zoom's meeting window too; can be switched during a recording.
+    @Published var recordScreen: Bool {
+        didSet {
+            screen.current = recordScreen
+            UserDefaults.standard.set(recordScreen, forKey: "recordScreen")
+        }
+    }
+    @Published var screenFound = true
+    private let screen = Locked(false)
     @Published var elapsed = 0
     @Published var progress: Double?
     @Published var outcome: Outcome?
@@ -98,6 +108,8 @@ final class RecorderModel: ObservableObject {
     init() {
         let saved = UserDefaults.standard.string(forKey: "folder")
         folder = saved.map { URL(fileURLWithPath: $0, isDirectory: true) } ?? Self.defaultFolder
+        recordScreen = UserDefaults.standard.bool(forKey: "recordScreen")
+        screen.current = recordScreen
         refresh()
         checkFolder()
         let timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
@@ -204,6 +216,7 @@ final class RecorderModel: ObservableObject {
         outcome = nil
         problem = nil
         zoomAudio = true
+        screenFound = true
         microphone = .unavailable
         connected = true
         progress = nil
@@ -234,7 +247,7 @@ final class RecorderModel: ObservableObject {
                 let created = try RecordingSession.create(destination: destination,
                                                           name: RecordingSession.fileName(for: Date()))
                 session = created
-                let summary = try await ZoomAudio.record(into: created.folder, stop: request, events: { event in
+                let summary = try await ZoomAudio.record(into: created.folder, stop: request, screen: screen, events: { event in
                     Task { @MainActor in
                         guard self.stop === request else { return }
                         self.handle(event)
@@ -311,18 +324,21 @@ final class RecorderModel: ObservableObject {
             if summary.interruptions > 0 { details.append("Связь с Zoom прерывалась: \(summary.interruptions)") }
             if !summary.hasVoice && delivery.microphone == nil && summary.hasZoom { details.append("Микрофон оставался выключен или не определялся") }
         }
+        let screenMissed = summary?.screenWanted == true && delivery.video == nil && !delivery.videoFailed
+        if screenMissed { details.append("Окно встречи Zoom не найдено — видео нет") }
+        if delivery.videoFailed { details.append("Видео не сохранено — исходные файлы сохранены") }
         if delivery.microphone != nil { details.append("Кнопка mute не определялась — микрофон сохранён отдельно") }
         if delivery.incomplete { details.append("Часть записи повреждена — исходные файлы сохранены") }
         if delivery.usedFallback {
             details.insert("Папка «\(preferred.lastPathComponent)» недоступна", at: 0)
             return Outcome(kind: .attention, title: "Сохранено в «\(delivery.url.deletingLastPathComponent().lastPathComponent)»",
                            detail: details.joined(separator: "\n"), file: delivery.url,
-                           microphone: delivery.microphone, unreadableFolder: delivery.unreadableFolder)
+                           microphone: delivery.microphone, unreadableFolder: delivery.unreadableFolder, video: delivery.video)
         }
         return Outcome(kind: delivery.incomplete || delivery.microphone != nil || summary?.hasZoom == false
-                       || (summary?.interruptions ?? 0) > 0 ? .attention : .saved, title: "Сохранено",
+                       || (summary?.interruptions ?? 0) > 0 || delivery.videoFailed || screenMissed ? .attention : .saved, title: "Сохранено",
                        detail: details.joined(separator: "\n"), file: delivery.url,
-                       microphone: delivery.microphone, unreadableFolder: delivery.unreadableFolder)
+                       microphone: delivery.microphone, unreadableFolder: delivery.unreadableFolder, video: delivery.video)
     }
 
     private func handle(_ event: RecorderEvent) {
@@ -345,6 +361,8 @@ final class RecorderModel: ObservableObject {
             lowDiskSpace = low
         case let .zoomAudio(receiving):
             zoomAudio = receiving
+        case let .screen(found):
+            screenFound = found
         }
     }
 
@@ -380,7 +398,7 @@ final class RecorderModel: ObservableObject {
                     recovered.append(delivery.url)
                     if outcome?.file == session.folder { outcome = nil }
                     if unrecovered == session.folder { unrecovered = nil }
-                    if delivery.incomplete || delivery.microphone != nil || delivery.usedFallback {
+                    if delivery.incomplete || delivery.microphone != nil || delivery.usedFallback || delivery.videoFailed {
                         let result = Self.outcome(for: delivery,
                             preferred: URL(fileURLWithPath: session.manifest.destination, isDirectory: true))
                         // Warnings already on screen stay, and so does a newer recording's result.
@@ -561,6 +579,9 @@ final class RecorderDelegate: NSObject, NSApplicationDelegate {
             model.zoomAudio = false; model.lowDiskSpace = true
         case "saving": model.phase = .saving; model.elapsed = 2832; model.progress = 0.62
         case "preparing": model.phase = .preparing
+        case "screen":
+            model.phase = .recording; model.microphone = .unmuted; model.elapsed = 754
+            model.recordScreen = true; model.screenFound = false
         case "saved", "closed":
             model.outcome = .init(kind: .saved, title: "Сохранено", detail: "47:12 · 38,2 МБ", file: file)
             model.zoomRunning = state != "closed"
@@ -581,6 +602,10 @@ final class RecorderDelegate: NSObject, NSApplicationDelegate {
             model.outcome = .init(kind: .attention, title: "Сохранено",
                 detail: "47:12 · 38,2 МБ\nКнопка mute не определялась — микрофон сохранён отдельно",
                 file: file, microphone: file.deletingLastPathComponent().appendingPathComponent("Zoom 2026-10-05 14-30 (микрофон).m4a"))
+        case "video":
+            model.outcome = .init(kind: .saved, title: "Сохранено", detail: "47:12 · 38,2 МБ", file: file,
+                                  video: file.deletingPathExtension().appendingPathExtension("mp4"))
+            model.recordScreen = true
         case "unrecovered":
             model.unrecovered = RecordingSession.root.appendingPathComponent("2026-10-05 14-30-00 1A2B3C4D")
         case "damaged":
@@ -606,8 +631,9 @@ final class RecorderDelegate: NSObject, NSApplicationDelegate {
                 try? bitmap.representation(using: .png, properties: [:])?.write(to:
                     URL(fileURLWithPath: CommandLine.arguments[1]))
             }
-            // Preview simulations never enter the recording shutdown path.
+            // Preview simulations never enter the recording shutdown path, nor keep a setting.
             model.phase = .idle
+            UserDefaults.standard.removeObject(forKey: "recordScreen")
             model.recovering = false
             NSApplication.shared.terminate(nil)
         }
@@ -721,6 +747,7 @@ struct RecorderMenu: View {
             Button("Начать запись") { model.start() }
                 .disabled(model.busy || !model.ready || !model.zoomRunning || model.quitting)
         }
+        if model.phase != .saving { Toggle("Записывать экран", isOn: $model.recordScreen) }
         if let file = model.lastFile, !model.busy {
             Button(file.pathExtension == "m4a" ? "Показать последнюю запись" : "Показать исходную запись") {
                 model.reveal([file])
@@ -811,6 +838,7 @@ struct IdleView: View {
             .controlSize(.large)
             .keyboardShortcut(.defaultAction)
             .disabled(!model.zoomRunning || model.quitting)
+            ScreenToggle(model: model)
             VStack(spacing: 4) {
                 if let outcome = model.outcome, !model.zoomRunning, outcome.detail != openZoomHint {
                     Caption(openZoomHint)
@@ -841,19 +869,12 @@ struct OutcomeView: View {
             .font(.title3.weight(.medium))
             .multilineTextAlignment(.center)
             if let file = outcome.file {
-                Button { model.reveal([file]) } label: {
-                    HStack(spacing: 6) {
-                        Image(systemName: file.pathExtension == "m4a" ? "waveform" : "folder")
-                        Text(file.pathExtension == "m4a" ? file.lastPathComponent : "Показать исходную запись")
-                            .lineLimit(1).truncationMode(.middle)
-                    }
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 5)
-                    .background(.quaternary.opacity(0.6), in: Capsule())
-                }
-                .buttonStyle(.plain)
-                .help("Показать в Finder")
-                .onDrag { NSItemProvider(contentsOf: file) ?? NSItemProvider() }
+                FileButton(model: model, file: file,
+                           icon: file.pathExtension == "m4a" ? "waveform" : "folder",
+                           title: file.pathExtension == "m4a" ? file.lastPathComponent : "Показать исходную запись")
+            }
+            if let video = outcome.video {
+                FileButton(model: model, file: video, icon: "film", title: video.lastPathComponent)
             }
             if let detail = outcome.detail {
                 Text(detail)
@@ -892,6 +913,37 @@ struct OutcomeView: View {
         case .attention: return "exclamationmark.triangle.fill"
         case .failed: return "xmark.octagon.fill"
         }
+    }
+}
+
+struct FileButton: View {
+    @ObservedObject var model: RecorderModel
+    let file: URL
+    let icon: String
+    let title: String
+    var body: some View {
+        Button { model.reveal([file]) } label: {
+            HStack(spacing: 6) {
+                Image(systemName: icon)
+                Text(title).lineLimit(1).truncationMode(.middle)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 5)
+            .background(.quaternary.opacity(0.6), in: Capsule())
+        }
+        .buttonStyle(.plain)
+        .help("Показать в Finder")
+        .onDrag { NSItemProvider(contentsOf: file) ?? NSItemProvider() }
+    }
+}
+
+struct ScreenToggle: View {
+    @ObservedObject var model: RecorderModel
+    var body: some View {
+        Toggle("Записывать экран", isOn: $model.recordScreen)
+            .toggleStyle(.checkbox)
+            .font(.callout)
+            .help("Рядом с аудио сохранится видео окна встречи Zoom")
     }
 }
 
@@ -947,6 +999,10 @@ struct RecordingView: View {
             .tint(.red)
             .controlSize(.large)
             .padding(.top, 6)
+            ScreenToggle(model: model)
+            if model.connected && model.recordScreen && !model.screenFound {
+                Caption("Не вижу окно встречи Zoom", warning: true)
+            }
         }
     }
 }
@@ -1113,6 +1169,7 @@ struct HelpView: View {
         VStack(alignment: .leading, spacing: 10) {
             Text("Войдите в созвон Zoom → «Начать запись» → «Остановить». Файл появится в папке записей.")
             Text("Ваш голос записывается, только когда микрофон включён в Zoom. В Zoom и macOS должен быть выбран один микрофон.")
+            Text("«Записывать экран» сохранит рядом видео окна встречи Zoom. Флажок работает и во время записи.")
             Text("Прерванная запись восстанавливается при следующем запуске.")
             Text("Если сохранение не удалось, нажмите «Повторить сохранение». Если кнопка mute не определялась, проверьте отдельную запись микрофона рядом с основным файлом.")
             Text("Предупредите участников о записи.").foregroundStyle(.secondary)

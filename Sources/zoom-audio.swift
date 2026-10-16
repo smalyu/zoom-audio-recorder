@@ -38,6 +38,17 @@ private final class Once: @unchecked Sendable {
     }
 }
 
+/// A value shared between threads.
+final class Locked<Value>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: Value
+    init(_ value: Value) { self.value = value }
+    var current: Value {
+        get { lock.withLock { value } }
+        set { lock.withLock { value = newValue } }
+    }
+}
+
 /// Waits for `operation`, but never longer than `seconds`: a hung system service
 /// must not keep captured audio from being saved.
 func waitAtMost(_ seconds: Double, _ operation: @escaping () async -> Void) async {
@@ -320,11 +331,11 @@ final class AudioTrack {
                                channels: channels, interleaved: true)!
     }
 
-    static func parts(named name: String, in directory: URL) -> [TrackPart] {
+    static func parts(named name: String, in directory: URL, type: String = "m4a") -> [TrackPart] {
         let files = (try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)) ?? []
         return files.compactMap { url -> TrackPart? in
             let fields = url.deletingPathExtension().lastPathComponent.split(separator: "-")
-            guard url.pathExtension == "m4a", fields.count == 3, fields[0] == name,
+            guard url.pathExtension == type, fields.count == 3, fields[0] == name,
                   Int(fields[1]) != nil, let start = Int64(fields[2]) else { return nil }
             return TrackPart(url: url, start: start)
         }.sorted { $0.start < $1.start }
@@ -1049,6 +1060,10 @@ func zoomMicrophoneDiagnostics(observations: Int = 1) async -> [String: Any] {
         } else {
             result["captureApplication"] = "unavailable"
         }
+        result["meetingWindowFrame"] = ZoomMeetingWindow.frame(pid: zoom.processIdentifier).map { "\($0)" } ?? "none"
+        result["meetingWindow"] = ZoomMeetingWindow.find(in: content, pid: zoom.processIdentifier).map { Int($0.windowID) } ?? "none"
+        result["zoomWindows"] = content.windows.filter { $0.owningApplication?.processID == zoom.processIdentifier }
+            .map { "\($0.windowID) layer \($0.windowLayer) \($0.isOnScreen ? "on" : "off") \($0.frame) \($0.title ?? "")" }
     }
     if observations > 1 {
         let start = Date()
@@ -1518,7 +1533,11 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
     var now: () -> CMTime = { CMClockGetTime(CMClockGetHostTimeClock()) }
     private let zoomPCM = PCMNormalizer(channels: 2)
     private let micPCM = PCMNormalizer(channels: 1)
-    private var origin: (pts: CMTime, host: CMTime)?
+    private var origin: (pts: CMTime, host: CMTime)? {
+        didSet { originHost.current = origin?.host.seconds }
+    }
+    /// Host time of the timeline's start, readable from any thread: the screen is placed by it.
+    let originHost = Locked<Double?>(nil)
     private var anchors: [SCStreamOutputType: Int64] = [:]
     private var expected: [SCStreamOutputType: Int64] = [:]
     private var voice: [(buffer: AVAudioPCMBuffer, position: Int64, captured: Double, arrival: Double, speech: Bool)] = []
@@ -1825,6 +1844,8 @@ enum RecorderEvent {
     case lowDiskSpace(Bool)
     /// False when no Zoom audio arrived for a while after connecting.
     case zoomAudio(Bool)
+    /// Whether Zoom's meeting window is being recorded, while recording the screen is on.
+    case screen(Bool)
 }
 
 struct RecordingSummary {
@@ -1839,6 +1860,8 @@ struct RecordingSummary {
     let zoomQuit: Bool
     /// Deliver the whole microphone too: mute detection may have failed.
     let needsSafetyCopy: Bool
+    /// Recording the screen was on at some point.
+    var screenWanted = false
 }
 
 struct ZoomAudio {
@@ -1872,7 +1895,9 @@ struct ZoomAudio {
 
     /// Records into `directory` until `stop` is requested. A broken stream or a Zoom
     /// restart reconnects automatically; the parts on disk stay aligned throughout.
-    static func record(into directory: URL, stop: StopRequest, events: @escaping (RecorderEvent) -> Void,
+    /// Zoom's meeting window is recorded too whenever `screen` is on.
+    static func record(into directory: URL, stop: StopRequest, screen wanted: Locked<Bool> = Locked(false),
+                       events: @escaping (RecorderEvent) -> Void,
                        onVoice: @escaping () -> Void, onUncertainVoice: @escaping () -> Void,
                        onControlSeen: @escaping () -> Void) async throws -> RecordingSummary {
         let capture = Capture(directory: directory)
@@ -1881,6 +1906,9 @@ struct ZoomAudio {
         capture.onUncertainVoice = onUncertainVoice
         capture.onControlSeen = onControlSeen
         capture.onProblem = { events(.problem($0)) }
+        let screen = ScreenCapture(directory: directory) { capture.originHost.current }
+        let screenStop = StopRequest()
+        var screenTask: Task<Void, Never>?
         var stream: SCStream?
         var watcher: ZoomMuteWatcher?
         var speakers: ZoomSpeakerWatcher?
@@ -1923,6 +1951,9 @@ struct ZoomAudio {
                     lostSince = nil
                     if started { interruptions += 1 }
                     events(started ? .connected : .started)
+                    if !started {
+                        screenTask = Task { await screen.run(wanted: wanted, stop: screenStop) { events(.screen($0)) } }
+                    }
                     started = true
                     connectedAt = Date()
                 } catch {
@@ -1978,17 +2009,20 @@ struct ZoomAudio {
                 lostSince = Date()
             }
         }
+        screenStop.stop()
         await disconnect()
         capture.queue.sync { capture.finishVoiceSpans() }
         async let zoomClosed: Void = capture.zoom.finish()
         async let micClosed: Void = capture.mic.finish()
         async let rawClosed: Void = capture.raw.finish()
-        _ = await (zoomClosed, micClosed, rawClosed)
+        let screenRun = screenTask
+        async let screenClosed: Void? = screenRun?.value
+        _ = await (zoomClosed, micClosed, rawClosed, screenClosed)
         let hasZoom = !capture.zoom.parts.isEmpty
         let needsSafetyCopy = capture.queue.sync { capture.needsSafetyCopy }
         return RecordingSummary(started: started, hasAudio: hasZoom || capture.hadVoice || needsSafetyCopy, hasZoom: hasZoom,
                                 hasVoice: capture.hadVoice, interruptions: interruptions, zoomQuit: zoomQuit,
-                                needsSafetyCopy: needsSafetyCopy)
+                                needsSafetyCopy: needsSafetyCopy, screenWanted: screen.wanted)
     }
 
     private static func connect(to app: NSRunningApplication, capture: Capture, stop: StopRequest, reconnecting: Bool,

@@ -11,9 +11,9 @@
     <key>CFBundleDisplayName</key>
     <string>Zoom Audio Recorder</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.8</string>
+    <string>1.9</string>
     <key>CFBundleVersion</key>
-    <string>14</string>
+    <string>15</string>
     <key>CFBundleExecutable</key>
     <string>zoom-audio</string>
     <key>CFBundlePackageType</key>
@@ -31,6 +31,6 @@
     <key>NSAudioCaptureUsageDescription</key>
     <string>Запись звука созвона Zoom.</string>
     <key>NSScreenCaptureUsageDescription</key>
-    <string>ScreenCaptureKit выбирает приложение Zoom для записи его звука; видео не сохраняется.</string>
+    <string>ScreenCaptureKit выбирает приложение Zoom для записи его звука, а с флажком «Записывать экран» — и окна встречи.</string>
 </dict>
 </plist>

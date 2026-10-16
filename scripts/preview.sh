@@ -9,7 +9,7 @@ xcrun swiftc -D PREVIEW -target "$build_arch-apple-macos15.0" -parse-as-library 
   -o build.noindex/previews/recorder-preview
 for appearance in light dark; do
   for state in idle nozoom permissions preparing recording muted unknown reconnecting warnings \
-    saving saved closed fallback kept failed recovered recovering safety unrecovered damaged longfolder; do
+    saving saved closed fallback kept failed recovered recovering safety unrecovered damaged longfolder screen video; do
     build.noindex/previews/recorder-preview "$destination/$state-$appearance.png" "$state" "--$appearance"
   done
 done
