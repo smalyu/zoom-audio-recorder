@@ -1063,12 +1063,13 @@ func zoomMicrophoneDiagnostics(observations: Int = 1) async -> [String: Any] {
             result["captureApplication"] = "unavailable"
         }
         let pid = zoom.processIdentifier
-        let onScreen = ZoomMeetingWindow.onScreen(pid: pid)
+        let windows = ZoomMeetingWindow.windows(pid: pid)
         let displays = ZoomMeetingWindow.displays()
         result["meetingWindow"] = String(describing: ZoomMeetingWindow.lookup(pid: pid))
-        result["meetingWindowOnScreen"] = ZoomMeetingWindow.frame(pid: pid)
-            .flatMap { ZoomMeetingWindow.match($0, in: onScreen.filter { $0.layer == 0 }.map { ($0.id, $0.frame) }) }.map { Int($0) } ?? "none"
-        let share = ZoomMeetingWindow.share(windows: onScreen.map { ($0.title, $0.layer, $0.frame) }, displays: displays.map(\.frame))
+        result["meetingWindowMatched"] = ZoomMeetingWindow.frame(pid: pid)
+            .flatMap { ZoomMeetingWindow.match($0, in: windows.filter { $0.layer == 0 }.map { ($0.id, $0.frame) }) }.map { Int($0) } ?? "none"
+        let share = ZoomMeetingWindow.share(windows: windows.filter(\.onScreen).map { ($0.title, $0.layer, $0.frame) },
+                                            displays: displays.map(\.frame))
         result["sharing"] = share.sharing
         result["sharedDisplay"] = share.display.map { Int(displays[$0].id) } ?? "none"
         result["sharePaused"] = share.sharing && ZoomMeetingWindow.sharePaused(pid: pid)

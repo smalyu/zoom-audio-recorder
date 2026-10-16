@@ -71,49 +71,54 @@ func checkMeetingWindow() throws {
                                               displays: displays)
     try check(!meetingOnly.sharing && meetingOnly.display == nil, "a meeting without a share taken for one: \(meetingOnly)")
     // The user switching desktops with Zoom's meeting window on one of them, again and again: the window is
-    // recorded only while it is on the screen, comes back at once, even before Zoom answers, and every
+    // recorded on any desktop, by its place while Accessibility names it and as the window remembered while
+    // it does not; a window of Zoom's kept off the screen at the same place is not taken for it; every
     // pause says why.
     let screen = [(id: CGDirectDisplayID(1), frame: displays[0])]
     let place = CGRect(x: 100, y: 80, width: 1000, height: 700)
-    let meetingWindow = ZoomWindow(id: 100, title: "Zoom Meeting", layer: 0, frame: place)
-    let fullScreen = ZoomWindow(id: 100, title: "Zoom Meeting", layer: 0, frame: displays[0])
-    typealias Step = (windows: [ZoomWindow], lookup: ZoomMeetingWindow.Lookup, hidden: Bool, exists: Bool,
+    let meetingWindow = ZoomWindow(id: 100, title: "Zoom Meeting", layer: 0, frame: place, onScreen: true)
+    let elsewhere = ZoomWindow(id: 100, title: "Zoom Meeting", layer: 0, frame: place, onScreen: false)
+    let ghost = ZoomWindow(id: 101, title: "", layer: 0, frame: place, onScreen: false)
+    let fullScreen = ZoomWindow(id: 100, title: "Zoom Meeting", layer: 0, frame: displays[0], onScreen: true)
+    let fullScreenElsewhere = ZoomWindow(id: 100, title: "Zoom Meeting", layer: 0, frame: displays[0], onScreen: false)
+    typealias Step = (windows: [ZoomWindow], lookup: ZoomMeetingWindow.Lookup, hidden: Bool,
                       target: ScreenCapture.Target?, pause: ScreenCapture.Pause?)
     let steps: [Step] = [
-        ([meetingWindow], .window(place, fullScreen: false), false, true, .window(100), nil),
-        ([], .missing, false, true, nil, .otherDesktop),
-        ([meetingWindow], .missing, false, true, .window(100), nil),
-        ([], .window(place, fullScreen: false), false, true, nil, .otherDesktop),
-        ([meetingWindow], .window(place, fullScreen: false), false, true, .window(100), nil),
-        ([fullScreen], .window(displays[0], fullScreen: true), false, true, .window(100), nil),
-        ([], .missing, false, true, nil, .fullScreenElsewhere),
-        ([fullScreen], .missing, false, true, .window(100), nil),
-        ([meetingWindow], .window(place, fullScreen: false), false, true, .window(100), nil),
-        ([], .minimized, false, true, nil, .minimized),
-        ([], .window(place, fullScreen: false), true, true, nil, .hidden),
-        ([meetingWindow], .window(place, fullScreen: false), false, true, .window(100), nil),
-        ([], .missing, false, false, nil, .noMeeting),
+        ([ghost, meetingWindow], .window(place), false, .window(100), nil),
+        ([ghost, elsewhere], .missing, false, .window(100), nil),
+        ([ghost, meetingWindow], .missing, false, .window(100), nil),
+        ([ghost, elsewhere], .window(place), false, .window(100), nil),
+        ([ghost, meetingWindow], .window(place), false, .window(100), nil),
+        ([fullScreen], .window(displays[0]), false, .window(100), nil),
+        ([fullScreenElsewhere], .missing, false, .window(100), nil),
+        ([fullScreen], .missing, false, .window(100), nil),
+        ([meetingWindow], .window(place), false, .window(100), nil),
+        ([elsewhere], .minimized, false, nil, .minimized),
+        ([elsewhere], .window(place), true, nil, .hidden),
+        ([meetingWindow], .window(place), false, .window(100), nil),
+        ([ghost], .missing, false, nil, .noMeeting),
     ]
     var recording: ScreenCapture.Target?
-    var remembered: ScreenCapture.Remembered?
+    var remembered: CGWindowID?
     for (index, step) in steps.enumerated() {
         let choice = ScreenCapture.decide(windows: step.windows, displays: screen, meeting: { step.lookup }, paused: { false },
-                                          recording: recording, remembered: remembered, hidden: step.hidden, exists: { _ in step.exists })
+                                          recording: recording, remembered: remembered, hidden: step.hidden)
         try check(choice.target == step.target && choice.pause == step.pause && !choice.sharing,
                   "desktop step \(index): \(String(describing: choice.target)), \(String(describing: choice.pause))")
         recording = choice.target
         remembered = choice.remembered
     }
     // A share starting, pausing, resuming, shrinking to one window and ending.
-    let shareBar = ZoomWindow(id: 7, title: "zoom share toolbar window", layer: 97, frame: CGRect(x: 400, y: 0, width: 600, height: 60))
-    let border = ZoomWindow(id: 8, title: "", layer: 96, frame: displays[0])
+    let shareBar = ZoomWindow(id: 7, title: "zoom share toolbar window", layer: 97, frame: CGRect(x: 400, y: 0, width: 600, height: 60),
+                              onScreen: true)
+    let border = ZoomWindow(id: 8, title: "", layer: 96, frame: displays[0], onScreen: true)
     let shares: [(windows: [ZoomWindow], paused: Bool, target: ScreenCapture.Target?, pause: ScreenCapture.Pause?)] = [
         ([meetingWindow], false, .window(100), nil), ([shareBar, border], false, .display(1), nil),
         ([shareBar, border], true, nil, .sharePaused), ([shareBar, border], false, .display(1), nil),
         ([shareBar], false, nil, .sharingWindow), ([meetingWindow], false, .window(100), nil),
     ]
     for (index, step) in shares.enumerated() {
-        let choice = ScreenCapture.decide(windows: step.windows, displays: screen, meeting: { .window(place, fullScreen: false) },
+        let choice = ScreenCapture.decide(windows: step.windows, displays: screen, meeting: { .window(place) },
                                           paused: { step.paused }, recording: recording, remembered: remembered)
         try check(choice.target == step.target && choice.pause == step.pause,
                   "share step \(index): \(String(describing: choice.target)), \(String(describing: choice.pause))")

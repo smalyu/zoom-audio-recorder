@@ -76,8 +76,6 @@ final class RecorderModel: ObservableObject {
     }
     var screenPausedText: String {
         switch screenPause {
-        case .otherDesktop?: return "Zoom на другом рабочем столе — видео на паузе"
-        case .fullScreenElsewhere?: return "Zoom во весь экран на другом столе — видео на паузе"
         case .minimized?: return "Zoom свёрнут — видео на паузе"
         case .hidden?: return "Zoom скрыт — видео на паузе"
         case .sharingWindow?: return "Вы показываете окно — видео на паузе"
@@ -85,8 +83,6 @@ final class RecorderModel: ObservableObject {
         case .noMeeting?, nil: return "Окно встречи Zoom не видно — видео на паузе"
         }
     }
-    /// How to keep the picture when working on other desktops.
-    static let everyDesktopHint = "Чтобы видео не прерывалось на других рабочих столах, закрепите Zoom на всех: правый клик по Zoom в Dock → Параметры → Все рабочие столы. Во весь экран не открывайте."
     var busy: Bool { phase != .idle }
     var time: String { Self.clock(elapsed) }
     var micText: String {
@@ -615,7 +611,7 @@ final class RecorderDelegate: NSObject, NSApplicationDelegate {
         case "preparing": model.phase = .preparing
         case "screen":
             model.phase = .recording; model.microphone = .unmuted; model.elapsed = 754
-            model.recordScreen = true; model.screenPause = .otherDesktop
+            model.recordScreen = true; model.screenPause = .minimized
         case "saved", "closed":
             model.outcome = .init(kind: .saved, title: "Сохранено", detail: "47:12 · 38,2 МБ", file: file)
             model.zoomRunning = state != "closed"
@@ -1038,7 +1034,7 @@ struct RecordingView: View {
             .padding(.top, 6)
             ScreenToggle(model: model)
             if model.screenPaused {
-                Caption(model.screenPausedText).help(RecorderModel.everyDesktopHint)
+                Caption(model.screenPausedText)
             }
         }
     }
