@@ -11,9 +11,9 @@
     <key>CFBundleDisplayName</key>
     <string>Zoom Audio Recorder</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.15</string>
+    <string>1.16</string>
     <key>CFBundleVersion</key>
-    <string>21</string>
+    <string>22</string>
     <key>NSHumanReadableCopyright</key>
     <string>© 2026 Alexander Smirnov. Лицензия MIT.</string>
     <key>LSApplicationCategoryType</key>

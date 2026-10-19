@@ -1570,6 +1570,8 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
     let originHost = Locked<Double?>(nil)
     private var anchors: [SCStreamOutputType: Int64] = [:]
     private var expected: [SCStreamOutputType: Int64] = [:]
+    /// The format last logged for each stream type: a device can change it mid-meeting.
+    private var described: [SCStreamOutputType: (rate: Double, channels: UInt32)] = [:]
     private var voice: [(buffer: AVAudioPCMBuffer, position: Int64, captured: Double, arrival: Double, speech: Bool)] = []
     private var voiceSpans = VoiceSpans()
     private let echo = EchoCanceller()
@@ -1630,6 +1632,12 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
     func receive(_ sample: CMSampleBuffer, of type: SCStreamOutputType) {
         guard sample.isValid, CMSampleBufferDataIsReady(sample), CMSampleBufferGetNumSamples(sample) > 0 else { return }
         let position = position(of: sample, type: type)
+        if type == .audio || type == .microphone,
+           let format = CMSampleBufferGetFormatDescription(sample).flatMap({ CMAudioFormatDescriptionGetStreamBasicDescription($0)?.pointee }),
+           described[type].map({ $0.rate != format.mSampleRate || $0.channels != format.mChannelsPerFrame }) ?? true {
+            described[type] = (format.mSampleRate, format.mChannelsPerFrame)
+            recorderLog.notice("\(type == .audio ? "Zoom audio" : "Microphone", privacy: .public): \(format.mSampleRate, format: .fixed(precision: 0)) Hz, \(format.mChannelsPerFrame) channels, \(CMSampleBufferGetNumSamples(sample)) frames")
+        }
         if let pending = pendingSpeaker {
             pendingSpeaker = nil
             noteSpeaker(pending.name, at: pending.time)
@@ -1773,8 +1781,10 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
     /// Prepares for a new stream: its clock may differ from the previous one.
     func attach(_ stream: SCStream?) {
         releaseVoice(flushing: true)
+        echo.flushReport()
         anchors.removeAll()
         expected.removeAll()
+        described.removeAll()
         streamError = nil
         lastProblem = nil
         receivingZoom = false

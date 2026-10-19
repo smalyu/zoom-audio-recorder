@@ -33,6 +33,7 @@ func checkEchoCanceller() throws {
         for (offset, sample) in samples.enumerated() { result.floatChannelData![0][offset] = sample }
         return result
     }
+    var report: EchoReport?
     /// `slipping`: timestamps jitter, the microphone's by up to 20 frames and Zoom's by a few.
     func run(_ microphone: [Float], slipping: Bool = false) throws -> [Float] {
         let canceller = EchoCanceller()
@@ -67,6 +68,7 @@ func checkEchoCanceller() throws {
         try take(canceller.drain())
         try check(written == microphone.count, "\(written) samples out of \(microphone.count)")
         try check(slipping || !filled.contains(false), "samples missing from the output")
+        report = canceller.lastReport
         return output.map { $0.isFinite ? $0 : 0 }
     }
     func db(_ signal: [Float], _ noise: [Float], _ seconds: Range<Int>) -> Double {
@@ -76,6 +78,9 @@ func checkEchoCanceller() throws {
     }
     let output = try run(zip(echo, near).map(+))
     let left = zip(output, near).map(-)
+    // The 16 s are reported every 10 s: the participant playing, the echo removed, the speakers' path found.
+    try check(report.map { $0.playing > 0 && $0.removed > 6 && $0.cleared > 0 && abs(($0.delay ?? 0) - 51) < 1 } == true,
+              "report: \(report?.description ?? "none")")
     try check(db(echo, left, 6..<12) > 15, "echo removed by only \(db(echo, left, 6..<12)) dB")
     try check(db(near, left, 12..<16) > 6, "the user's voice over a participant lost: \(db(near, left, 12..<16)) dB")
     // With headphones the microphone hears no one: what it records stays as it was.
@@ -86,6 +91,7 @@ func checkEchoCanceller() throws {
     try check(db(near, zip(unplugged, near).map(-), 12..<16) > 40, "the voice changed after the echo stopped")
     // Jittering timestamps of the microphone and of Zoom keep it cancelling.
     let slipped = try run(echo, slipping: true)
+    try check(report.map { $0.microphoneRuns == 0 && $0.referenceRuns == 0 } == true, "jitter started new runs: \(report?.description ?? "none")")
     try check(db(echo, slipped, 6..<12) > 15, "with slipping positions echo removed by only \(db(echo, slipped, 6..<12)) dB")
     // A broken sample neither stops the filter nor spreads.
     var broken = echo

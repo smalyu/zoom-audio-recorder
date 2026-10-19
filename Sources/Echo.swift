@@ -32,6 +32,53 @@ private final class Spectrum {
     }
 }
 
+/// What the canceller did over a stretch of audio. It is logged: whether echo was removed in
+/// a real call can only be told from that call.
+struct EchoReport {
+    var blocks = 0
+    /// Blocks while Zoom played something, and the energy of the microphone, of what went
+    /// out and of Zoom's audio over them.
+    var playing = 0
+    var microphone: Float = 0
+    var output: Float = 0
+    var reference: Float = 0
+    /// Of those, blocks with the echo at least 10 dB down: low while the user talks over a
+    /// participant, while a working filter keeps it high whenever they are quiet.
+    var cleared = 0
+    /// The foreground filter taken over, forgotten as worse than none, and the background
+    /// filter started again from it.
+    var adopted = 0
+    var resets = 0
+    var restarts = 0
+    /// Broken samples, after which both filters start over.
+    var broken = 0
+    /// Blocks let out before Zoom's audio of the same moment came in.
+    var unreferenced = 0
+    /// Blocks that went out as the microphone itself, the filter's output being louder.
+    var bypassed = 0
+    /// Audio that did not continue the previous run, of the microphone and of Zoom.
+    var microphoneRuns = 0
+    var referenceRuns = 0
+    /// Where the subtracted and the learning filter are strongest, in ms; nil while empty.
+    var delay: Double?
+    var learning: Double?
+
+    /// How much quieter the output was than the microphone while Zoom played.
+    var removed: Double { 10 * log10(Double(max(microphone, 1e-20)) / Double(max(output, 1e-20))) }
+
+    var description: String {
+        let level = { (energy: Float) in 10 * log10(Double(max(energy, 1e-20)) / Double(max(self.playing, 1) * EchoCanceller.block)) }
+        let path = { (delay: Double?) in delay.map { String(format: "%.0f ms", $0) } ?? "none" }
+        return String(format: "Echo: %.0f s, Zoom playing %ld%%, removed %.1f dB, 10 dB down in %ld%% (microphone %.0f dB, Zoom %.0f dB), "
+                      + "path %@, learning %@, taken %ld, reset %ld, restarted %ld, broken %ld, unreferenced %ld, bypassed %ld, "
+                      + "new runs microphone %ld Zoom %ld",
+                      Double(blocks * EchoCanceller.block) / AudioTrack.rate, 100 * playing / max(blocks, 1),
+                      playing > 0 ? removed : 0, 100 * cleared / max(playing, 1), level(microphone), level(reference),
+                      path(delay), path(learning), adopted, resets, restarts, broken, unreferenced, bypassed,
+                      microphoneRuns, referenceRuns)
+    }
+}
+
 /// Takes the participants the microphone hears from the speakers out of it. Zoom removes
 /// them from what it sends, but the recording mixes the raw microphone with Zoom's clean
 /// audio, so without this everyone would sound twice, the second time some 50 ms later.
@@ -56,6 +103,8 @@ final class EchoCanceller {
     /// How fast a smoothed shift follows timestamps, per buffer: a device clock's drift of
     /// tens of ppm is followed, jitter of a few milliseconds is averaged out.
     static let follow = 0.002
+    /// A report is logged every 10 s of microphone audio.
+    static let reportFrames = 480_000
     private static let size = 2 * block
     private static let history = 1 << 18
     private let forward = vDSP_DFT_zop_CreateSetup(nil, vDSP_Length(size), .FORWARD)!
@@ -87,6 +136,8 @@ final class EchoCanceller {
     private var slips: Int64 = 0
     private var shift: Double = 0
     private var format: AVAudioFormat?
+    private var report = EchoReport()
+    private(set) var lastReport: EchoReport?
     // Scratch space.
     private let time = UnsafeMutablePointer<Float>.allocate(capacity: size)
     private let imaginary = UnsafeMutablePointer<Float>.allocate(capacity: size)
@@ -123,6 +174,7 @@ final class EchoCanceller {
             run.written += Int64(frames)
             referenceRun = run
         } else {
+            if referenceRun != nil { report.referenceRuns += 1 }
             referenceRun = (position, Int64(frames), 0)
         }
         // A gap since the last audio is silence, not whatever the ring held before.
@@ -140,6 +192,7 @@ final class EchoCanceller {
     /// Microphone audio in; echo-free blocks out with their timeline positions, each once
     /// Zoom's audio of the same moment is in.
     func process(_ buffer: AVAudioPCMBuffer, at position: Int64) -> [(buffer: AVAudioPCMBuffer, position: Int64)] {
+        let first = format == nil
         format = format ?? buffer.format
         guard let samples = buffer.floatChannelData?[0] else { return [] }
         // Audio that does not continue the run, give or take a slipped frame, starts a new one.
@@ -149,6 +202,7 @@ final class EchoCanceller {
             slips += slip
             shift += Self.follow * (Double(slips) - shift)
         } else {
+            if !first { report.microphoneRuns += 1 }
             done = drain()
             pendingStart = position
             slips = 0
@@ -172,6 +226,7 @@ final class EchoCanceller {
             guard count == Self.block || flushing else { break }
             guard flushing || (referenceEnd ?? .min) >= start + Int64(count) || end - start - Int64(count) >= Self.patience else { break }
             guard let output = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(Self.block)) else { break }
+            if (referenceEnd ?? .min) < start + Int64(count) { report.unreferenced += 1 }
             output.frameLength = AVAudioFrameCount(count)
             pending.withUnsafeBufferPointer { input in
                 if count == Self.block {
@@ -248,6 +303,7 @@ final class EchoCanceller {
                         count: Int, adapt: Bool) {
         let block = Int64(Self.block)
         let blockLength = vDSP_Length(Self.block)
+        defer { if report.blocks * Self.block >= Self.reportFrames { finishReport() } }
         if lastBlock.map({ abs(start - block - $0) > Self.jitter }) ?? true {
             // Not right after the previous block: rebuild the history at these positions.
             for partition in stride(from: Self.partitions - 1, through: 1, by: -1) { push(endingAt: start + block - Int64(partition) * block) }
@@ -265,9 +321,11 @@ final class EchoCanceller {
         vDSP_svesq(microphone, 1, &microphoneEnergy, blockLength)
         window(endingAt: start + block)
         vDSP_svesq(time + Self.block, 1, &referenceEnergy, blockLength)
+        report.blocks += 1
         guard microphoneEnergy.isFinite, foregroundEnergy.isFinite, backgroundEnergy.isFinite else {
             // Broken samples teach nothing, and the filters must not keep them.
             output.update(from: microphone, count: Self.block)
+            report.broken += 1
             if !foregroundEnergy.isFinite || !backgroundEnergy.isFinite { reset() }
             return
         }
@@ -317,13 +375,16 @@ final class EchoCanceller {
         // Pauses in Zoom's audio do not count either way.
         if adapt, playing { worse = errors.foreground > errors.microphone ? worse + 1 : 0 }
         if worse >= 40 {
+            report.resets += 1
             reset()
         } else if better >= 3 {
+            report.adopted += 1
             for partition in 0..<Self.partitions { foreground[partition].copy(background[partition]) }
             errors.foreground = errors.background
             better = 0
         } else if errors.background > 2 * errors.foreground {
             // The background filter learned the user's voice as echo: start it again from the foreground.
+            report.restarts += 1
             for partition in 0..<Self.partitions { background[partition].copy(foreground[partition]) }
             errors.background = errors.foreground
         }
@@ -331,7 +392,43 @@ final class EchoCanceller {
         var foregroundReal: Float = 0, microphoneReal: Float = 0
         vDSP_svesq(echoForeground, 1, &foregroundReal, vDSP_Length(count))
         vDSP_svesq(microphone, 1, &microphoneReal, vDSP_Length(count))
-        output.update(from: foregroundReal <= microphoneReal ? UnsafePointer(echoForeground) : microphone, count: Self.block)
+        let filtered = foregroundReal <= microphoneReal
+        output.update(from: filtered ? UnsafePointer(echoForeground) : microphone, count: Self.block)
+        if !filtered { report.bypassed += 1 }
+        if playing {
+            report.playing += 1
+            report.microphone += microphoneEnergy
+            report.output += filtered ? foregroundEnergy : microphoneEnergy
+            report.reference += referenceEnergy
+            if filtered, foregroundEnergy * 10 <= microphoneEnergy { report.cleared += 1 }
+        }
+    }
+
+    /// Logs what is left of the current report, as when a stream ends.
+    func flushReport() {
+        if report.blocks > 0 { finishReport() }
+    }
+
+    /// Logs what the canceller did since the last report and starts a new one.
+    private func finishReport() {
+        report.delay = strongest(foreground)
+        report.learning = strongest(background)
+        recorderLog.notice("\(self.report.description, privacy: .public)")
+        lastReport = report
+        report = EchoReport()
+    }
+
+    /// Where `filter` is strongest, in ms: the delay of the path it learned. Taps beyond the first
+    /// half of a partition are wrap-around the constraint has not cleared yet, not delay.
+    private func strongest(_ filter: [Spectrum]) -> Double? {
+        var strongest: (tap: Int, value: Float) = (0, 0)
+        for partition in 0..<Self.partitions {
+            restore(filter[partition])
+            for tap in 0..<Self.block where abs(time[tap]) > strongest.value {
+                strongest = (partition * Self.block + tap, abs(time[tap]))
+            }
+        }
+        return strongest.value > 0 ? Double(strongest.tap) / AudioTrack.rate * 1000 : nil
     }
 
     private func reset() {
