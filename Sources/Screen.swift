@@ -102,7 +102,7 @@ final class ScreenTrack {
         close(at: position)
         let closing = closing
         // A picture is never worth holding up the sound: a part left unfinished plays to its last fragment.
-        await waitAtMost(10) {
+        await waitAtMost(10, "closing the screen track") {
             await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
                 closing.notify(queue: .global()) { done.resume() }
             }
@@ -165,7 +165,7 @@ final class ScreenTrack {
     }
 
     private func fail(_ error: Error) {
-        recorderLog.error("screen track: \(error.localizedDescription, privacy: .public)")
+        recorderLog.error("screen track: \(error.localizedDescription)")
         failure = error
         // Back off: a full disk or a broken encoder would fail again right away.
         retryAt = Date().addingTimeInterval(retryDelay)
@@ -488,7 +488,7 @@ final class ScreenCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
     func stream(_ stream: SCStream, didStopWithError error: Error) {
         queue.async {
             guard stream === self.current else { return }
-            recorderLog.error("Screen stream stopped: \(error.localizedDescription, privacy: .public)")
+            recorderLog.error("Screen stream stopped: \(error.localizedDescription)")
             self.broken.current = true
         }
     }
@@ -619,7 +619,7 @@ final class ScreenCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
                 hiddenAt = nil
                 track.close(at: position)
             }
-            if let stream { await waitAtMost(5) { try? await stream.stopCapture() } }
+            if let stream { await waitAtMost(5, "stopping the screen stream") { try? await stream.stopCapture() } }
             stream = nil
             target = nil
             broken.current = false
@@ -642,6 +642,9 @@ final class ScreenCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
                 lastSpaceCheck = Date()
                 let free = (try? directory.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]))?
                     .volumeAvailableCapacityForImportantUsage ?? .max
+                if (free < Self.minimumSpace) != lowSpace {
+                    recorderLog.notice(lowSpace ? "Screen: disk space back" : "Screen: stopped, \(free / 1_000_000) MB free")
+                }
                 lowSpace = free < Self.minimumSpace
             }
             if wanted.current {
@@ -687,7 +690,7 @@ final class ScreenCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
                     pause = choice.pause
                     remembered = choice.remembered
                     let state = choice.target == nil ? ZoomMeetingWindow.describe(choice.windows, sharing: choice.sharing) : nil
-                    if let state, state != described { recorderLog.notice("No picture to record. \(state, privacy: .public)") }
+                    if let state, state != described { recorderLog.notice("No picture to record. \(state)") }
                     described = state
                     if choice.target != target, let pid {
                         var next: (filter: SCContentFilter, size: CGSize, cursor: Bool)?
@@ -713,8 +716,9 @@ final class ScreenCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
                                     target = next
                                     started = Date()
                                     startDelay = 5
-                                    recorderLog.notice("Recording \(setup.cursor ? "the display the user shares" : "Zoom's meeting window", privacy: .public)")
+                                    recorderLog.notice("Recording \(setup.cursor ? "the display the user shares" : "Zoom's meeting window")")
                                 } else {
+                                    recorderLog.error("Screen: could not start recording; trying again in \(Int(startDelay)) s")
                                     nextLook = Date().addingTimeInterval(startDelay)
                                     startDelay = min(startDelay * 2, 60)
                                 }
@@ -765,6 +769,7 @@ final class ScreenCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
         // The part is closed on the queue; no frame reaches the track after this.
         await end()
         await track.finish(at: nil)
+        recorderLog.notice("Screen track closed: \(queue.sync { track.parts.count }) parts\(queue.sync { track.failure }.map { ", failed: \($0.localizedDescription)" } ?? "")")
     }
 
     /// Whether two shapes differ by more than rounding.
@@ -825,7 +830,7 @@ final class ScreenCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
             }) { try await stream.startCapture() }
             return stream
         } catch {
-            recorderLog.error("Screen capture failed: \(error.localizedDescription, privacy: .public)")
+            recorderLog.error("Screen capture failed: \(error.localizedDescription)")
             let position = position(at: Self.now())
             // Frames may have come before the start gave up: their part ends here.
             queue.sync {

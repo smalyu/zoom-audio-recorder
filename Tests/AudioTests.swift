@@ -871,6 +871,27 @@ func checkStorage(_ folder: URL) throws {
     print("PASS: directory probing creates folders, rejects files and missing drives, preserves existing files")
 }
 
+func checkRecorderLog(_ folder: URL) throws {
+    let url = folder.appendingPathComponent("Logs/zoom-audio.log")
+    let log = RecorderLog(url: url, limit: 100)
+    log.notice("Echo: first")
+    log.error("Stream stopped: second")
+    log.flush()
+    let lines = try String(contentsOf: url, encoding: .utf8).split(separator: "\n")
+    try check(lines.count == 2 && lines[0].hasSuffix(" Echo: first") && lines[1].hasSuffix(" Stream stopped: second")
+              && lines[0].hasPrefix("20"), "log lines \(lines)")
+    try FileManager.default.removeItem(at: url)
+    log.notice("Echo: after the file was deleted")
+    log.flush()
+    try check(try String(contentsOf: url, encoding: .utf8).hasSuffix(" Echo: after the file was deleted\n"), "a deleted log not made anew")
+    for index in 0..<5 { log.notice("Echo: line \(index) of a long call") }
+    log.flush()
+    let old = folder.appendingPathComponent("Logs/zoom-audio.old.log")
+    try check(try String(contentsOf: old, encoding: .utf8).contains("Echo: line"), "a full log not kept aside")
+    try check(try String(contentsOf: url, encoding: .utf8).utf8.count < 200, "a full log not started over")
+    print("PASS: the recorder log keeps timestamped lines in a file, makes it anew and starts over when full")
+}
+
 func checkStopRequest() async throws {
     let request = StopRequest()
     request.signal()
@@ -957,6 +978,7 @@ func checkBoundedOperations() async throws {
         try checkMeetingWindow()
         let folder = URL(fileURLWithPath: arguments[1], isDirectory: true)
         try checkStorage(folder.appendingPathComponent("storage"))
+        try checkRecorderLog(folder.appendingPathComponent("recorder-log"))
         try checkNormalizer()
         try checkDevices()
         try await checkStopRequest()

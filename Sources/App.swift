@@ -25,35 +25,53 @@ final class RecorderModel: ObservableObject {
         var video: URL? = nil
     }
 
-    @Published var phase: Phase = .idle
-    @Published var screenAllowed = false
-    @Published var microphoneAllowed = false
-    @Published var zoomAllowed = false
-    @Published var zoomRunning = false
+    // What the window shows is logged as it changes, so a report can be read back from the log.
+    @Published var phase: Phase = .idle { didSet { if phase != oldValue { recorderLog.notice("Phase: \(phase)") } } }
+    @Published var screenAllowed = false { didSet { if screenAllowed != oldValue { recorderLog.notice("Screen access: \(screenAllowed)") } } }
+    @Published var microphoneAllowed = false {
+        didSet { if microphoneAllowed != oldValue { recorderLog.notice("Microphone access: \(microphoneAllowed)") } }
+    }
+    @Published var zoomAllowed = false { didSet { if zoomAllowed != oldValue { recorderLog.notice("Accessibility access: \(zoomAllowed)") } } }
+    @Published var zoomRunning = false { didSet { if zoomRunning != oldValue { recorderLog.notice("Zoom running: \(zoomRunning)") } } }
     @Published var microphone: ZoomMuteState = .unavailable
-    @Published var connected = true
-    @Published var problem: String?
-    @Published var lowDiskSpace = false
-    @Published var zoomAudio = true
+    @Published var connected = true { didSet { if connected != oldValue { recorderLog.notice("Connected to Zoom: \(connected)") } } }
+    @Published var problem: String? {
+        didSet { if problem != oldValue { recorderLog.notice("Problem shown: \(problem ?? "none")") } }
+    }
+    @Published var lowDiskSpace = false { didSet { if lowDiskSpace != oldValue { recorderLog.notice("Low disk space shown: \(lowDiskSpace)") } } }
+    @Published var zoomAudio = true { didSet { if zoomAudio != oldValue { recorderLog.notice("Zoom audio arriving: \(zoomAudio)") } } }
     /// Record Zoom's meeting window too; can be switched during a recording.
     @Published var recordScreen: Bool {
         didSet {
             screen.current = recordScreen
             UserDefaults.standard.set(recordScreen, forKey: "recordScreen")
+            if recordScreen != oldValue { recorderLog.notice("Record screen: \(recordScreen) (phase \(phase))") }
         }
     }
-    @Published var screenPause: ScreenCapture.Pause?
+    @Published var screenPause: ScreenCapture.Pause? {
+        didSet { if screenPause != oldValue { recorderLog.notice("Screen pause shown: \(screenPause.map { "\($0)" } ?? "none")") } }
+    }
     private let screen = Locked(false)
     @Published var elapsed = 0
     @Published var progress: Double?
-    @Published var outcome: Outcome?
+    @Published var outcome: Outcome? {
+        didSet {
+            guard outcome != oldValue, let outcome else { return }
+            recorderLog.notice("Shown: \(outcome.kind) \"\(outcome.title)\"" + (outcome.detail.map { ": \($0)" } ?? "")
+                               + (outcome.file.map { ", \($0.path)" } ?? ""))
+        }
+    }
     @Published var recovered: [URL] = []
     /// The videos saved with the recovered recordings, by recording, shown with them.
     private var recoveredVideos: [URL: URL] = [:]
-    @Published var unrecovered: URL?
+    @Published var unrecovered: URL? {
+        didSet { if unrecovered != oldValue { recorderLog.notice("Unsaved recording shown: \(unrecovered?.path ?? "none")") } }
+    }
     @Published var recovering = false
     @Published var folder: URL
-    @Published var folderAvailable = true
+    @Published var folderAvailable = true {
+        didSet { if folderAvailable != oldValue { recorderLog.notice("Folder \(folder.path) available: \(folderAvailable)") } }
+    }
     @Published var attention = false
     @Published var quitting = false
     /// Logout, restart or shutdown: close the tracks and leave saving to the next launch.
@@ -240,7 +258,10 @@ final class RecorderModel: ObservableObject {
     func start() {
         refresh()
         // A recovery may still be saving an older recording; it does not hold up this one.
-        guard ready, !busy, zoomRunning, !quitting else { return }
+        guard ready, !busy, zoomRunning, !quitting else {
+            recorderLog.notice("Start ignored: ready \(ready), busy \(busy), Zoom running \(zoomRunning), quitting \(quitting)")
+            return
+        }
         // A recording still waiting to be saved stays visible as a banner.
         if unsaved, unrecovered == nil { unrecovered = outcome?.file }
         outcome = nil
@@ -277,6 +298,8 @@ final class RecorderModel: ObservableObject {
                 let created = try RecordingSession.create(destination: destination,
                                                           name: RecordingSession.fileName(for: Date()))
                 session = created
+                recorderLog.notice("Recording started: session \(created.folder.lastPathComponent), "
+                                   + "to \(destination.path), record screen \(screen.current)")
                 let summary = try await ZoomAudio.record(into: created.folder, stop: request, screen: screen, events: { event in
                     Task { @MainActor in
                         guard self.stop === request else { return }
@@ -301,11 +324,14 @@ final class RecorderModel: ObservableObject {
                             self.progress = min(1, max(self.progress ?? 0, value))
                         }
                     }
+                    recorderLog.notice("Saved \(delivery.summary)")
                     outcome = Self.outcome(for: delivery, summary: summary, preferred: destination)
                 }
             } catch is CancellationError where cancelled || !(session?.hasAudio ?? false) {
+                recorderLog.notice("Cancelled; nothing saved")
                 session?.remove()
             } catch {
+                recorderLog.error("Recording failed: \(error.localizedDescription)")
                 tracksClosed = true
                 if case let RecorderError.damaged(kept) = error {
                     // Every part was damaged: what could be kept is aside, the session itself is empty.
@@ -417,6 +443,7 @@ final class RecorderModel: ObservableObject {
 
     func finish() {
         guard phase == .recording || phase == .preparing else { return }
+        recorderLog.notice("Stop requested (phase \(phase))")
         if let started { elapsed = Int(ProcessInfo.processInfo.systemUptime - started) }
         if phase == .preparing { cancelled = true }
         if phase == .recording { phase = .saving }
@@ -445,14 +472,20 @@ final class RecorderModel: ObservableObject {
                 }
                 raiseAttention()
             }
-            for session in RecordingSession.interrupted(fallback: Self.defaultFolder) {
+            let sessions = RecordingSession.interrupted(fallback: Self.defaultFolder)
+            if !sessions.isEmpty {
+                recorderLog.notice("Recovering \(sessions.map(\.folder.lastPathComponent).joined(separator: ", "))")
+            }
+            for session in sessions {
                 // A crash in the first second leaves nothing playable to save.
                 guard session.hasAudio else {
+                    recorderLog.notice("Recovery: \(session.folder.lastPathComponent) has no audio; removed")
                     session.remove()
                     continue
                 }
                 do {
                     let delivery = try await session.deliver(fallback: Self.defaultFolder, recovering: true)
+                    recorderLog.notice("Recovered \(delivery.summary)")
                     recovered.append(delivery.url)
                     recoveredVideos[delivery.url] = delivery.video
                     if outcome?.file == session.folder { outcome = nil }
@@ -463,18 +496,20 @@ final class RecorderModel: ObservableObject {
                     }
                 } catch RecorderError.noAudio {
                     // Nothing playable was recorded.
+                    recorderLog.notice("Recovery: \(session.folder.lastPathComponent) has nothing playable; removed")
                     session.remove()
                     if outcome?.file == session.folder { outcome = nil }
                     if unrecovered == session.folder { unrecovered = nil }
                 } catch let RecorderError.damaged(kept) {
                     // Every part was damaged and kept aside; the session itself is empty.
+                    recorderLog.error("Recovery: every part damaged; kept in \(kept.path)")
                     session.remove()
                     if unrecovered == session.folder { unrecovered = nil }
                     if outcome?.file == session.folder { outcome = nil }
                     show(Outcome(kind: .failed, title: "Не удалось сохранить", detail: RecorderError.damaged(kept: kept).localizedDescription,
                                  unreadableFolder: kept))
                 } catch {
-                    recorderLog.error("Recovery failed: \(error.localizedDescription, privacy: .public)")
+                    recorderLog.error("Recovery failed: \(error.localizedDescription)")
                     // The result already on screen for this recording shows the new error.
                     if outcome?.file == session.folder {
                         outcome?.detail = Self.unsavedDetail(error)
@@ -545,6 +580,7 @@ final class RecorderModel: ObservableObject {
     }
 
     func setFolder(_ url: URL) {
+        recorderLog.notice("Folder set to \(url.path)")
         folder = url
         if url == Self.defaultFolder {
             UserDefaults.standard.removeObject(forKey: "folder")
@@ -557,6 +593,7 @@ final class RecorderModel: ObservableObject {
     func quit() -> NSApplication.TerminateReply {
         // Logout, restart and shutdown never ask and never wait for an export.
         let system = Self.isSystemQuit
+        recorderLog.notice("Quit requested: \(system ? "logout, restart or shutdown" : "by the user"), phase \(phase), recovering \(recovering)")
         switch phase {
         case .idle:
             // A recovery in progress finishes first; its folder survives a forced exit anyway.
@@ -570,7 +607,10 @@ final class RecorderModel: ObservableObject {
                 alert.informativeText = "Запись будет сохранена."
                 alert.addButton(withTitle: "Сохранить и выйти")
                 alert.addButton(withTitle: "Продолжить запись").keyEquivalent = "\u{1b}"
-                guard alert.runModal() == .alertFirstButtonReturn else { return .terminateCancel }
+                guard alert.runModal() == .alertFirstButtonReturn else {
+                    recorderLog.notice("Quit cancelled: recording goes on")
+                    return .terminateCancel
+                }
                 // The recording may have ended on its own while the alert was open.
                 if phase == .idle {
                     guard recovering else { return .terminateNow }
@@ -604,6 +644,7 @@ final class RecorderDelegate: NSObject, NSApplicationDelegate {
         // Read-only developer diagnostics run under this app's own authorization.
         let arguments = CommandLine.arguments
         guard let flag = arguments.firstIndex(of: "--diagnose-zoom"), arguments.count > flag + 1 else {
+            noteLaunch()
             RecorderModel.shared.recover()
             return
         }
@@ -701,6 +742,45 @@ final class RecorderDelegate: NSObject, NSApplicationDelegate {
     #endif
     @MainActor func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         RecorderModel.shared.quit()
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        recorderLog.notice("Quit")
+        recorderLog.flush()
+    }
+
+    /// The version, the Mac and the settings, then what happens around a recording that it
+    /// cannot see itself: sleep, displays, Zoom starting and quitting.
+    @MainActor private func noteLaunch() {
+        let info = Bundle.main.infoDictionary
+        let model = RecorderModel.shared
+        let system = ProcessInfo.processInfo.operatingSystemVersion
+        var size = 0
+        sysctlbyname("hw.model", nil, &size, nil, 0)
+        var name = [CChar](repeating: 0, count: max(size, 1))
+        sysctlbyname("hw.model", &name, &size, nil, 0)
+        recorderLog.notice("Launched \(info?["CFBundleShortVersionString"] as? String ?? "?") (\(info?["CFBundleVersion"] as? String ?? "?")), "
+                           + "macOS \(system.majorVersion).\(system.minorVersion).\(system.patchVersion), \(String(cString: name)), "
+                           + "folder \(model.folder.path), record screen \(model.recordScreen)")
+        let center = NSWorkspace.shared.notificationCenter
+        let events = [(NSWorkspace.willSleepNotification, "Mac going to sleep"), (NSWorkspace.didWakeNotification, "Mac woke up"),
+                      (NSWorkspace.screensDidSleepNotification, "Displays asleep"), (NSWorkspace.screensDidWakeNotification, "Displays awake"),
+                      (NSWorkspace.sessionDidResignActiveNotification, "Switched to another user"),
+                      (NSWorkspace.sessionDidBecomeActiveNotification, "Back from another user")]
+        for (event, text) in events {
+            center.addObserver(forName: event, object: nil, queue: .main) { _ in recorderLog.notice(text) }
+        }
+        for (event, text) in [(NSWorkspace.didLaunchApplicationNotification, "Zoom started"),
+                              (NSWorkspace.didTerminateApplicationNotification, "Zoom quit")] {
+            center.addObserver(forName: event, object: nil, queue: .main) { note in
+                guard let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
+                      app.bundleIdentifier == "us.zoom.xos" else { return }
+                recorderLog.notice("\(text), pid \(app.processIdentifier)")
+            }
+        }
+        NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main) { _ in
+            recorderLog.notice("Displays changed: \(NSScreen.screens.count) connected")
+        }
     }
 }
 

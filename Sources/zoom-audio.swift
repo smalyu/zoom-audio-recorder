@@ -1,6 +1,7 @@
 import AVFoundation
 import AppKit
 import ApplicationServices
+import CoreAudio
 import CoreGraphics
 import CoreMedia
 import Foundation
@@ -10,7 +11,74 @@ import ScreenCaptureKit
 // macOS 15+. Record Zoom's output plus the default microphone while Zoom is unmuted.
 // Build with build.sh so macOS sees the privacy descriptions in Info.plist.
 
-let recorderLog = Logger(subsystem: "local.zoom-audio-recorder", category: "capture")
+#if PREVIEW
+let recorderLog = RecorderLog(url: nil)
+#else
+let recorderLog = RecorderLog(url: Bundle.main.bundleIdentifier == nil ? nil : RecorderLog.file)
+#endif
+
+/// What the recorder notes as it goes, in the system log and in a file of its own: macOS
+/// keeps its log for about a day, too short to read after a call what happened in it.
+final class RecorderLog: @unchecked Sendable {
+    static let file = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask)[0]
+        .appendingPathComponent("Logs/Zoom Audio Recorder/zoom-audio.log")
+    private let system = Logger(subsystem: "local.zoom-audio-recorder", category: "capture")
+    /// The file, nil in the tests (they run without a bundle); past `limit` bytes it starts
+    /// over and the previous one is kept beside it with ".old" in its name.
+    private let url: URL?
+    private let limit: UInt64
+    private let queue = DispatchQueue(label: "local.zoom-audio-recorder.log")
+    private let stamp: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        return formatter
+    }()
+
+    init(url: URL?, limit: UInt64 = 10_000_000) {
+        self.url = url
+        self.limit = limit
+    }
+
+    func notice(_ message: String) {
+        system.notice("\(message, privacy: .public)")
+        append(message)
+    }
+
+    func error(_ message: String) {
+        system.error("\(message, privacy: .public)")
+        append(message)
+    }
+
+    private func append(_ message: String) {
+        guard let url else { return }
+        let now = Date()
+        // Written in the background, as lines come from the audio queues too. Opened for each
+        // line, a few a minute: a file deleted or moved meanwhile is made anew.
+        queue.async { [self] in
+            let line = Data("\(stamp.string(from: now)) \(message)\n".utf8)
+            let manager = FileManager.default
+            if let size = (try? manager.attributesOfItem(atPath: url.path))?[.size] as? UInt64, size > limit {
+                let old = url.deletingPathExtension().appendingPathExtension("old.log")
+                try? manager.removeItem(at: old)
+                try? manager.moveItem(at: url, to: old)
+            }
+            if let handle = try? FileHandle(forWritingTo: url) {
+                _ = try? handle.seekToEnd()
+                try? handle.write(contentsOf: line)
+                try? handle.close()
+            } else {
+                try? manager.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try? line.write(to: url)
+            }
+        }
+    }
+
+    /// Waits until every line so far is in the file, as before the app quits.
+    func flush() {
+        queue.sync {}
+    }
+}
 
 enum RecorderError: Error, LocalizedError, Equatable {
     case message(String)
@@ -55,15 +123,20 @@ final class Locked<Value>: @unchecked Sendable {
 }
 
 /// Waits for `operation`, but never longer than `seconds`: a hung system service
-/// must not keep captured audio from being saved.
-func waitAtMost(_ seconds: Double, _ operation: @escaping () async -> Void) async {
+/// must not keep captured audio from being saved. Giving up on a named one is logged.
+func waitAtMost(_ seconds: Double, _ name: String? = nil, _ operation: @escaping () async -> Void) async {
     let once = Once()
     await withCheckedContinuation { (finished: CheckedContinuation<Void, Never>) in
         Task {
             await operation()
             once.run { finished.resume() }
         }
-        DispatchQueue.global().asyncAfter(deadline: .now() + seconds) { once.run { finished.resume() } }
+        DispatchQueue.global().asyncAfter(deadline: .now() + seconds) {
+            once.run {
+                if let name { recorderLog.error("Gave up \(name) after \(Int(seconds)) s") }
+                finished.resume()
+            }
+        }
     }
 }
 
@@ -319,6 +392,8 @@ final class AudioTrack {
     private let closing = DispatchGroup()
     private var retryAt = Date.distantPast
     private var retryDelay = 5.0
+    /// Audio let go while writing kept failing, logged once a part opens again.
+    private var lostFrames: Int64 = 0
     private var previousQuiet = false
     private(set) var parts: [URL] = []
     private(set) var failure: Error?
@@ -375,7 +450,14 @@ final class AudioTrack {
                 buffer = rest
                 position = 0
             }
-            guard openPart(at: position) else { return }
+            guard openPart(at: position) else {
+                lostFrames += Int64(buffer.frameLength)
+                return
+            }
+            if lostFrames > 0 {
+                recorderLog.error(String(format: "%@ track: %.1f s of audio lost while writing failed", name, Double(lostFrames) / Self.rate))
+                lostFrames = 0
+            }
         }
         enqueue(buffer)
         drain()
@@ -386,11 +468,15 @@ final class AudioTrack {
     func finish() async {
         closePart()
         let closing = closing
-        await waitAtMost(120) {
+        await waitAtMost(120, "closing the \(name) track") {
             await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
                 closing.notify(queue: .global()) { done.resume() }
             }
         }
+        if lostFrames > 0 {
+            recorderLog.error(String(format: "%@ track: %.1f s of audio lost while writing failed", name, Double(lostFrames) / Self.rate))
+        }
+        recorderLog.notice("\(name) track closed: \(parts.count) parts, \(failures) failures")
         // finishWriting rewrites each file's header in place; persist it.
         parts.forEach(syncToStorage)
     }
@@ -463,7 +549,7 @@ final class AudioTrack {
     }
 
     private func record(_ error: Error) {
-        recorderLog.error("\(self.name, privacy: .public) track: \(error.localizedDescription, privacy: .public)")
+        recorderLog.error("\(self.name) track: \(error.localizedDescription)")
         failure = error
         failures += 1
     }
@@ -1142,6 +1228,123 @@ enum ZoomTiles {
 
 /// Reads who Zoom shows as speaking from its meeting window, five times a second. A poll
 /// is one round trip for the window's children and one per video.
+/// Notes the microphone and the output macOS uses by default, their volumes, and each change
+/// of them during a recording: the participants reach the microphone only through speakers,
+/// the louder the higher the volume, and Zoom may turn the microphone's volume itself.
+final class AudioDeviceWatcher {
+    private static let system = AudioObjectID(kAudioObjectSystemObject)
+    private static let defaults = [kAudioHardwarePropertyDefaultInputDevice, kAudioHardwarePropertyDefaultOutputDevice]
+    private let queue = DispatchQueue(label: "zoom-audio.devices")
+    private var running = false
+    private var watched: [AudioObjectPropertyScope: AudioObjectID] = [:]
+    private var described: String?
+    private var pending = false
+    private lazy var listener: AudioObjectPropertyListenerBlock = { [weak self] _, _ in self?.changed() }
+
+    func start() {
+        queue.sync {
+            running = true
+            for selector in Self.defaults {
+                var address = Self.address(selector, kAudioObjectPropertyScopeGlobal)
+                AudioObjectAddPropertyListenerBlock(Self.system, &address, queue, listener)
+            }
+            update()
+        }
+    }
+
+    func stop() {
+        queue.sync {
+            running = false
+            for selector in Self.defaults {
+                var address = Self.address(selector, kAudioObjectPropertyScopeGlobal)
+                AudioObjectRemovePropertyListenerBlock(Self.system, &address, queue, listener)
+            }
+            watch(AudioObjectID(kAudioObjectUnknown), kAudioObjectPropertyScopeInput)
+            watch(AudioObjectID(kAudioObjectUnknown), kAudioObjectPropertyScopeOutput)
+        }
+    }
+
+    /// Volume steps and device switches come in bursts: one line once they settle.
+    private func changed() {
+        guard !pending else { return }
+        pending = true
+        queue.asyncAfter(deadline: .now() + 1) { [weak self] in
+            self?.pending = false
+            self?.update()
+        }
+    }
+
+    private func update() {
+        guard running else { return }
+        let input = Self.read(Self.system, kAudioHardwarePropertyDefaultInputDevice, kAudioObjectPropertyScopeGlobal,
+                              AudioObjectID(kAudioObjectUnknown)) ?? AudioObjectID(kAudioObjectUnknown)
+        let output = Self.read(Self.system, kAudioHardwarePropertyDefaultOutputDevice, kAudioObjectPropertyScopeGlobal,
+                               AudioObjectID(kAudioObjectUnknown)) ?? AudioObjectID(kAudioObjectUnknown)
+        watch(input, kAudioObjectPropertyScopeInput)
+        watch(output, kAudioObjectPropertyScopeOutput)
+        let text = "Audio devices: microphone \(Self.describe(input, kAudioObjectPropertyScopeInput)), "
+            + "output \(Self.describe(output, kAudioObjectPropertyScopeOutput))"
+        guard text != described else { return }
+        described = text
+        recorderLog.notice(text)
+    }
+
+    /// Follows the volume and mute of this device instead of the previous one on that side.
+    private func watch(_ device: AudioObjectID, _ scope: AudioObjectPropertyScope) {
+        let previous = watched[scope] ?? AudioObjectID(kAudioObjectUnknown)
+        guard device != previous else { return }
+        for selector in [kAudioHardwareServiceDeviceProperty_VirtualMainVolume, kAudioDevicePropertyMute] {
+            var address = Self.address(selector, scope)
+            if previous != kAudioObjectUnknown { AudioObjectRemovePropertyListenerBlock(previous, &address, queue, listener) }
+            if device != kAudioObjectUnknown { AudioObjectAddPropertyListenerBlock(device, &address, queue, listener) }
+        }
+        watched[scope] = device
+    }
+
+    /// Name, connection, volume and mute, as "MacBook Pro Speakers (built-in), volume 50%".
+    private static func describe(_ device: AudioObjectID, _ scope: AudioObjectPropertyScope) -> String {
+        guard device != kAudioObjectUnknown else { return "none" }
+        var address = address(kAudioObjectPropertyName, kAudioObjectPropertyScopeGlobal)
+        var name: Unmanaged<CFString>?
+        var size = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+        let status = withUnsafeMutablePointer(to: &name) { AudioObjectGetPropertyData(device, &address, 0, nil, &size, $0) }
+        let title = status == noErr ? name?.takeRetainedValue() as String? ?? "unnamed" : "unnamed"
+        let transport: String
+        switch read(device, kAudioDevicePropertyTransportType, kAudioObjectPropertyScopeGlobal, UInt32(0)) {
+        case kAudioDeviceTransportTypeBuiltIn: transport = "built-in"
+        case kAudioDeviceTransportTypeBluetooth, kAudioDeviceTransportTypeBluetoothLE: transport = "Bluetooth"
+        case kAudioDeviceTransportTypeUSB: transport = "USB"
+        case kAudioDeviceTransportTypeHDMI, kAudioDeviceTransportTypeDisplayPort: transport = "display"
+        case kAudioDeviceTransportTypeAirPlay: transport = "AirPlay"
+        case kAudioDeviceTransportTypeContinuityCaptureWired, kAudioDeviceTransportTypeContinuityCaptureWireless: transport = "iPhone"
+        case kAudioDeviceTransportTypeVirtual: transport = "virtual"
+        case kAudioDeviceTransportTypeAggregate, kAudioDeviceTransportTypeAutoAggregate: transport = "aggregate"
+        case let other?: transport = String(format: "%08x", other)
+        case nil: transport = "unknown"
+        }
+        var text = "\(title) (\(transport))"
+        if let volume = read(device, kAudioHardwareServiceDeviceProperty_VirtualMainVolume, scope, Float32(0)) {
+            text += ", volume \(Int((volume * 100).rounded()))%"
+        }
+        if read(device, kAudioDevicePropertyMute, scope, UInt32(0)) == 1 { text += ", muted" }
+        return text
+    }
+
+    private static func address(_ selector: AudioObjectPropertySelector, _ scope: AudioObjectPropertyScope) -> AudioObjectPropertyAddress {
+        AudioObjectPropertyAddress(mSelector: selector, mScope: scope, mElement: kAudioObjectPropertyElementMain)
+    }
+
+    private static func read<Value>(_ object: AudioObjectID, _ selector: AudioObjectPropertySelector,
+                                    _ scope: AudioObjectPropertyScope, _ initial: Value) -> Value? {
+        var address = address(selector, scope)
+        guard object != kAudioObjectUnknown, AudioObjectHasProperty(object, &address) else { return nil }
+        var value = initial
+        var size = UInt32(MemoryLayout<Value>.size)
+        let status = withUnsafeMutablePointer(to: &value) { AudioObjectGetPropertyData(object, &address, 0, nil, &size, $0) }
+        return status == noErr ? value : nil
+    }
+}
+
 final class ZoomSpeakerWatcher {
     private static let attributes = [kAXRoleAttribute, kAXDescriptionAttribute, kAXSizeAttribute] as CFArray
     private let application: AXUIElement
@@ -1614,6 +1817,12 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
         uncertainVoice || (!controlSeen && speechSeconds > 10) || silencedInMeeting > 3
     }
 
+    /// For the log: whether the whole microphone is saved, and what decided it.
+    var decisionSummary: String {
+        "whole microphone \(needsSafetyCopy) (mute control seen \(controlSeen), speech \(Int(speechSeconds)) s, "
+            + "uncertain \(uncertainVoice) \(Int(uncertainSeconds)) s, silenced in a meeting \(Int(silencedInMeeting)) s)"
+    }
+
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer,
                 of type: SCStreamOutputType) {
         guard stream === current else { return }
@@ -1623,7 +1832,7 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
     func stream(_ stream: SCStream, didStopWithError error: Error) {
         queue.async {
             guard stream === self.current else { return }
-            recorderLog.error("Stream stopped: \(error.localizedDescription, privacy: .public)")
+            recorderLog.error("Stream stopped: \(error.localizedDescription)")
             self.streamError = error
             self.wake?.signal()
         }
@@ -1636,7 +1845,7 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
            let format = CMSampleBufferGetFormatDescription(sample).flatMap({ CMAudioFormatDescriptionGetStreamBasicDescription($0)?.pointee }),
            described[type].map({ $0.rate != format.mSampleRate || $0.channels != format.mChannelsPerFrame }) ?? true {
             described[type] = (format.mSampleRate, format.mChannelsPerFrame)
-            recorderLog.notice("\(type == .audio ? "Zoom audio" : "Microphone", privacy: .public): \(format.mSampleRate, format: .fixed(precision: 0)) Hz, \(format.mChannelsPerFrame) channels, \(CMSampleBufferGetNumSamples(sample)) frames")
+            recorderLog.notice("\(type == .audio ? "Zoom audio" : "Microphone"): \(Int(format.mSampleRate)) Hz, \(format.mChannelsPerFrame) channels, \(CMSampleBufferGetNumSamples(sample)) frames")
         }
         if let pending = pendingSpeaker {
             pendingSpeaker = nil
@@ -1696,7 +1905,10 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
             voice.removeFirst()
             let kept = keep(ranges, of: entry.buffer, capturedAt: entry.captured)
             hadVoice = hadVoice || kept
-            if hadVoice, !marked.voice { marked.voice = onVoice() }
+            if hadVoice, !marked.voice {
+                marked.voice = onVoice()
+                if marked.voice { recorderLog.notice("First voice written") }
+            }
             // Judged by the readings that decided the audio, not by whether the control is back now.
             track(speech: entry.speech, kept: kept, length: length,
                   missing: timeline.controlMissing(from: entry.captured, to: entry.captured + length))
@@ -1711,7 +1923,10 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
     private func track(speech: Bool, kept: Bool, length: Double, missing: Bool) {
         let status = control()
         controlSeen = controlSeen || status.seen
-        if controlSeen, !marked.control { marked.control = onControlSeen() }
+        if controlSeen, !marked.control {
+            marked.control = onControlSeen()
+            if marked.control { recorderLog.notice("Zoom's mute control found") }
+        }
         if !status.missing {
             uncertainSeconds += missingSpeech
             missingSpeech = 0
@@ -1730,7 +1945,10 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
         }
         // Marked at once, so a crash later in the meeting still delivers the whole microphone.
         uncertainVoice = uncertainVoice || silencedInMeeting > 3 || uncertainSeconds > 3
-        if uncertainVoice, !marked.uncertain { marked.uncertain = onUncertainVoice() }
+        if uncertainVoice, !marked.uncertain {
+            marked.uncertain = onUncertainVoice()
+            if marked.uncertain { recorderLog.notice("Speech silenced while Zoom's mute control was gone: the whole microphone will be saved") }
+        }
     }
 
     private func forgetOldHearing() {
@@ -1960,9 +2178,14 @@ struct ZoomAudio {
         var connectedAt = Date()
         var zoomAudio = true
         var lastStall = Date.distantPast
+        // While Zoom is closed connecting fails every 2 s: a failure is logged when it changes, or once a minute.
+        var lastFailure: (text: String, at: Date)?
+        let devices = AudioDeviceWatcher()
+        devices.start()
+        defer { devices.stop() }
 
         func disconnect() async {
-            if let stream { await waitAtMost(5) { try? await stream.stopCapture() } }
+            if let stream { await waitAtMost(5, "stopping the capture") { try? await stream.stopCapture() } }
             stream = nil
             // Confirm or reject the last moments of speech before the held audio is written.
             watcher?.finalReading()
@@ -1985,8 +2208,13 @@ struct ZoomAudio {
                     zoom = app
                     // Cancelled while connecting: nothing was meant to be recorded.
                     if stop.isRequested && !started { break }
+                    if started {
+                        interruptions += 1
+                        recorderLog.notice(String(format: "Reconnected after %.0f s (interruption %d)",
+                                                  Date().timeIntervalSince(lostSince ?? Date()), interruptions))
+                    }
                     lostSince = nil
-                    if started { interruptions += 1 }
+                    lastFailure = nil
                     events(started ? .connected : .started)
                     if !started {
                         screenTask = Task { await screen.run(wanted: wanted, stop: screenStop) { events(.screen($0)) } }
@@ -1994,11 +2222,16 @@ struct ZoomAudio {
                     started = true
                     connectedAt = Date()
                 } catch {
-                    recorderLog.error("Connect failed: \(error.localizedDescription, privacy: .public)")
+                    let text = error.localizedDescription
+                    if lastFailure?.text != text || Date().timeIntervalSince(lastFailure?.at ?? .distantPast) >= 60 {
+                        recorderLog.error("Connect failed: \(text)")
+                        lastFailure = (text, Date())
+                    }
                     guard started else { throw error }
                     let since = lostSince ?? Date()
                     lostSince = since
                     if runningZoom() == nil, Date().timeIntervalSince(since) > zoomReturnTimeout {
+                        recorderLog.notice("Zoom gone for \(Int(zoomReturnTimeout)) s; the recording ends")
                         zoomQuit = true
                         break
                     }
@@ -2040,7 +2273,7 @@ struct ZoomAudio {
                 recorderLog.error("No microphone audio for \(Int(silent)) s; reconnecting")
             }
             if broken || stalled || zoom?.isTerminated == true {
-                recorderLog.notice("Capture interrupted; reconnecting")
+                recorderLog.notice("Capture interrupted (\(broken ? "stream error" : stalled ? "no microphone audio" : "Zoom quit")); reconnecting")
                 await disconnect()
                 capture.queue.sync { capture.noteSpeaker(nil, at: capture.now().seconds) }
                 events(.microphone(.unavailable))
@@ -2059,6 +2292,9 @@ struct ZoomAudio {
         _ = await (zoomClosed, micClosed, rawClosed, screenClosed)
         let hasZoom = !capture.zoom.parts.isEmpty
         let needsSafetyCopy = capture.queue.sync { capture.needsSafetyCopy }
+        recorderLog.notice("Capture ended: Zoom audio \(hasZoom), voice \(capture.hadVoice), interruptions \(interruptions), "
+                           + "Zoom quit \(zoomQuit), \(capture.queue.sync { capture.decisionSummary }), "
+                           + "screen wanted \(screen.wanted), screen out of space \(screen.noSpace)")
         return RecordingSummary(started: started, hasAudio: hasZoom || capture.hadVoice || needsSafetyCopy, hasZoom: hasZoom,
                                 hasVoice: capture.hadVoice, interruptions: interruptions, zoomQuit: zoomQuit,
                                 needsSafetyCopy: needsSafetyCopy, screenWanted: screen.wanted, screenNoSpace: screen.noSpace)
@@ -2082,9 +2318,10 @@ struct ZoomAudio {
         guard let zoom = captureApplication(in: content, pid: app.processIdentifier) else {
             throw RecorderError.message(openZoomHint)
         }
-        recorderLog.notice("Recording target: \(zoom.bundleIdentifier, privacy: .public), pid \(zoom.processID)")
+        let version = app.bundleURL.flatMap { Bundle(url: $0)?.infoDictionary?["CFBundleShortVersionString"] as? String } ?? "unknown"
+        recorderLog.notice("Recording target: \(zoom.bundleIdentifier) \(version), pid \(zoom.processID)")
         let watcher = ZoomMuteWatcher(pid: app.processIdentifier, bundleURL: app.bundleURL) { state in
-            recorderLog.notice("Zoom microphone: \(String(describing: state), privacy: .public)")
+            recorderLog.notice("Zoom microphone: \(String(describing: state))")
             events(.microphone(state))
         }
         let speakers = ZoomSpeakerWatcher(pid: app.processIdentifier) { speaker, time in

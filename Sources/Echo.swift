@@ -413,7 +413,7 @@ final class EchoCanceller {
     private func finishReport() {
         report.delay = strongest(foreground)
         report.learning = strongest(background)
-        recorderLog.notice("\(self.report.description, privacy: .public)")
+        recorderLog.notice(report.description)
         lastReport = report
         report = EchoReport()
     }

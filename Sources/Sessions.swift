@@ -117,7 +117,7 @@ private func encodeMix(of composition: AVComposition, range: CMTimeRange, tracks
                     continue
                 }
                 retried = false
-                recorderLog.error("Damaged audio at \(Double(written) / AudioTrack.rate, privacy: .public) s skipped")
+                recorderLog.error("Damaged audio at \(String(format: "%.1f", Double(written) / AudioTrack.rate)) s skipped")
                 try silence(until: written + Int64(AudioTrack.rate / 4))
             }
             input.markAsFinished()
@@ -127,7 +127,7 @@ private func encodeMix(of composition: AVComposition, range: CMTimeRange, tracks
             guard writer.status == .completed else { throw writer.error ?? RecorderError.message("Не удалось сохранить запись") }
             done(true)
         } catch {
-            recorderLog.error("Mix encoder failed, using the export preset: \(error.localizedDescription, privacy: .public)")
+            recorderLog.error("Mix encoder failed, using the export preset: \(error.localizedDescription)")
             done(false)
         }
     }
@@ -228,7 +228,7 @@ func exportRecording(zoom: [TrackPart], mic: [TrackPart], to output: URL, trimme
             let asset = AVURLAsset(url: part.url)
             guard let source = try? await asset.loadTracks(withMediaType: .audio).first,
                   let duration = try? await asset.load(.duration), duration.seconds.isFinite, duration.seconds > 0 else {
-                recorderLog.error("Unreadable part \(part.url.lastPathComponent, privacy: .public)")
+                recorderLog.error("Unreadable part \(part.url.lastPathComponent)")
                 unreadable.append(part.url)
                 continue
             }
@@ -255,6 +255,10 @@ func exportRecording(zoom: [TrackPart], mic: [TrackPart], to output: URL, trimme
     let range = trimmed ? await withCheckedContinuation { found in
         findSoundRange(of: composition, tracks: tracks, mix: mix) { found.resume(returning: $0) }
     } : CMTimeRange(start: .zero, duration: composition.duration)
+    if trimmed {
+        recorderLog.notice(String(format: "Sound kept from %.1f to %.1f s of %.1f s", range.start.seconds, range.end.seconds,
+                                  composition.duration.seconds))
+    }
     let metadata = description(range.start.seconds, range.end.seconds).map { text -> [AVMetadataItem] in
         // "desc", unlike the identifier for "©des", is what ffprobe shows as `description`.
         let item = AVMutableMetadataItem()
@@ -291,7 +295,7 @@ func exportRecording(zoom: [TrackPart], mic: [TrackPart], to output: URL, trimme
             try await exporter.export(to: output, as: .m4a)
         } catch where !metadata.isEmpty {
             // The speaker timeline is never worth the recording: save without it.
-            recorderLog.error("Export with the speaker timeline failed, saving without it: \(error.localizedDescription, privacy: .public)")
+            recorderLog.error("Export with the speaker timeline failed, saving without it: \(error.localizedDescription)")
             try? FileManager.default.removeItem(at: output)
             guard let plain = AVAssetExportSession(asset: composition, presetName: AVAssetExportPresetAppleM4A) else { throw error }
             plain.audioMix = mix
@@ -302,6 +306,7 @@ func exportRecording(zoom: [TrackPart], mic: [TrackPart], to output: URL, trimme
     withExtendedLifetime(assets) {}
     let duration = try await verifyRecording(output)
     guard duration > min(expected, range.end.seconds) - range.start.seconds - 1 else {
+        recorderLog.error(String(format: "Saved file %.1f s, expected %.1f s", duration, min(expected, range.end.seconds) - range.start.seconds))
         throw RecorderError.message("Сохранённый файл короче записи")
     }
     return ExportResult(duration: duration, unreadable: unreadable, start: range.start.seconds)
@@ -345,7 +350,12 @@ func exportScreen(_ parts: [TrackPart], audio: URL, from start: Double, to outpu
         assets.append(asset)
         if size == .zero, let natural = try? await frames.load(.naturalSize) { size = natural }
     }
-    guard !pieces.isEmpty else { return nil }
+    guard !pieces.isEmpty else {
+        recorderLog.notice("No picture within the saved sound out of \(parts.count) screen parts; no video")
+        return nil
+    }
+    recorderLog.notice(String(format: "Video from %d of %d screen parts, %.0f s with a picture of %.0f s", pieces.count, parts.count,
+                              pieces.reduce(0) { $0 + $1.range.duration.seconds }, length.seconds))
     // A ten-second black part, repeated over every stretch without a picture, each copy starting on
     // its keyframe. Without one the stretches stay empty, which Apple's players show black too.
     let blackFolder = output.deletingLastPathComponent().appendingPathComponent("black", isDirectory: true)
@@ -363,7 +373,7 @@ func exportScreen(_ parts: [TrackPart], audio: URL, from start: Double, to outpu
                 assets.append(asset)
             }
         } catch {
-            recorderLog.error("No black picture for the gaps: \(error.localizedDescription, privacy: .public)")
+            recorderLog.error("No black picture for the gaps: \(error.localizedDescription)")
         }
     }
     var at = CMTime.zero
@@ -410,7 +420,7 @@ func exportScreen(_ parts: [TrackPart], audio: URL, from start: Double, to outpu
         } catch {
             exporter.cancelExport()
             guard !tags.isEmpty, (error as? RecorderError) == nil, !(error is CancellationError), !cancel.isRequested else { throw error }
-            recorderLog.error("Video with the speaker timeline failed, saving without it: \(error.localizedDescription, privacy: .public)")
+            recorderLog.error("Video with the speaker timeline failed, saving without it: \(error.localizedDescription)")
         }
     }
     withExtendedLifetime(assets) {}
@@ -452,6 +462,20 @@ final class RecordingSession {
         var videoNoSpace = false
         /// Its files could not be kept aside either: the session stays, and the next launch tries again.
         var videoPending = false
+
+        /// For the log: where it went, how long it is, and all that did not go as planned.
+        var summary: String {
+            var text = "\(url.path), \(Int(duration.rounded())) s"
+            if usedFallback { text += ", in the fallback folder" }
+            if incomplete { text += ", unreadable sound parts" }
+            if let microphone { text += ", whole microphone \(microphone.lastPathComponent)" }
+            if let video { text += ", video \(video.lastPathComponent)" }
+            if videoIncomplete { text += ", unreadable screen parts" }
+            if videoFailed { text += videoNoSpace ? ", video not saved: no space" : ", video not saved" }
+            if videoPending { text += ", video left for the next launch" }
+            if let unreadableFolder { text += ", kept aside in \(unreadableFolder.path)" }
+            return text
+        }
     }
 
     /// The sound delivered before the video was saved, so an attempt cut short there never
@@ -613,13 +637,21 @@ final class RecordingSession {
                  progress: @escaping (Double) -> Void = { _ in }) async throws -> Delivery {
         if let data = try? Data(contentsOf: folder.appendingPathComponent("delivered.json")),
            let sound = try? JSONDecoder().decode(DeliveredSound.self, from: data) {
+            recorderLog.notice("Sound already saved as \(sound.url.path); saving the video")
             return await deliverScreen(after: sound, progress: progress)
         }
-        var wholeMicrophone = needsSafetyCopy(recovering: recovering)
+        let marked = needsSafetyCopy(recovering: recovering)
+        var wholeMicrophone = marked
         if !wholeMicrophone, recovering { wholeMicrophone = await microphoneCutShort() }
         let tracks = ["zoom"] + (hasVoice ? ["mic"] : []) + (wholeMicrophone ? ["raw"] : [])
+        recorderLog.notice("Saving \(folder.lastPathComponent): tracks \(tracks.joined(separator: ", "))"
+                           + (wholeMicrophone ? (marked ? ", whole microphone: mute detection uncertain" : ", whole microphone: cut short") : "")
+                           + (recovering ? ", recovering" : ""))
         // Unreadable parts go aside first, so they never decide which tracks are mixed.
         let (incomplete, videoIncomplete) = try await keepUnreadableParts(of: tracks)
+        if incomplete || videoIncomplete {
+            recorderLog.error("Unreadable \(incomplete ? "sound" : "screen")\(incomplete && videoIncomplete ? " and screen" : "") parts kept in \(unreadableFolder.path)")
+        }
         let zoomParts = AudioTrack.parts(named: "zoom", in: folder)
         let micParts = tracks.contains("mic") ? AudioTrack.parts(named: "mic", in: folder) : []
         let rawParts = tracks.contains("raw") ? AudioTrack.parts(named: "raw", in: folder) : []
@@ -644,6 +676,7 @@ final class RecordingSession {
         var failure: Error?
         // A network share that went away must not hold up saving to the fallback folder.
         if await !answers(within: 10, { RecordingStorage.reachable(preferred) }) {
+            recorderLog.error("Folder \(preferred.path) unreachable; saving to \(fallback.path)")
             failure = RecorderError.message("Папка «\(preferred.lastPathComponent)» недоступна")
         }
         for directory in [preferred, fallback] where directory != preferred || failure == nil {
@@ -678,7 +711,7 @@ final class RecordingSession {
                 syncToStorage(record)
                 return await deliverScreen(after: sound) { progress(share + $0 * (1 - share)) }
             } catch {
-                recorderLog.error("Save to \(directory.path, privacy: .public) failed: \(error.localizedDescription, privacy: .public)")
+                recorderLog.error("Save to \(directory.path) failed: \(error.localizedDescription)")
                 failure = error
             }
         }
@@ -722,14 +755,14 @@ final class RecordingSession {
         do {
             result.video = try await saveScreen(next: sound.url, start: sound.start, progress: progress)
         } catch {
-            recorderLog.error("Screen not saved: \(error.localizedDescription, privacy: .public)")
+            recorderLog.error("Screen not saved: \(error.localizedDescription)")
             result.videoFailed = true
             result.videoNoSpace = error as? RecorderError == .noSpaceForVideo
             do {
                 try await keepScreenAside()
                 result.unreadableFolder = unreadableFolder
             } catch {
-                recorderLog.error("Screen not kept aside: \(error.localizedDescription, privacy: .public)")
+                recorderLog.error("Screen not kept aside: \(error.localizedDescription)")
                 result.videoPending = true
                 return result
             }
