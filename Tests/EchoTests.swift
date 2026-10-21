@@ -35,8 +35,8 @@ func checkEchoCanceller() throws {
     }
     var report: EchoReport?
     /// `slipping`: timestamps jitter, the microphone's by up to 20 frames and Zoom's by a few.
-    func run(_ microphone: [Float], slipping: Bool = false) throws -> [Float] {
-        let canceller = EchoCanceller()
+    func run(_ microphone: [Float], slipping: Bool = false, suppressing: Bool = true) throws -> [Float] {
+        let canceller = EchoCanceller(suppressing: suppressing)
         var output = [Float](repeating: 0, count: microphone.count)
         var filled = [Bool](repeating: false, count: microphone.count)
         var written = 0
@@ -98,7 +98,29 @@ func checkEchoCanceller() throws {
     broken[rate / 2] = .nan
     let recovered = try run(broken)
     try check(db(echo, recovered, 6..<12) > 15, "after a broken sample echo removed by only \(db(echo, recovered, 6..<12)) dB")
-    print("PASS: echo cancellation removes the speakers, keeps the user's voice and every sample, recovers from headphones, slips and broken samples")
+    try check(recovered.allSatisfy { $0.isFinite }, "a broken sample let out")
+    // Loud speakers distort, which no filter subtracts: the suppressor takes most of what it
+    // leaves, and the user's voice over the participant stays as loud.
+    var distorted = [Float](repeating: 0, count: far.count)
+    let driven = far.map { tanh(6 * $0) / 6 }
+    for (lag, gain) in [(2448, Float(0.4)), (2600, 0.15), (3100, -0.08), (4000, 0.04)] {
+        for index in lag..<far.count { distorted[index] += gain * driven[index - lag] }
+    }
+    let heard = zip(distorted, near).map(+)
+    let filteredOnly = try run(heard, suppressing: false)
+    let suppressed = try run(heard)
+    let byFilter = db(distorted, zip(filteredOnly, near).map(-), 6..<12)
+    let byBoth = db(distorted, zip(suppressed, near).map(-), 6..<12)
+    try check(report.map { $0.suppressed > 2 } == true, "report: \(report?.description ?? "none")")
+    try check(byBoth > byFilter + 8, "distorted echo removed by \(byFilter) dB, with the suppressor only \(byBoth) dB")
+    /// How loud the user's voice comes out, in dB against what they said.
+    func kept(_ output: [Float]) -> Double {
+        let range = 12 * rate..<16 * rate
+        let along = range.reduce(0.0) { $0 + Double(output[$1] * near[$1]) }
+        return 20 * log10(along / range.reduce(0.0) { $0 + Double(near[$1] * near[$1]) })
+    }
+    try check(kept(suppressed) > kept(filteredOnly) - 1.5, "the voice over a participant turned down: \(kept(suppressed)) dB, filter only \(kept(filteredOnly)) dB")
+    print("PASS: echo cancellation removes the speakers and what they distort, keeps the user's voice and every sample, recovers from headphones, slips and broken samples")
 }
 
 /// The recording's microphone track is echo-free; the safety copy keeps the raw microphone.
