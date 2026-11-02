@@ -89,14 +89,14 @@ enum RecorderError: Error, LocalizedError, Equatable {
     var errorDescription: String? {
         switch self {
         case let .message(value): return value
-        case .noAudio: return "Звук не получен. Войдите в созвон Zoom и проверьте индикатор микрофона."
+        case .noAudio: return "Звук не получен. Войдите в созвон и проверьте индикатор микрофона."
         case .noSpaceForVideo: return "Мало места для видео"
         case .damaged: return "Запись повреждена — исходные файлы сохранены"
         }
     }
 }
 
-let openZoomHint = "Откройте Zoom и войдите в созвон"
+let openMeetingHint = "Откройте Zoom или Телемост и войдите в созвон"
 private let screenAccessHint = "Разрешите Zoom Audio Recorder «Запись экрана и системного звука» в Системных настройках и перезапустите приложение."
 
 private final class Once: @unchecked Sendable {
@@ -805,7 +805,7 @@ struct MuteIndicators {
     }
 }
 
-private final class ZoomMuteWatcher {
+private final class ZoomMuteWatcher: MicrophoneWatcher {
     private enum Reading { case found(label: ZoomMuteState, tip: ZoomMuteState?), none, busy }
     private struct Control {
         let element: AXUIElement
@@ -874,6 +874,9 @@ private final class ZoomMuteWatcher {
 
     /// Whether Zoom's microphone control has been found, and whether it is missing now.
     var control: (seen: Bool, missing: Bool) { lock.withLock { (controlSeen, lastReported == .unavailable) } }
+
+    /// Zoom's own-audio control is there only in a meeting.
+    var inMeeting: Bool { lock.withLock { lastReported != nil && lastReported != .unavailable } }
 
     /// Readings from just before `time` on, for deciding captured microphone audio.
     func timeline(from time: Double) -> MuteTimeline {
@@ -1686,11 +1689,29 @@ struct MuteTimeline {
     /// When a poll began, whether it saw Zoom's microphone on, and whether it saw no control at all.
     typealias Reading = (time: Double, unmuted: Bool, missing: Bool)
     var readings: [Reading] = []
+    /// How long before an unmute reading voice is kept: Zoom shows a press late, Telemost's log
+    /// gives the press itself.
+    var lead = MuteTimeline.lead
+    /// Where the app left the recording: nothing more comes, and its microphone is off from then.
+    var ended: Double?
+    /// The other apps recorded alongside, as Zoom and Telemost in one call: voice is kept where
+    /// any of them has the microphone on, and a control is missing only where all miss one.
+    var alongside: [MuteTimeline] = []
+
+    /// The readings, closed by an "off" one where the app left.
+    private var closed: [Reading] {
+        guard let ended else { return readings }
+        return readings.filter { $0.time < ended } + [(ended, false, true)]
+    }
 
     /// Whether Zoom's control was missing at some point in [start, end): a reading holds until the next.
     func controlMissing(from start: Double, to end: Double) -> Bool {
+        alongside.allSatisfy { $0.controlMissing(from: start, to: end) } && ownControlMissing(from: start, to: end)
+    }
+
+    private func ownControlMissing(from start: Double, to end: Double) -> Bool {
         var previous: Reading?
-        for reading in readings {
+        for reading in closed {
             if let previous, previous.missing, previous.time < end, reading.time > start { return true }
             previous = reading
         }
@@ -1700,12 +1721,22 @@ struct MuteTimeline {
     /// The voice parts of [start, end), or nil while the readings that decide them are
     /// not in yet. `final` decides now and carries the last reading forward.
     func voice(from start: Double, to end: Double, final: Bool = false) -> [Range<Double>]? {
-        if !final, (readings.last?.time ?? -.infinity) < end + Self.lead + Self.pad { return nil }
+        guard var ranges = ownVoice(from: start, to: end, final: final || ended != nil) else { return nil }
+        for other in alongside {
+            guard let more = other.voice(from: start, to: end, final: final) else { return nil }
+            ranges = Self.union(ranges + more)
+        }
+        return ranges
+    }
+
+    private func ownVoice(from start: Double, to end: Double, final: Bool) -> [Range<Double>]? {
+        let readings = closed
+        if !final, (readings.last?.time ?? -.infinity) < end + lead + Self.pad { return nil }
         var spans: [Range<Double>] = []
         var previous: Reading?
         for reading in readings {
             if reading.unmuted {
-                let from = previous.flatMap { $0.unmuted ? $0.time : nil } ?? reading.time - Self.lead
+                let from = previous.flatMap { $0.unmuted ? $0.time : nil } ?? reading.time - lead
                 spans.append(from..<reading.time)
             } else if let previous, previous.unmuted {
                 spans.append(previous.time..<max(previous.time, reading.time))
@@ -1715,18 +1746,24 @@ struct MuteTimeline {
         if final, let last = readings.last, last.unmuted {
             spans.append(last.time..<max(last.time, end))
         }
-        var ranges: [Range<Double>] = []
-        for span in spans {
+        return Self.union(spans.compactMap { span in
             let lower = max(start, span.lowerBound - Self.pad)
             let upper = min(end, span.upperBound + Self.pad)
-            guard lower < upper else { continue }
-            if let last = ranges.last, lower <= last.upperBound {
-                ranges[ranges.count - 1] = last.lowerBound..<max(last.upperBound, upper)
+            return lower < upper ? lower..<upper : nil
+        })
+    }
+
+    /// Ranges joined where they touch or overlap, in order.
+    static func union(_ ranges: [Range<Double>]) -> [Range<Double>] {
+        var result: [Range<Double>] = []
+        for range in ranges.sorted(by: { $0.lowerBound < $1.lowerBound }) {
+            if let last = result.last, range.lowerBound <= last.upperBound {
+                result[result.count - 1] = last.lowerBound..<max(last.upperBound, range.upperBound)
             } else {
-                ranges.append(lower..<upper)
+                result.append(range)
             }
         }
-        return ranges
+        return result
     }
 }
 
@@ -1925,7 +1962,7 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
         controlSeen = controlSeen || status.seen
         if controlSeen, !marked.control {
             marked.control = onControlSeen()
-            if marked.control { recorderLog.notice("Zoom's mute control found") }
+            if marked.control { recorderLog.notice("Mute control found") }
         }
         if !status.missing {
             uncertainSeconds += missingSpeech
@@ -2093,6 +2130,10 @@ enum RecorderEvent {
     case started
     case reconnecting
     case connected
+    /// The app shown from now on: of those in a meeting, the one in front.
+    case app(MeetingApp)
+    /// The first meeting recorded is in this app: the file is named after it.
+    case named(MeetingApp)
     case microphone(ZoomMuteState)
     case problem(String)
     case lowDiskSpace(Bool)
@@ -2108,15 +2149,17 @@ struct RecordingSummary {
     let hasAudio: Bool
     let hasZoom: Bool
     let hasVoice: Bool
-    /// Times the connection to Zoom broke and was restored.
+    /// Times the connection to the meeting app broke and was restored.
     let interruptions: Int
-    /// Zoom quit and did not come back, so the recording stopped by itself.
-    let zoomQuit: Bool
+    /// The meeting app quit and did not come back, so the recording stopped by itself.
+    let appQuit: Bool
     /// Deliver the whole microphone too: mute detection may have failed.
     let needsSafetyCopy: Bool
     /// Recording the screen was on at some point, and low disk space kept it from recording.
     var screenWanted = false
     var screenNoSpace = false
+    /// The app recorded last.
+    var app = MeetingApp.zoom
 }
 
 struct ZoomAudio {
@@ -2132,8 +2175,8 @@ struct ZoomAudio {
         NSRunningApplication.runningApplications(withBundleIdentifier: "us.zoom.xos").first { !$0.isTerminated }
     }
 
-    /// Checks everything a recording needs before any file is created.
-    static func prepare() async throws {
+    /// Checks everything a recording needs before any file is created, and picks the meeting to record.
+    static func prepare() async throws -> MeetingTarget {
         guard CGPreflightScreenCaptureAccess() || CGRequestScreenCaptureAccess() else {
             throw RecorderError.message(screenAccessHint)
         }
@@ -2143,15 +2186,19 @@ struct ZoomAudio {
         guard await AVCaptureDevice.requestAccess(for: .audio) else {
             throw RecorderError.message("Разрешите Zoom Audio Recorder доступ к микрофону в Системных настройках.")
         }
-        guard runningZoom() != nil else {
-            throw RecorderError.message(openZoomHint)
+        guard let target = Meetings.choose() else {
+            throw RecorderError.message(openMeetingHint)
         }
+        return target
     }
 
-    /// Records into `directory` until `stop` is requested. A broken stream or a Zoom
-    /// restart reconnects automatically; the parts on disk stay aligned throughout.
-    /// Zoom's meeting window is recorded too whenever `screen` is on.
-    static func record(into directory: URL, stop: StopRequest, screen wanted: Locked<Bool> = Locked(false),
+    /// Records into `directory` until `stop` is requested: every meeting app at once, as Zoom and
+    /// Telemost may both be in one call, one after the other or together. An app that starts or
+    /// joins a meeting is added to the same stream as it goes, one that quits drops out, and the
+    /// user's voice is kept where any of them has the microphone on. A broken stream reconnects
+    /// automatically; the parts on disk stay aligned throughout. The meeting window of the app in
+    /// front is recorded too whenever `screen` is on.
+    static func record(into directory: URL, first: MeetingTarget, stop: StopRequest, screen wanted: Locked<Bool> = Locked(false),
                        events: @escaping (RecorderEvent) -> Void,
                        onVoice: @escaping () -> Bool, onUncertainVoice: @escaping () -> Bool,
                        onControlSeen: @escaping () -> Bool) async throws -> RecordingSummary {
@@ -2162,50 +2209,90 @@ struct ZoomAudio {
         capture.onControlSeen = onControlSeen
         capture.onProblem = { events(.problem($0)) }
         let screen = ScreenCapture(directory: directory) { capture.originHost.current }
+        let screenSource = Locked<ScreenCapture.Source?>(ScreenCapture.Source(app: first.app, pid: first.pid, inMeeting: true))
         let screenStop = StopRequest()
+        let members = MeetingMembers()
+        let browsers = BrowserMembership()
         var screenTask: Task<Void, Never>?
         var stream: SCStream?
-        var watcher: ZoomMuteWatcher?
-        var speakers: ZoomSpeakerWatcher?
-        var zoom: NSRunningApplication?
+        var primary: MeetingTarget? = first
+        var named = false
         var started = false
         var lostSince: Date?
         var lastSync = Date()
         var lastSpaceCheck = Date.distantPast
         var lowSpace = false
         var interruptions = 0
-        var zoomQuit = false
+        var appQuit = false
         var connectedAt = Date()
         var zoomAudio = true
         var lastStall = Date.distantPast
-        // While Zoom is closed connecting fails every 2 s: a failure is logged when it changes, or once a minute.
+        // While no meeting app runs connecting fails every 2 s: a failure is logged when it changes, or once a minute.
         var lastFailure: (text: String, at: Date)?
         let devices = AudioDeviceWatcher()
         devices.start()
         defer { devices.stop() }
 
+        /// Adds watchers for the apps now in the stream.
+        func join(_ targets: [MeetingTarget]) {
+            for target in targets {
+                let app = target.process
+                let name = target.app == .zoom ? "Zoom" : "\(target.app)"
+                let changed = { (state: ZoomMuteState) in
+                    recorderLog.notice("\(name) microphone: \(String(describing: state))")
+                    // The window shows the microphone of all apps together.
+                    let all = members.note(state, of: target.pid)
+                    if members.show(all) { events(.microphone(all)) }
+                }
+                let watcher: MicrophoneWatcher
+                var speakers: ZoomSpeakerWatcher?
+                switch target.app {
+                case .zoom:
+                    watcher = ZoomMuteWatcher(pid: app.processIdentifier, bundleURL: app.bundleURL, onChange: changed)
+                    speakers = ZoomSpeakerWatcher(pid: app.processIdentifier) { speaker, time in
+                        capture.queue.async { capture.noteSpeaker(speaker, at: time) }
+                    }
+                case .telemost:
+                    watcher = TelemostMuteWatcher(app: app, onChange: changed)
+                case .browser:
+                    watcher = BrowserMuteWatcher(app: app, onChange: changed)
+                }
+                let version = app.bundleURL.flatMap { Bundle(url: $0)?.infoDictionary?["CFBundleShortVersionString"] as? String } ?? "unknown"
+                recorderLog.notice("Recording \(target.app) \(version), pid \(target.pid)")
+                members.add(MeetingMembers.Member(target: target, watcher: watcher, speakers: speakers))
+                watcher.start()
+                speakers?.start()
+            }
+        }
+
+        /// Ends the apps that left; Zoom's speaker is no one once Zoom is gone.
+        func leave(keeping pids: Set<pid_t>) {
+            let now = capture.now().seconds
+            for member in members.end(keeping: pids, at: now) {
+                recorderLog.notice("\(member.target.app) left the recording, pid \(member.target.pid)")
+                if member.target.app == .zoom { capture.queue.sync { capture.noteSpeaker(nil, at: now) } }
+            }
+            let all = members.microphone
+            if members.show(all) { events(.microphone(all)) }
+        }
+
         func disconnect() async {
             if let stream { await waitAtMost(5, "stopping the capture") { try? await stream.stopCapture() } }
             stream = nil
             // Confirm or reject the last moments of speech before the held audio is written.
-            watcher?.finalReading()
+            leave(keeping: [])
             capture.queue.sync { capture.attach(nil) }
-            watcher?.stop()
-            watcher = nil
-            speakers?.stop()
-            speakers = nil
+            members.forget()
         }
 
         while !stop.isRequested {
             if stream == nil {
                 do {
-                    guard let app = runningZoom() else { throw RecorderError.message("Zoom закрыт") }
-                    let connection = try await connect(to: app, capture: capture, stop: stop,
-                                                       reconnecting: started, events: events)
+                    let apps = desiredMeetings(browsers: browsers)
+                    guard !apps.isEmpty else { throw RecorderError.message("Zoom и Телемост закрыты") }
+                    let connection = try await connect(to: apps, capture: capture, members: members, stop: stop, reconnecting: started)
                     stream = connection.stream
-                    watcher = connection.watcher
-                    speakers = connection.speakers
-                    zoom = app
+                    join(connection.recorded)
                     // Cancelled while connecting: nothing was meant to be recorded.
                     if stop.isRequested && !started { break }
                     if started {
@@ -2217,7 +2304,9 @@ struct ZoomAudio {
                     lastFailure = nil
                     events(started ? .connected : .started)
                     if !started {
-                        screenTask = Task { await screen.run(wanted: wanted, stop: screenStop) { events(.screen($0)) } }
+                        screenTask = Task {
+                            await screen.run(wanted: wanted, stop: screenStop, source: { screenSource.current }) { events(.screen($0)) }
+                        }
                     }
                     started = true
                     connectedAt = Date()
@@ -2230,9 +2319,9 @@ struct ZoomAudio {
                     guard started else { throw error }
                     let since = lostSince ?? Date()
                     lostSince = since
-                    if runningZoom() == nil, Date().timeIntervalSince(since) > zoomReturnTimeout {
-                        recorderLog.notice("Zoom gone for \(Int(zoomReturnTimeout)) s; the recording ends")
-                        zoomQuit = true
+                    if desiredMeetings(browsers: browsers).isEmpty, Date().timeIntervalSince(since) > zoomReturnTimeout {
+                        recorderLog.notice("No meeting app for \(Int(zoomReturnTimeout)) s; the recording ends")
+                        appQuit = true
                         break
                     }
                     await stop.wait(timeout: 2)
@@ -2242,6 +2331,46 @@ struct ZoomAudio {
             }
             await stop.wait(timeout: 2)
             if stop.isRequested { break }
+            // Apps that started or joined a meeting go into the same stream, apps that quit drop out.
+            var broken = false
+            let wantedNow = desiredMeetings(browsers: browsers)
+            let current = Set(members.active.map(\.target.pid))
+            if Set(wantedNow.map(\.pid)) != current, let running = stream {
+                if wantedNow.isEmpty {
+                    recorderLog.notice("No meeting app left; waiting for one")
+                    await disconnect()
+                    events(.reconnecting)
+                    lostSince = Date()
+                    continue
+                }
+                do {
+                    let (filter, recorded) = try await self.filter(for: wantedNow, stop: stop, timeout: 10)
+                    if Set(recorded.map(\.pid)) != current {
+                        try await bounded(stop, timeout: 10) { try await running.updateContentFilter(filter) }
+                        leave(keeping: Set(recorded.map(\.pid)))
+                        join(recorded.filter { !current.contains($0.pid) })
+                    }
+                } catch is CancellationError {
+                    break
+                } catch {
+                    recorderLog.error("Could not change the apps recorded: \(error.localizedDescription)")
+                    broken = true
+                }
+            }
+            members.forget(before: capture.now().seconds - MeetingMembers.keep)
+            // What the window shows and the picture follows: the meeting in front.
+            let active = members.active
+            let meeting = active.filter(\.watcher.inMeeting).map(\.target)
+            let next = MeetingMembers.primary(among: meeting, all: active.map(\.target),
+                                              front: NSWorkspace.shared.frontmostApplication?.processIdentifier, previous: primary)
+            if let next, next.pid != primary?.pid || next.app != primary?.app { events(.app(next.app)) }
+            primary = next
+            if let next { screenSource.current = ScreenCapture.Source(app: next.app, pid: next.pid, inMeeting: meeting.contains { $0.pid == next.pid }) }
+            // The file is named after the first meeting recorded.
+            if !named, let first = meeting.first {
+                named = true
+                events(.named((next.flatMap { shown in meeting.first { $0.pid == shown.pid } } ?? first).app))
+            }
             if Date().timeIntervalSince(lastSync) >= 10 {
                 lastSync = Date()
                 capture.syncToDisk()
@@ -2260,7 +2389,7 @@ struct ZoomAudio {
                 zoomAudio = receiving
                 events(.zoomAudio(receiving))
             }
-            let broken = capture.queue.sync { capture.takeStreamError() } != nil
+            broken = broken || capture.queue.sync { capture.takeStreamError() } != nil
             // A stream can stop delivering without an error, as after the Mac sleeps: five
             // seconds without microphone audio, once it has flowed, reconnect it, at most once a
             // minute. A stream that never brings any, as with no microphone, is left alone, unless
@@ -2272,11 +2401,9 @@ struct ZoomAudio {
                 lastStall = Date()
                 recorderLog.error("No microphone audio for \(Int(silent)) s; reconnecting")
             }
-            if broken || stalled || zoom?.isTerminated == true {
-                recorderLog.notice("Capture interrupted (\(broken ? "stream error" : stalled ? "no microphone audio" : "Zoom quit")); reconnecting")
+            if broken || stalled {
+                recorderLog.notice("Capture interrupted (\(broken ? "stream error" : "no microphone audio")); reconnecting")
                 await disconnect()
-                capture.queue.sync { capture.noteSpeaker(nil, at: capture.now().seconds) }
-                events(.microphone(.unavailable))
                 events(.reconnecting)
                 lostSince = Date()
             }
@@ -2292,19 +2419,27 @@ struct ZoomAudio {
         _ = await (zoomClosed, micClosed, rawClosed, screenClosed)
         let hasZoom = !capture.zoom.parts.isEmpty
         let needsSafetyCopy = capture.queue.sync { capture.needsSafetyCopy }
-        recorderLog.notice("Capture ended: Zoom audio \(hasZoom), voice \(capture.hadVoice), interruptions \(interruptions), "
-                           + "Zoom quit \(zoomQuit), \(capture.queue.sync { capture.decisionSummary }), "
+        let app = primary?.app ?? first.app
+        recorderLog.notice("Capture ended: meeting audio \(hasZoom), voice \(capture.hadVoice), interruptions \(interruptions), "
+                           + "app quit \(appQuit), \(capture.queue.sync { capture.decisionSummary }), "
                            + "screen wanted \(screen.wanted), screen out of space \(screen.noSpace)")
         return RecordingSummary(started: started, hasAudio: hasZoom || capture.hadVoice || needsSafetyCopy, hasZoom: hasZoom,
-                                hasVoice: capture.hadVoice, interruptions: interruptions, zoomQuit: zoomQuit,
-                                needsSafetyCopy: needsSafetyCopy, screenWanted: screen.wanted, screenNoSpace: screen.noSpace)
+                                hasVoice: capture.hadVoice, interruptions: interruptions, appQuit: appQuit,
+                                needsSafetyCopy: needsSafetyCopy, screenWanted: screen.wanted, screenNoSpace: screen.noSpace, app: app)
     }
 
-    private static func connect(to app: NSRunningApplication, capture: Capture, stop: StopRequest, reconnecting: Bool,
-                                events: @escaping (RecorderEvent) -> Void)
-        async throws -> (stream: SCStream, watcher: ZoomMuteWatcher, speakers: ZoomSpeakerWatcher) {
-        // The first connection may wait on a system consent prompt; reconnections may not hang.
-        let timeout: TimeInterval? = reconnecting ? 15 : nil
+    /// The meeting apps to record now: Zoom and Telemost's app while they run, and a browser
+    /// while it shows Telemost's page, or keeps the microphone as through its meeting.
+    static func desiredMeetings(browsers: BrowserMembership) -> [MeetingTarget] {
+        var list: [MeetingTarget] = []
+        if let zoom = runningZoom() { list.append(MeetingTarget(app: .zoom, process: zoom)) }
+        if let telemost = Meetings.telemost() { list.append(MeetingTarget(app: .telemost, process: telemost)) }
+        return list + browsers.current()
+    }
+
+    /// A filter for the apps' audio, from ScreenCaptureKit's own list, and the apps it has.
+    private static func filter(for targets: [MeetingTarget], stop: StopRequest, timeout: TimeInterval?)
+        async throws -> (filter: SCContentFilter, recorded: [MeetingTarget]) {
         let content: SCShareableContent
         do {
             content = try await bounded(stop, timeout: timeout) {
@@ -2315,18 +2450,17 @@ struct ZoomAudio {
         } catch {
             throw RecorderError.message("\(screenAccessHint) Системная ошибка: \(error.localizedDescription)")
         }
-        guard let zoom = captureApplication(in: content, pid: app.processIdentifier) else {
-            throw RecorderError.message(openZoomHint)
+        // The recorder's own name also contains "Zoom": apps are matched by process and bundle.
+        var applications: [SCRunningApplication] = []
+        var recorded: [MeetingTarget] = []
+        for target in targets {
+            let found = target.app == .zoom ? captureApplication(in: content, pid: target.pid)
+                : content.applications.first { $0.processID == target.pid && $0.bundleIdentifier == target.process.bundleIdentifier }
+            guard let found else { continue }
+            applications.append(found)
+            recorded.append(target)
         }
-        let version = app.bundleURL.flatMap { Bundle(url: $0)?.infoDictionary?["CFBundleShortVersionString"] as? String } ?? "unknown"
-        recorderLog.notice("Recording target: \(zoom.bundleIdentifier) \(version), pid \(zoom.processID)")
-        let watcher = ZoomMuteWatcher(pid: app.processIdentifier, bundleURL: app.bundleURL) { state in
-            recorderLog.notice("Zoom microphone: \(String(describing: state))")
-            events(.microphone(state))
-        }
-        let speakers = ZoomSpeakerWatcher(pid: app.processIdentifier) { speaker, time in
-            capture.queue.async { capture.noteSpeaker(speaker, at: time) }
-        }
+        guard !applications.isEmpty else { throw RecorderError.message(openMeetingHint) }
         // App audio does not depend on the display. Prefer the built-in one, so
         // unplugging an external monitor mid-meeting does not stop the stream.
         guard let display = content.displays.first(where: { CGDisplayIsBuiltin($0.displayID) != 0 })
@@ -2334,7 +2468,14 @@ struct ZoomAudio {
                 ?? content.displays.first else {
             throw RecorderError.message("Не найден экран для фильтра ScreenCaptureKit")
         }
-        let filter = SCContentFilter(display: display, including: [zoom], exceptingWindows: [])
+        return (SCContentFilter(display: display, including: applications, exceptingWindows: []), recorded)
+    }
+
+    private static func connect(to targets: [MeetingTarget], capture: Capture, members: MeetingMembers, stop: StopRequest,
+                                reconnecting: Bool) async throws -> (stream: SCStream, recorded: [MeetingTarget]) {
+        // The first connection may wait on a system consent prompt; reconnections may not hang.
+        let timeout: TimeInterval? = reconnecting ? 15 : nil
+        let (filter, recorded) = try await filter(for: targets, stop: stop, timeout: timeout)
         let config = SCStreamConfiguration()
         config.width = 16
         config.height = 16
@@ -2348,25 +2489,21 @@ struct ZoomAudio {
         try stream.addStreamOutput(capture, type: .audio, sampleHandlerQueue: capture.queue)
         try stream.addStreamOutput(capture, type: .microphone, sampleHandlerQueue: capture.queue)
         capture.queue.sync {
-            capture.muteTimeline = { watcher.timeline(from: $0) }
-            capture.control = { watcher.control }
+            capture.muteTimeline = { members.timeline(from: $0) }
+            capture.control = { members.control }
             capture.attach(stream)
         }
-        watcher.start()
-        speakers.start()
         do {
             try await bounded(stop, timeout: timeout, onLateResult: { _ in
                 // startCapture can finish after cancellation and after the first stop attempt.
                 try? await stream.stopCapture()
             }) { try await stream.startCapture() }
         } catch {
-            watcher.stop()
-            speakers.stop()
             capture.queue.sync { capture.attach(nil) }
             // A start that finishes late must not leave an orphaned capture running.
             Task { try? await stream.stopCapture() }
             throw error
         }
-        return (stream, watcher, speakers)
+        return (stream, recorded)
     }
 }

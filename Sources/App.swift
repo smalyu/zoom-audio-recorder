@@ -32,9 +32,11 @@ final class RecorderModel: ObservableObject {
         didSet { if microphoneAllowed != oldValue { recorderLog.notice("Microphone access: \(microphoneAllowed)") } }
     }
     @Published var zoomAllowed = false { didSet { if zoomAllowed != oldValue { recorderLog.notice("Accessibility access: \(zoomAllowed)") } } }
-    @Published var zoomRunning = false { didSet { if zoomRunning != oldValue { recorderLog.notice("Zoom running: \(zoomRunning)") } } }
+    @Published var meetingRunning = false { didSet { if meetingRunning != oldValue { recorderLog.notice("Meeting app running: \(meetingRunning)") } } }
+    /// The app being recorded, or recorded last.
+    @Published var app = MeetingApp.zoom { didSet { if app != oldValue { recorderLog.notice("Recording app shown: \(app)") } } }
     @Published var microphone: ZoomMuteState = .unavailable
-    @Published var connected = true { didSet { if connected != oldValue { recorderLog.notice("Connected to Zoom: \(connected)") } } }
+    @Published var connected = true { didSet { if connected != oldValue { recorderLog.notice("Connected to \(app): \(connected)") } } }
     @Published var problem: String? {
         didSet { if problem != oldValue { recorderLog.notice("Problem shown: \(problem ?? "none")") } }
     }
@@ -94,22 +96,32 @@ final class RecorderModel: ObservableObject {
     }
     var screenPausedText: String {
         switch screenPause {
-        case .minimized?: return "Zoom свёрнут — видео на паузе"
-        case .hidden?: return "Zoom скрыт — видео на паузе"
+        case .minimized?: return "\(app.name) свёрнут — видео на паузе"
+        case .hidden?: return "\(app.name) скрыт — видео на паузе"
         case .sharingWindow?: return "Вы показываете окно — видео на паузе"
         case .sharePaused?: return "Показ экрана на паузе — видео тоже"
         case .noPicture?: return "Видео на паузе"
-        case .noMeeting?, nil: return "Окно встречи Zoom не видно — видео на паузе"
+        case .noMeeting?, nil:
+            return app == .zoom ? "Окно встречи Zoom не видно — видео на паузе" : "Встреча в Телемосте не видна — видео на паузе"
         }
     }
     var busy: Bool { phase != .idle }
     var time: String { Self.clock(elapsed) }
     var micText: String {
-        guard connected else { return "Переподключаюсь к Zoom…" }
+        guard connected else { return "Переподключаюсь \(app.dative)…" }
         switch microphone {
-        case .unmuted: return "Ваш голос записывается"
-        case .muted: return "Микрофон выключен в Zoom"
-        case .unavailable: return "Не вижу микрофон Zoom"
+        // The browser's mute is not seen: the microphone is kept through the whole meeting.
+        case .unmuted: return app.isBrowser ? "Ваш голос записывается весь звонок" : "Ваш голос записывается"
+        case .muted: return "Микрофон выключен \(app.locative)"
+        case .unavailable: return "Не вижу микрофон \(app.genitive)"
+        }
+    }
+    /// What to do while the microphone is not seen.
+    var micHint: String {
+        switch app {
+        case .zoom: return "Покажите панель управления встречей в Zoom"
+        case .telemost: return "Войдите во встречу в Телемосте"
+        case .browser: return "Войдите во встречу в браузере"
         }
     }
     var micIcon: String {
@@ -170,13 +182,13 @@ final class RecorderModel: ObservableObject {
         if !busy { refresh() }
     }
 
-    /// Permissions and Zoom: cheap, so checked every second while idle.
+    /// Permissions and meeting apps: cheap, so checked every second while idle.
     func refresh() {
         #if !PREVIEW
         update(\.screenAllowed, CGPreflightScreenCaptureAccess())
         update(\.microphoneAllowed, AVCaptureDevice.authorizationStatus(for: .audio) == .authorized)
         update(\.zoomAllowed, AXIsProcessTrusted())
-        update(\.zoomRunning, ZoomAudio.runningZoom() != nil)
+        update(\.meetingRunning, Meetings.available)
         #endif
     }
 
@@ -258,8 +270,8 @@ final class RecorderModel: ObservableObject {
     func start() {
         refresh()
         // A recovery may still be saving an older recording; it does not hold up this one.
-        guard ready, !busy, zoomRunning, !quitting else {
-            recorderLog.notice("Start ignored: ready \(ready), busy \(busy), Zoom running \(zoomRunning), quitting \(quitting)")
+        guard ready, !busy, meetingRunning, !quitting else {
+            recorderLog.notice("Start ignored: ready \(ready), busy \(busy), meeting app running \(meetingRunning), quitting \(quitting)")
             return
         }
         // A recording still waiting to be saved stays visible as a banner.
@@ -289,18 +301,22 @@ final class RecorderModel: ObservableObject {
         Task {
             // Keeps the Mac awake and App Nap away until the file is saved.
             let activity = ProcessInfo.processInfo.beginActivity(
-                options: [.userInitiated, .idleSystemSleepDisabled], reason: "Запись созвона Zoom")
+                options: [.userInitiated, .idleSystemSleepDisabled], reason: "Запись созвона")
             defer { ProcessInfo.processInfo.endActivity(activity) }
             var session: RecordingSession?
             do {
-                try await ZoomAudio.prepare()
+                let target = try await ZoomAudio.prepare()
                 guard !request.isRequested else { throw CancellationError() }
-                let created = try RecordingSession.create(destination: destination,
-                                                          name: RecordingSession.fileName(for: Date()))
+                app = target.app
+                let begun = Date()
+                let created = try RecordingSession.create(destination: destination, name: RecordingSession.fileName(for: begun, app: target.app),
+                                                          started: begun)
                 session = created
                 recorderLog.notice("Recording started: session \(created.folder.lastPathComponent), "
-                                   + "to \(destination.path), record screen \(screen.current)")
-                let summary = try await ZoomAudio.record(into: created.folder, stop: request, screen: screen, events: { event in
+                                   + "to \(destination.path), record screen \(screen.current), app \(target.app)")
+                let summary = try await ZoomAudio.record(into: created.folder, first: target, stop: request, screen: screen, events: { event in
+                    // Named after the first meeting recorded, as when started before joining it.
+                    if case let .named(app) = event { created.name(after: app) }
                     Task { @MainActor in
                         guard self.stop === request else { return }
                         self.handle(event)
@@ -388,13 +404,14 @@ final class RecorderModel: ObservableObject {
             if !summary.hasZoom, !summary.hasVoice, summary.needsSafetyCopy {
                 details.append("Кнопка mute не определялась — записан весь микрофон")
             }
-            if summary.zoomQuit { details.append("Zoom закрылся — запись остановлена") }
-            if summary.interruptions > 0 { details.append("Связь с Zoom прерывалась: \(summary.interruptions)") }
+            if summary.appQuit { details.append("\(summary.app.name) закрылся — запись остановлена") }
+            if summary.interruptions > 0 { details.append("Связь \(summary.app.instrumental) прерывалась: \(summary.interruptions)") }
             if !summary.hasVoice && delivery.microphone == nil && summary.hasZoom { details.append("Микрофон оставался выключен или не определялся") }
         }
         let screenMissed = summary?.screenWanted == true && delivery.video == nil && !delivery.videoFailed
         if screenMissed {
-            details.append(summary?.screenNoSpace == true ? "Мало места — видео не записано" : "Окно встречи Zoom не найдено — видео нет")
+            details.append(summary?.screenNoSpace == true ? "Мало места — видео не записано"
+                           : (summary?.app ?? .zoom) == .zoom ? "Окно встречи Zoom не найдено — видео нет" : "Окно встречи не найдено — видео нет")
         }
         if delivery.videoFailed {
             details.append(delivery.videoNoSpace ? "Мало места — видео не сохранено"
@@ -425,6 +442,10 @@ final class RecorderModel: ObservableObject {
         case .connected:
             connected = true
             problem = nil
+        case let .app(next):
+            app = next
+        case .named:
+            break
         case .reconnecting:
             if connected { NSApplication.shared.requestUserAttention(.informationalRequest) }
             connected = false
@@ -643,7 +664,8 @@ final class RecorderDelegate: NSObject, NSApplicationDelegate {
     @MainActor func applicationDidFinishLaunching(_ notification: Notification) {
         // Read-only developer diagnostics run under this app's own authorization.
         let arguments = CommandLine.arguments
-        guard let flag = arguments.firstIndex(of: "--diagnose-zoom"), arguments.count > flag + 1 else {
+        let telemost = arguments.contains("--diagnose-telemost")
+        guard let flag = arguments.firstIndex(of: telemost ? "--diagnose-telemost" : "--diagnose-zoom"), arguments.count > flag + 1 else {
             noteLaunch()
             RecorderModel.shared.recover()
             return
@@ -651,7 +673,7 @@ final class RecorderDelegate: NSObject, NSApplicationDelegate {
         let path = arguments[flag + 1]
         let observations = arguments.contains("--observe") ? 150 : 1
         Task.detached {
-            let result = await zoomMicrophoneDiagnostics(observations: observations)
+            let result = telemost ? telemostDiagnostics() : await zoomMicrophoneDiagnostics(observations: observations)
             if let data = try? JSONSerialization.data(withJSONObject: result, options: [.prettyPrinted, .sortedKeys]) {
                 try? data.write(to: URL(fileURLWithPath: path), options: .atomic)
             }
@@ -668,7 +690,7 @@ final class RecorderDelegate: NSObject, NSApplicationDelegate {
         model.screenAllowed = true
         model.microphoneAllowed = state != "permissions"
         model.zoomAllowed = state != "permissions"
-        model.zoomRunning = state != "nozoom"
+        model.meetingRunning = state != "nozoom"
         let file = RecorderModel.defaultFolder.appendingPathComponent("Zoom 2026-10-05 14-30.m4a")
         switch state {
         case "recording": model.phase = .recording; model.microphone = .unmuted; model.elapsed = 754
@@ -685,7 +707,7 @@ final class RecorderDelegate: NSObject, NSApplicationDelegate {
             model.recordScreen = true; model.screenPause = .minimized
         case "saved", "closed":
             model.outcome = .init(kind: .saved, title: "Сохранено", detail: "47:12 · 38,2 МБ", file: file)
-            model.zoomRunning = state != "closed"
+            model.meetingRunning = state != "closed"
         case "fallback":
             model.outcome = .init(kind: .attention, title: "Сохранено в «Записи Zoom»",
                                   detail: "Папка «Meetings» недоступна\n47:12 · 38,2 МБ", file: file)
@@ -694,7 +716,7 @@ final class RecorderDelegate: NSObject, NSApplicationDelegate {
                                   detail: "Файл не сохранён: на диске нет места. Можно повторить сохранение.",
                                   file: RecordingSession.root.appendingPathComponent("2026-10-05 14-30-00 1A2B3C4D"))
         case "failed":
-            model.outcome = .init(kind: .failed, title: "Не удалось записать", detail: openZoomHint)
+            model.outcome = .init(kind: .failed, title: "Не удалось записать", detail: openMeetingHint)
         case "recovered": model.recovered = [file]
         case "recovering": model.recovering = true
         case "longfolder":
@@ -770,12 +792,12 @@ final class RecorderDelegate: NSObject, NSApplicationDelegate {
         for (event, text) in events {
             center.addObserver(forName: event, object: nil, queue: .main) { _ in recorderLog.notice(text) }
         }
-        for (event, text) in [(NSWorkspace.didLaunchApplicationNotification, "Zoom started"),
-                              (NSWorkspace.didTerminateApplicationNotification, "Zoom quit")] {
+        for (event, text) in [(NSWorkspace.didLaunchApplicationNotification, "started"),
+                              (NSWorkspace.didTerminateApplicationNotification, "quit")] {
             center.addObserver(forName: event, object: nil, queue: .main) { note in
                 guard let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
-                      app.bundleIdentifier == "us.zoom.xos" else { return }
-                recorderLog.notice("\(text), pid \(app.processIdentifier)")
+                      let name = ["us.zoom.xos": "Zoom", Meetings.telemostBundle: "Telemost"][app.bundleIdentifier ?? ""] else { return }
+                recorderLog.notice("\(name) \(text), pid \(app.processIdentifier)")
             }
         }
         NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main) { _ in
@@ -816,7 +838,7 @@ struct RecorderCommands: Commands {
         CommandMenu("Запись") {
             Button("Начать запись") { model.start() }
                 .keyboardShortcut("r")
-                .disabled(model.busy || !model.ready || !model.zoomRunning || model.quitting)
+                .disabled(model.busy || !model.ready || !model.meetingRunning || model.quitting)
             Button(model.phase == .preparing ? "Отменить запись" : "Остановить запись") { model.finish() }
                 .keyboardShortcut(".")
                 .disabled(model.phase != .recording && model.phase != .preparing)
@@ -844,7 +866,7 @@ struct MenuBarLabel: View {
                 .monospacedDigit()
                 .accessibilityLabel("Идёт запись, \(model.time). \(model.micText)" + (model.screenPaused ? ". \(model.screenPausedText)" : ""))
         case .preparing:
-            Image(systemName: "record.circle").accessibilityLabel("Подключаюсь к Zoom…")
+            Image(systemName: "record.circle").accessibilityLabel("Подключаюсь \(model.app.dative)…")
         case .saving:
             Image(systemName: "arrow.down.circle").accessibilityLabel("Сохраняю…")
         case .idle:
@@ -868,10 +890,10 @@ struct RecorderMenu: View {
         }
         switch model.phase {
         case .recording:
-            Text(model.connected ? "Запись · \(model.time)" : "Запись · \(model.time) · нет связи с Zoom")
+            Text(model.connected ? "Запись · \(model.time)" : "Запись · \(model.time) · нет связи \(model.app.instrumental)")
             Text(model.micText)
             if model.screenPaused { Text(model.screenPausedText) }
-        case .preparing: Text("Подключаюсь к Zoom…")
+        case .preparing: Text("Подключаюсь \(model.app.dative)…")
         case .saving: Text("Сохраняю…")
         case .idle:
             if model.recovering {
@@ -879,7 +901,7 @@ struct RecorderMenu: View {
             }
             if let outcome = model.outcome { Text(outcome.title) }
             if !model.ready { Text("Нужен доступ") }
-            else if !model.zoomRunning { Text(openZoomHint) }
+            else if !model.meetingRunning { Text(openMeetingHint) }
         }
         Divider()
         if model.phase == .preparing {
@@ -888,7 +910,7 @@ struct RecorderMenu: View {
             Button("Остановить запись") { model.finish() }
         } else {
             Button("Начать запись") { model.start() }
-                .disabled(model.busy || !model.ready || !model.zoomRunning || model.quitting)
+                .disabled(model.busy || !model.ready || !model.meetingRunning || model.quitting)
         }
         if model.phase != .saving { Toggle("Записывать экран", isOn: $model.recordScreen) }
         if let file = model.lastFile, !model.busy {
@@ -977,9 +999,9 @@ struct IdleView: View {
             if let outcome = model.outcome {
                 OutcomeView(model: model, outcome: outcome)
             } else {
-                Text(model.zoomRunning ? "Готов к записи" : openZoomHint)
+                Text(model.meetingRunning ? "Готов к записи" : openMeetingHint)
                     .font(.title3.weight(.medium))
-                    .foregroundStyle(model.zoomRunning ? .primary : .secondary)
+                    .foregroundStyle(model.meetingRunning ? .primary : .secondary)
                     .multilineTextAlignment(.center)
             }
             Button { model.start() } label: {
@@ -988,11 +1010,11 @@ struct IdleView: View {
             .buttonStyle(.borderedProminent)
             .controlSize(.large)
             .keyboardShortcut(.defaultAction)
-            .disabled(!model.zoomRunning || model.quitting)
+            .disabled(!model.meetingRunning || model.quitting)
             ScreenToggle(model: model)
             VStack(spacing: 4) {
-                if let outcome = model.outcome, !model.zoomRunning, outcome.detail != openZoomHint {
-                    Caption(openZoomHint)
+                if let outcome = model.outcome, !model.meetingRunning, outcome.detail != openMeetingHint {
+                    Caption(openMeetingHint)
                 }
                 FolderMenu(model: model)
                 if !model.folderAvailable {
@@ -1104,7 +1126,7 @@ struct PreparingView: View {
         VStack(spacing: 14) {
             HStack(spacing: 8) {
                 ProgressView().controlSize(.small)
-                Text("Подключаюсь к Zoom…").font(.title3.weight(.medium))
+                Text("Подключаюсь \(model.app.dative)…").font(.title3.weight(.medium))
             }
             Button("Отменить") { model.finish() }
                 .controlSize(.large)
@@ -1138,9 +1160,9 @@ struct RecordingView: View {
             }
             .font(.callout)
             if model.connected && model.microphone == .unavailable {
-                Caption("Покажите панель управления встречей в Zoom")
+                Caption(model.micHint)
             }
-            if model.connected && !model.zoomAudio { Caption("Звук Zoom не поступает", warning: true) }
+            if model.connected && !model.zoomAudio { Caption("Звук \(model.app.genitive) не поступает", warning: true) }
             if let problem = model.problem { Caption(problem, warning: true) }
             if model.lowDiskSpace { Caption("Мало места на диске", warning: true) }
             Button { model.finish() } label: {
@@ -1182,7 +1204,7 @@ struct PermissionsView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text("Нужен доступ").font(.title3.weight(.medium))
-            row(.screen, "Звук Zoom", "speaker.wave.2", "«Запись экрана и системного звука»")
+            row(.screen, "Звук созвона", "speaker.wave.2", "«Запись экрана и системного звука»")
             row(.microphone, "Микрофон", "mic", "«Микрофон»")
             row(.zoom, "Кнопка mute в Zoom", "hand.tap",
                 "«Универсальный доступ» (в macOS 27 — «Управление устройством и доступ к данным»)")
@@ -1319,8 +1341,8 @@ struct Caption: View {
 struct HelpView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text("Войдите в созвон Zoom → «Начать запись» → «Остановить». Файл появится в папке записей.")
-            Text("Ваш голос записывается, только когда микрофон включён в Zoom. В Zoom и macOS должен быть выбран один микрофон.")
+            Text("Войдите в созвон в Zoom или Телемосте → «Начать запись» → «Остановить». Файл появится в папке записей.")
+            Text("Ваш голос записывается, только когда микрофон включён в Zoom или приложении Телемоста; в Телемосте в браузере — весь звонок. В созвоне и в macOS должен быть выбран один микрофон.")
             Text("«Записывать экран» сохранит рядом видео того, что показывают на встрече. Флажок работает и во время записи.")
             Text("Прерванная запись восстанавливается при следующем запуске.")
             Text("Если сохранение не удалось, нажмите «Повторить сохранение». Если кнопка mute не определялась, проверьте отдельную запись микрофона рядом с основным файлом.")

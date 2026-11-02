@@ -494,12 +494,14 @@ final class RecordingSession {
         .appendingPathComponent("Zoom Audio Recorder/Recordings", isDirectory: true)
 
     let folder: URL
-    let manifest: Manifest
+    /// Renamed from the recording's own task while the window reads it.
+    private let current: Locked<Manifest>
+    var manifest: Manifest { current.current }
     private var lock: Int32
 
     private init(folder: URL, manifest: Manifest, lock: Int32) {
         self.folder = folder
-        self.manifest = manifest
+        current = Locked(manifest)
         self.lock = lock
     }
 
@@ -555,11 +557,22 @@ final class RecordingSession {
         }
     }
 
-    static func fileName(for date: Date) -> String {
+    static func fileName(for date: Date, app: MeetingApp = .zoom) -> String {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.dateFormat = "yyyy-MM-dd HH-mm"
-        return "Zoom \(formatter.string(from: date)).m4a"
+        return "\(app.name) \(formatter.string(from: date)).m4a"
+    }
+
+    /// Names the recording after the app it moved to, as when it was started before joining a
+    /// Telemost meeting while Zoom was open. The file is named when it is saved.
+    func name(after app: MeetingApp) {
+        var next = manifest
+        next.name = Self.fileName(for: next.started, app: app)
+        guard next.name != manifest.name, let data = try? JSONEncoder().encode(next) else { return }
+        // Kept as it was if the folder cannot be written: the name is only a name.
+        guard (try? data.write(to: folder.appendingPathComponent("session.json"), options: .atomic)) != nil else { return }
+        current.current = next
     }
 
     private static func acquireLock(_ folder: URL) -> Int32? {

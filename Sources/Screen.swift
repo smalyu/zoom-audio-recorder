@@ -381,15 +381,16 @@ enum ZoomMeetingWindow {
 
     /// Zoom's windows in one line for the log, without what may name people or meetings: Zoom's
     /// own window names are kept, others are left out.
-    static func describe(_ windows: [ZoomWindow], sharing: Bool) -> String {
+    static func describe(_ windows: [ZoomWindow], sharing: Bool, app: MeetingApp = .zoom) -> String {
         let names = windows.map { window -> String in
             let lower = window.title.lowercased()
-            // Zoom's internal names are in lower case; a meeting's own title is not kept.
+            // Zoom's internal names are in lower case; a meeting's own title is not kept, nor a browser's tab.
             let own = (window.title == lower && lower.hasPrefix("zoom ")) || window.title == "Annotation - Zoom"
                 || ["", "Zoom", "Zoom Meeting", "Zoom Workplace"].contains(window.title)
+                || (app != .zoom && Meetings.isTelemostTitle(window.title))
             return "\"\(own ? window.title : "…")\" \(window.layer)\(window.onScreen ? "" : " off")"
         }
-        return (sharing ? "Sharing, paused or no single display. " : "") + "Zoom windows: " + names.joined(separator: "; ")
+        return (sharing ? "Sharing, paused or no single display. " : "") + "\(app) windows: " + names.joined(separator: "; ")
     }
 }
 
@@ -493,6 +494,13 @@ final class ScreenCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
         }
     }
 
+    /// The app the sound is recorded from, and whether it is in a meeting.
+    struct Source: Equatable {
+        let app: MeetingApp
+        let pid: pid_t
+        let inMeeting: Bool
+    }
+
     /// What a stream records: Zoom's meeting window, or the display the user shares in the meeting.
     enum Target: Equatable {
         case window(CGWindowID)
@@ -564,6 +572,33 @@ final class ScreenCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
         return (nil, .noMeeting, false, remembered)
     }
 
+    /// What to record of Telemost: the page's window in a browser, or the app's own window, the
+    /// largest it has, while it is in a meeting. A browser's window is named after the tab it shows,
+    /// so another tab in front is not recorded. The window recorded stays while it is still one.
+    static func decideTelemost(windows: [ZoomWindow], browser: Bool, inMeeting: Bool, recording: Target?,
+                               remembered: CGWindowID?, hidden: Bool) -> (target: Target?, pause: Pause?, remembered: CGWindowID?) {
+        guard inMeeting else { return (nil, .noMeeting, remembered) }
+        if hidden { return (nil, .hidden, remembered) }
+        let candidates = windows.filter {
+            $0.layer == 0 && $0.frame.width >= 320 && $0.frame.height >= 240 && (!browser || Meetings.isTelemostTitle($0.title))
+        }
+        let largest = { (among: [ZoomWindow]) in among.max { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height } }
+        if case let .window(id)? = recording, candidates.contains(where: { $0.id == id }) { return (recording, nil, id) }
+        let choice = largest(candidates.filter(\.onScreen)) ?? candidates.first { $0.id == remembered } ?? largest(candidates)
+        guard let choice else { return (nil, .noMeeting, remembered) }
+        return (.window(choice.id), nil, choice.id)
+    }
+
+    private func choose(source: Source, recording: Target?, remembered: CGWindowID?, lastPause: Pause?)
+        -> (target: Target?, pause: Pause?, windows: [ZoomWindow], sharing: Bool, remembered: CGWindowID?) {
+        guard source.app != .zoom else { return choose(pid: source.pid, recording: recording, remembered: remembered, lastPause: lastPause) }
+        let windows = ZoomMeetingWindow.windows(pid: source.pid)
+        let choice = Self.decideTelemost(windows: windows, browser: source.app != .telemost, inMeeting: source.inMeeting,
+                                         recording: recording, remembered: remembered,
+                                         hidden: NSRunningApplication(processIdentifier: source.pid)?.isHidden == true)
+        return (choice.target, choice.pause, windows, false, choice.remembered)
+    }
+
     private func choose(pid: pid_t, recording: Target?, remembered: CGWindowID?, lastPause: Pause?)
         -> (target: Target?, pause: Pause?, windows: [ZoomWindow], sharing: Bool, remembered: CGWindowID?) {
         let windows = ZoomMeetingWindow.windows(pid: pid)
@@ -592,7 +627,9 @@ final class ScreenCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
 
     /// Records whenever `wanted` is on, until `stop`, then closes the track. `found` tells whether a
     /// picture is being written while it is wanted.
-    func run(wanted: Locked<Bool>, stop: StopRequest, found: @escaping (Pause?) -> Void) async {
+    func run(wanted: Locked<Bool>, stop: StopRequest, source: @escaping () -> Source? = {
+        ZoomAudio.runningZoom().map { Source(app: .zoom, pid: $0.processIdentifier, inMeeting: true) }
+    }, found: @escaping (Pause?) -> Void) async {
         var stream: SCStream?
         var target: Target?
         var nextLook = Date.distantPast
@@ -605,6 +642,7 @@ final class ScreenCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
         var reported: Pause??
         var pause: Pause?
         var remembered: CGWindowID?
+        var lastSource: Source?
         var writingAt = Self.now()
         var described: String?
         var weighed: (part: URL, bytes: Int, at: Date)?
@@ -683,13 +721,17 @@ final class ScreenCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
                 // ScreenCaptureKit is asked only to start or switch a stream.
                 if Date() >= nextLook {
                     nextLook = Date().addingTimeInterval(1)
-                    // No Zoom, no picture: a display is never recorded without Zoom sharing it.
-                    let pid = ZoomAudio.runningZoom()?.processIdentifier
-                    let choice = pid.map { choose(pid: $0, recording: target, remembered: remembered, lastPause: pause) }
+                    // No meeting app, no picture: a display is never recorded without Zoom sharing it.
+                    let app = source()
+                    if app?.pid != lastSource?.pid { remembered = nil }
+                    lastSource = app
+                    let pid = app?.pid
+                    let choice = app.map { choose(source: $0, recording: target, remembered: remembered, lastPause: pause) }
                         ?? (target: nil, pause: .noMeeting, windows: [], sharing: false, remembered: nil)
                     pause = choice.pause
                     remembered = choice.remembered
-                    let state = choice.target == nil ? ZoomMeetingWindow.describe(choice.windows, sharing: choice.sharing) : nil
+                    let state = choice.target == nil
+                        ? ZoomMeetingWindow.describe(choice.windows, sharing: choice.sharing, app: app?.app ?? .zoom) : nil
                     if let state, state != described { recorderLog.notice("No picture to record. \(state)") }
                     described = state
                     if choice.target != target, let pid {
@@ -701,7 +743,7 @@ final class ScreenCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
                            (try? await bounded(stop, timeout: 10, { try await running.updateContentFilter(next.filter) })) != nil {
                             // Another meeting window: the same stream and part go on with it.
                             target = choice.target
-                            recorderLog.notice("Recording another Zoom meeting window")
+                            recorderLog.notice("Recording another \(app?.app ?? .zoom) meeting window")
                         } else if next == nil, case .window? = choice.target, case .window? = target, stream != nil, !stop.isRequested {
                             // ScreenCaptureKit does not list the other window yet: the one recorded goes
                             // on, and the other is looked at again a little later.
@@ -716,7 +758,7 @@ final class ScreenCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
                                     target = next
                                     started = Date()
                                     startDelay = 5
-                                    recorderLog.notice("Recording \(setup.cursor ? "the display the user shares" : "Zoom's meeting window")")
+                                    recorderLog.notice("Recording \(setup.cursor ? "the display the user shares" : "\(app?.app ?? .zoom)'s meeting window")")
                                 } else {
                                     recorderLog.error("Screen: could not start recording; trying again in \(Int(startDelay)) s")
                                     nextLook = Date().addingTimeInterval(startDelay)

@@ -11,9 +11,9 @@
     <key>CFBundleDisplayName</key>
     <string>Zoom Audio Recorder</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.18</string>
+    <string>1.19</string>
     <key>CFBundleVersion</key>
-    <string>24</string>
+    <string>25</string>
     <key>NSHumanReadableCopyright</key>
     <string>© 2026 Alexander Smirnov. Лицензия MIT.</string>
     <key>LSApplicationCategoryType</key>
@@ -31,10 +31,10 @@
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>NSMicrophoneUsageDescription</key>
-    <string>Запись собственного голоса в созвоне Zoom, когда микрофон включён.</string>
+    <string>Запись собственного голоса в созвоне, когда микрофон включён.</string>
     <key>NSAudioCaptureUsageDescription</key>
-    <string>Запись звука созвона Zoom.</string>
+    <string>Запись звука созвона.</string>
     <key>NSScreenCaptureUsageDescription</key>
-    <string>Запись звука созвона Zoom, а с флажком «Записывать экран» — и того, что на нём показывают.</string>
+    <string>Запись звука созвона, а с флажком «Записывать экран» — и того, что на нём показывают.</string>
 </dict>
 </plist>
