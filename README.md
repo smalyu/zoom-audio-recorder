@@ -105,14 +105,45 @@
 
 ## Для разработчиков
 
-Нужны macOS 15 и Xcode.
+Нужны macOS 15 или новее и полный Xcode, выбранный в `xcode-select -p`. Проект собирается напрямую через `xcrun swiftc`, без Swift Package Manager и `.xcodeproj`.
+
+### Проверка изменений
+
+```sh
+zsh scripts/check.sh
+```
+
+Команда проверяет типы всех Swift-исходников для Apple Silicon и Intel, включая режим `PREVIEW`, затем запускает тесты на архитектуре текущего Mac. Подпись приложения, Keychain и нотарификация для этой проверки не нужны. Та же команда выполняется в GitHub Actions на macOS при push и pull request.
+
+Только тесты или снимки интерфейса:
+
+```sh
+zsh scripts/test.sh
+zsh scripts/preview.sh
+```
+
+Тесты используют синтетические звук и видео, без созвона и разрешений на запись. Превью сохраняет снимки состояний интерфейса в обеих темах в `build.noindex/previews/`. Результаты проверок и сборки находятся в игнорируемом `build.noindex/`.
+
+Устройство проекта и правила для агентов описаны в [AGENTS.md](AGENTS.md).
+
+### Сборка приложения
 
 ```sh
 zsh scripts/build.sh
-zsh scripts/test.sh
-zsh scripts/preview.sh
+```
+
+Готовое универсальное приложение: `build.noindex/Zoom Audio Recorder.app`. Скрипт подписывает его Developer ID из Keychain, а если такого сертификата нет — создаёт постоянную локальную identity для сохранения разрешений macOS между пересборками.
+
+### Подготовка релиза
+
+Сначала соберите приложение, затем создайте установщик:
+
+```sh
+zsh scripts/build.sh
 zsh scripts/package.sh
 ```
+
+DMG появится в `build.noindex/Zoom Audio Recorder.dmg`. Упаковка устанавливает `ds_store` и `mac_alias` в `build.noindex/packaging/`. При наличии Developer ID скрипт отправляет приложение и DMG в Apple на нотарификацию, используя заранее настроенный профиль Keychain `zoom-audio-recorder`. Сборка и упаковка предназначены для подготовки приложения к запуску или выпуску; для обычной проверки изменений используйте `check.sh`.
 
 ---
 
